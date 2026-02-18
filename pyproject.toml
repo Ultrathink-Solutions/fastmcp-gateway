@@ -1,0 +1,74 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fastmcp-gateway"
+version = "0.1.0"
+description = "Progressive tool discovery gateway for MCP, built on FastMCP"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+authors = [{ name = "Ultrathink Solutions" }]
+keywords = ["mcp", "fastmcp", "gateway", "llm", "tools", "progressive-discovery"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = [
+    "fastmcp>=2.0",
+    "opentelemetry-api>=1.20",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.9",
+    "pyright>=1.1",
+    "pydantic-ai>=0.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/Ultrathink-Solutions/fastmcp-gateway"
+Repository = "https://github.com/Ultrathink-Solutions/fastmcp-gateway"
+Issues = "https://github.com/Ultrathink-Solutions/fastmcp-gateway/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fastmcp_gateway"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",     # pycodestyle errors
+    "W",     # pycodestyle warnings
+    "F",     # pyflakes
+    "I",     # isort
+    "UP",    # pyupgrade
+    "B",     # flake8-bugbear
+    "SIM",   # flake8-simplify
+    "TCH",   # flake8-type-checking
+    "RUF",   # ruff-specific
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["fastmcp_gateway"]
+
+[tool.pyright]
+pythonVersion = "3.11"
+typeCheckingMode = "standard"
+include = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
