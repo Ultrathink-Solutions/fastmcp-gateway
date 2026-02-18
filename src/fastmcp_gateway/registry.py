@@ -1,10 +1,9 @@
 """Tool registry: in-memory store for discovered tools from upstream MCP servers."""
 
-from __future__ import annotations
-
 import logging
-from dataclasses import dataclass
 from typing import Any
+
+from pydantic import BaseModel, ConfigDict
 
 logger = logging.getLogger(__name__)
 
@@ -27,9 +26,10 @@ def infer_group(domain: str, tool_name: str) -> str:
     return "general"
 
 
-@dataclass
-class ToolEntry:
+class ToolEntry(BaseModel):
     """A single tool in the registry."""
+
+    model_config = ConfigDict(frozen=True)
 
     name: str
     domain: str
@@ -39,9 +39,10 @@ class ToolEntry:
     upstream_url: str
 
 
-@dataclass
-class DomainInfo:
+class DomainInfo(BaseModel):
     """Summary information about a domain."""
+
+    model_config = ConfigDict(frozen=True)
 
     name: str
     description: str
