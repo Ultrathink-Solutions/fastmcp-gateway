@@ -257,3 +257,101 @@ class TestIntrospection:
             manager = UpstreamManager({"svc": "http://svc:8080/mcp"}, ToolRegistry())
         with pytest.raises(KeyError):
             manager.upstream_url("nonexistent")
+
+
+# ---------------------------------------------------------------------------
+# registry_auth_headers
+# ---------------------------------------------------------------------------
+
+
+class TestRegistryAuthHeaders:
+    def test_headers_set_on_registry_clients(self) -> None:
+        """Registry clients should have auth headers on their transport."""
+        mock_client = MagicMock()
+        mock_transport = MagicMock()
+        mock_client.transport = mock_transport
+
+        with patch("fastmcp_gateway.client_manager.Client", return_value=mock_client):
+            UpstreamManager(
+                {"svc": "http://svc:8080/mcp"},
+                ToolRegistry(),
+                registry_auth_headers={"Authorization": "Bearer test-token"},
+            )
+
+        assert mock_transport.headers == {"Authorization": "Bearer test-token"}
+
+    def test_no_headers_when_none(self) -> None:
+        """When no auth headers, transport should not be modified."""
+        mock_client = MagicMock()
+        mock_transport = MagicMock()
+        mock_transport.headers = {}
+        mock_client.transport = mock_transport
+
+        with patch("fastmcp_gateway.client_manager.Client", return_value=mock_client):
+            UpstreamManager({"svc": "http://svc:8080/mcp"}, ToolRegistry())
+
+        # Headers should still be the default empty dict
+        assert mock_transport.headers == {}
+
+
+# ---------------------------------------------------------------------------
+# upstream_headers (per-domain execution headers)
+# ---------------------------------------------------------------------------
+
+
+class TestUpstreamHeaders:
+    @pytest.mark.asyncio
+    async def test_domain_with_override_uses_new_with_headers(self, registry: ToolRegistry) -> None:
+        """Domains with upstream_headers should use client.new() and merge headers."""
+        fake_result = MagicMock()
+        fresh_client = AsyncMock()
+        fresh_client.__aenter__ = AsyncMock(return_value=fresh_client)
+        fresh_client.__aexit__ = AsyncMock(return_value=None)
+        fresh_client.call_tool = AsyncMock(return_value=fake_result)
+        fresh_client.transport = MagicMock()
+        fresh_client.transport.headers = {}
+
+        base_client = MagicMock()
+        base_client.new = MagicMock(return_value=fresh_client)
+
+        with patch("fastmcp_gateway.client_manager.Client", return_value=base_client):
+            manager = UpstreamManager(
+                {"svc": "http://svc:8080/mcp"},
+                registry,
+                upstream_headers={"svc": {"Authorization": "Bearer domain-key"}},
+            )
+
+        registry.populate_domain("svc", "http://svc:8080/mcp", [{"name": "svc_ping", "inputSchema": {}}])
+
+        result = await manager.execute_tool("svc_ping")
+
+        assert result is fake_result
+        # Should use client.new() uniformly, then apply headers
+        base_client.new.assert_called_once()
+        assert fresh_client.transport.headers == {"Authorization": "Bearer domain-key"}
+
+    @pytest.mark.asyncio
+    async def test_domain_without_override_uses_new(self, registry: ToolRegistry) -> None:
+        """Domains without upstream_headers should use base_client.new()."""
+        fake_result = MagicMock()
+        fresh_client = AsyncMock()
+        fresh_client.__aenter__ = AsyncMock(return_value=fresh_client)
+        fresh_client.__aexit__ = AsyncMock(return_value=None)
+        fresh_client.call_tool = AsyncMock(return_value=fake_result)
+
+        base_client = MagicMock()
+        base_client.new = MagicMock(return_value=fresh_client)
+
+        with patch("fastmcp_gateway.client_manager.Client", return_value=base_client):
+            manager = UpstreamManager(
+                {"svc": "http://svc:8080/mcp"},
+                registry,
+                upstream_headers={"other_domain": {"Authorization": "Bearer other"}},
+            )
+
+        registry.populate_domain("svc", "http://svc:8080/mcp", [{"name": "svc_ping", "inputSchema": {}}])
+
+        await manager.execute_tool("svc_ping")
+
+        # Should use base_client.new() since "svc" has no override
+        base_client.new.assert_called_once()
