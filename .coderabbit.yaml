@@ -1,0 +1,206 @@
+# CodeRabbit Configuration for fastmcp-gateway
+# Docs: https://docs.coderabbit.ai/reference/configuration
+#
+# Technology Stack:
+# - Python 3.11+, FastMCP (>=2.0), OpenTelemetry API
+# - Testing: pytest, pytest-asyncio
+# - Linting: ruff, pyright
+
+language: en-US
+
+# ==============================================================================
+# REVIEW SETTINGS
+# ==============================================================================
+reviews:
+  profile: assertive
+
+  # Report commit status to GitHub — enables required status checks
+  request_changes_workflow: true
+  commit_status: true
+
+  high_level_summary: true
+  high_level_summary_placeholder: "@coderabbitai summary"
+
+  suggested_labels: true
+  suggested_reviewers: false
+  poem: false
+
+  auto_review:
+    enabled: true
+    auto_incremental_review: true
+    ignore_title_keywords:
+      - "WIP"
+      - "DO NOT MERGE"
+      - "DRAFT"
+
+  # ---------------------------------------------------------------------------
+  # PRE-MERGE CHECKS
+  # ---------------------------------------------------------------------------
+  pre_merge_checks:
+    issue_assessment:
+      mode: "error"
+
+    title:
+      mode: "error"
+
+    description:
+      mode: "warning"
+
+    custom_checks:
+      - name: "Issue Scope Alignment"
+        mode: "error"
+        instructions: |
+          Verify the PR changes align with the linked Linear issue scope:
+
+          1. SCOPE CHECK: The PR must address at least a meaningful portion of the
+             linked issue. A PR that only adds minor comments or formatting without
+             substantive progress toward the issue goal should FAIL.
+
+          2. NO SCOPE CREEP: The PR should not contain significant unrelated changes
+             that aren't mentioned in the issue. Small opportunistic fixes are OK,
+             but major unrelated features or refactors should be in separate PRs.
+
+          3. INCREMENTAL PROGRESS: For large issues, partial implementations are
+             acceptable if they represent a coherent, working increment. The PR
+             description should clarify what portion of the issue is addressed.
+
+          PASS if the changes meaningfully advance the linked issue's goals.
+          FAIL if the changes are cosmetic-only or mostly unrelated to the issue.
+
+      - name: "Architecture Alignment"
+        mode: "warning"
+        instructions: |
+          Verify the implementation follows fastmcp-gateway's architectural patterns:
+
+          PACKAGE STRUCTURE:
+          - src/ layout with fastmcp_gateway package
+          - gateway.py is the main entry point (GatewayServer)
+          - registry.py owns the in-memory tool store (ToolRegistry)
+          - meta_tools.py implements the 3 meta-tools
+          - client_manager.py manages upstream connections (UpstreamManager)
+
+          PATTERNS:
+          - Dataclasses for simple data containers (ToolEntry, DomainInfo)
+          - All I/O functions must be async def
+          - Type annotations on all public functions
+          - JSON serialization for meta-tool responses (json.dumps)
+          - Upstream tools accessed via FastMCP Client
+
+          CONNECTION MODEL:
+          - Persistent Client instances for registry population (list_tools)
+          - Fresh-per-request via client.new() for tool execution
+          - Graceful degradation: one upstream failure should not block others
+
+          PASS if the implementation follows these patterns.
+          WARN if there are deviations that may have valid reasons but should be reviewed.
+
+  # ---------------------------------------------------------------------------
+  # PATH FILTERS
+  # ---------------------------------------------------------------------------
+  path_filters:
+    - "!**/*.lock"
+    - "!**/.venv/**"
+    - "!**/dist/**"
+    - "!**/__pycache__/**"
+    - "!**/build/**"
+    - "!**/coverage/**"
+    - "!**/.idea/**"
+    - "!**/.vscode/**"
+    - "!**/*.egg-info/**"
+    - "!**/.pytest_cache/**"
+    - "!**/.ruff_cache/**"
+
+  # ---------------------------------------------------------------------------
+  # PATH INSTRUCTIONS
+  # ---------------------------------------------------------------------------
+  path_instructions:
+    - path: "src/fastmcp_gateway/**/*.py"
+      instructions: |
+        PYTHON LIBRARY CODE REVIEW RULES:
+
+        1. TYPE HINTS - REQUIRED:
+           - Use Python 3.11+ syntax: list[str], dict[str, Any], X | None
+           - NEVER import List, Dict, Optional, Union from typing module
+           - All public functions must have complete type annotations
+           - Return types required on all functions
+           - Use `from __future__ import annotations` for forward references
+
+        2. ASYNC I/O - MANDATORY:
+           - All network/client operations must be async
+           - Use FastMCP Client for upstream communication
+           - Never block the event loop with synchronous I/O
+
+        3. ERROR HANDLING:
+           - Meta-tools should return JSON error objects, never raise exceptions to the LLM
+           - Include actionable suggestions in error messages (available domains, similar tool names)
+           - Catch specific exception types, not bare except
+
+        4. PUBLIC API:
+           - GatewayServer is the only public API surface
+           - Changes to __init__.py exports are breaking changes — flag for review
+           - Maintain backwards compatibility in public interfaces
+
+        5. LINTING:
+           - Must pass ruff with rules: E, W, F, I, UP, B, SIM, TCH, RUF
+           - Must pass pyright in standard mode
+
+    - path: "tests/**/*.py"
+      instructions: |
+        TEST CODE REVIEW RULES:
+
+        1. STRUCTURE:
+           - Tests mirror source structure (test_registry.py tests registry.py)
+           - Use shared fixtures from conftest.py, don't duplicate setup
+           - Integration tests use real FastMCP in-process transport
+
+        2. ASSERTIONS:
+           - Test behavior, not implementation details
+           - Don't make tests brittle (e.g., testing exact error copy)
+           - Assert on structural properties (key existence, type, count)
+
+        3. ASYNC:
+           - Use @pytest.mark.asyncio for async tests
+           - pytest-asyncio auto mode is enabled — async fixtures auto-detected
+
+  # ---------------------------------------------------------------------------
+  # TOOLS
+  # ---------------------------------------------------------------------------
+  tools:
+    ruff:
+      enabled: true
+
+    gitleaks:
+      enabled: true
+
+    yamllint:
+      enabled: true
+
+    shellcheck:
+      enabled: true
+
+    ast-grep:
+      essential_rules: true
+
+# ==============================================================================
+# CHAT SETTINGS
+# ==============================================================================
+chat:
+  auto_reply: true
+
+# ==============================================================================
+# KNOWLEDGE BASE
+# ==============================================================================
+knowledge_base:
+  learnings:
+    scope: auto
+
+  issues:
+    scope: auto
+
+  linear:
+    usage: enabled
+    team_keys:
+      - "ULT"
+
+  code_guidelines:
+    enabled: true
