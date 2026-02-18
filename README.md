@@ -43,11 +43,17 @@ No existing project combines progressive tool discovery with an MCP gateway on F
 
 ## Research
 
+- [Requirements](docs/requirements.md) — Functional and non-functional requirements
 - [Gateway Landscape Analysis](docs/research/01-gateway-landscape.md) — Code-level review of MetaMCP, Microsoft MCP Gateway, IBM ContextForge
 - [Progressive Discovery Prior Art](docs/research/02-progressive-discovery-prior-art.md) — Speakeasy, Claude Code Tool Search, and open-source implementations
 - [FastMCP Building Blocks](docs/research/03-fastmcp-building-blocks.md) — What FastMCP already provides and what must be built
 - [Why Build New](docs/research/04-why-build-new.md) — Why extending an existing gateway won't work
-- [Requirements](docs/requirements.md) — Functional and non-functional requirements
+- [Community Anchors](docs/research/05-community-anchors.md) — MCP specs, Anthropic guidance, community best practices
+- [Language and Architecture](docs/research/06-language-and-architecture.md) — Python confirmation, FastMCP extension architecture
+- [PydanticAI Integration](docs/research/07-pydantic-ai-integration.md) — Integration points and technical requirements
+- [Observability](docs/research/08-observability.md) — OpenTelemetry, MCP semantic conventions, Logfire
+- [Connection Lifecycle](docs/research/09-connection-lifecycle.md) — Upstream connections and auth passthrough
+- [Meta-Tool Schemas](docs/research/10-meta-tool-schemas.md) — API surface design for the 3 meta-tools
 
 ## License
 
