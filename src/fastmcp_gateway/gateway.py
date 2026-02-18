@@ -6,6 +6,7 @@ from typing import Any
 
 from fastmcp import FastMCP
 
+from fastmcp_gateway.client_manager import UpstreamManager
 from fastmcp_gateway.registry import ToolRegistry
 
 
@@ -32,6 +33,7 @@ class GatewayServer:
     ) -> None:
         self.upstreams = upstreams
         self.registry = ToolRegistry()
+        self.upstream_manager = UpstreamManager(upstreams, self.registry)
         self._mcp = FastMCP(
             name,
             instructions=instructions if instructions is not None else self._default_instructions(),
@@ -43,16 +45,23 @@ class GatewayServer:
         """Access the underlying FastMCP server instance."""
         return self._mcp
 
+    async def populate(self) -> dict[str, int]:
+        """Discover tools from all configured upstreams.
+
+        Call this before serving requests so the registry is populated.
+        Returns a mapping of domain -> tool count.
+        """
+        return await self.upstream_manager.populate_all()
+
     def run(self, **kwargs: Any) -> None:
         """Run the gateway server."""
         self._mcp.run(**kwargs)
 
     def _register_meta_tools(self) -> None:
         """Register the 3 meta-tools on the FastMCP server."""
-        # Import here to avoid circular imports
         from fastmcp_gateway.meta_tools import register_meta_tools
 
-        register_meta_tools(self._mcp, self.registry, self.upstreams)
+        register_meta_tools(self._mcp, self.registry, self.upstream_manager)
 
     @staticmethod
     def _default_instructions() -> str:
