@@ -84,7 +84,7 @@ class UpstreamManager:
 
         return self._registry.populate_domain(
             domain=domain,
-            upstream_url=self._upstreams[domain],
+            upstream_url=str(self._upstreams[domain]),
             tools=raw_tools,
         )
 
