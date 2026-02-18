@@ -97,6 +97,41 @@ class TestRegistryBasics:
         tools = empty_registry.get_tools_by_group("d", "g")
         assert len(tools) == 1
 
+    def test_reregister_cleans_up_stale_index(self, empty_registry: ToolRegistry) -> None:
+        """Re-registering a tool under a different domain/group removes stale index entries."""
+        original = ToolEntry(
+            name="moving_tool",
+            domain="old_domain",
+            group="old_group",
+            description="",
+            input_schema={},
+            upstream_url="http://x:8080/mcp",
+        )
+        empty_registry.register_tool(original)
+        assert empty_registry.has_domain("old_domain")
+        assert empty_registry.has_group("old_domain", "old_group")
+
+        # Re-register under a different domain/group
+        updated = ToolEntry(
+            name="moving_tool",
+            domain="new_domain",
+            group="new_group",
+            description="updated",
+            input_schema={},
+            upstream_url="http://y:8080/mcp",
+        )
+        empty_registry.register_tool(updated)
+
+        # Old index entries should be cleaned up
+        assert not empty_registry.has_domain("old_domain")
+        assert not empty_registry.has_group("old_domain", "old_group")
+
+        # New entries should exist
+        assert empty_registry.has_domain("new_domain")
+        assert empty_registry.has_group("new_domain", "new_group")
+        assert empty_registry.tool_count == 1
+        assert empty_registry.lookup("moving_tool") is updated
+
 
 # ---------------------------------------------------------------------------
 # ToolRegistry — domain info and listing
