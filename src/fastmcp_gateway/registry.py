@@ -2,8 +2,29 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+
+def infer_group(domain: str, tool_name: str) -> str:
+    """Infer a tool's group from its name by stripping the domain prefix.
+
+    Convention: tool names follow ``{domain}_{group}_{action}`` pattern.
+    Examples:
+        infer_group("apollo", "apollo_people_search")   -> "people"
+        infer_group("hubspot", "hubspot_contacts_create") -> "contacts"
+        infer_group("apollo", "search")                  -> "general"
+    """
+    prefix = f"{domain}_"
+    if tool_name.startswith(prefix):
+        remainder = tool_name[len(prefix) :]
+        parts = remainder.split("_", 1)
+        if parts[0]:
+            return parts[0]
+    return "general"
 
 
 @dataclass
@@ -74,6 +95,55 @@ class ToolRegistry:
             if not self._domains[domain]:
                 del self._domains[domain]
 
+    def populate_domain(
+        self,
+        domain: str,
+        upstream_url: str,
+        tools: list[dict[str, Any]],
+        *,
+        description: str = "",
+        group_overrides: dict[str, str] | None = None,
+    ) -> int:
+        """Populate the registry with tools from an upstream server.
+
+        Each tool dict should have at minimum ``name`` and ``inputSchema`` keys,
+        matching the shape returned by MCP ``tools/list``.  An optional
+        ``description`` key provides the tool's one-line summary.
+
+        Groups are inferred from tool name prefixes unless overridden via
+        *group_overrides* (mapping tool name -> explicit group).
+
+        Returns the number of tools registered.
+        """
+        self.clear_domain(domain)
+
+        if description:
+            self.set_domain_description(domain, description)
+
+        overrides = group_overrides or {}
+        count = 0
+        for raw in tools:
+            name: str = raw.get("name", "")
+            if not name:
+                logger.warning("Skipping tool with empty name in domain %s", domain)
+                continue
+
+            group = overrides.get(name, infer_group(domain, name))
+
+            self.register_tool(
+                ToolEntry(
+                    name=name,
+                    domain=domain,
+                    group=group,
+                    description=raw.get("description", ""),
+                    input_schema=raw.get("inputSchema", {}),
+                    upstream_url=upstream_url,
+                )
+            )
+            count += 1
+
+        return count
+
     def set_domain_description(self, domain: str, description: str) -> None:
         """Set a human-readable description for a domain."""
         self._domain_descriptions[domain] = description
@@ -128,7 +198,11 @@ class ToolRegistry:
         return [self._tools[name] for name in sorted(tool_names) if name in self._tools]
 
     def search(self, query: str) -> list[ToolEntry]:
-        """Keyword search across tool names and descriptions."""
+        """Keyword search across tool names and descriptions.
+
+        All whitespace-separated tokens must appear somewhere in the
+        tool's name or description (AND semantics).
+        """
         query_lower = query.lower()
         tokens = query_lower.split()
         results = []
