@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -27,7 +28,87 @@ def register_meta_tools(mcp: FastMCP, registry: ToolRegistry, upstream_manager: 
         Call with a domain and group to see tools in that specific group.
         Call with a query to search across all tools by keyword.
         """
-        raise NotImplementedError("discover_tools not yet implemented")
+        # Mode 4: keyword search (takes priority when query is provided)
+        if query is not None and query.strip():
+            results = registry.search(query)
+            return json.dumps(
+                {
+                    "query": query,
+                    "results": [
+                        {
+                            "name": t.name,
+                            "domain": t.domain,
+                            "group": t.group,
+                            "description": t.description,
+                        }
+                        for t in results
+                    ],
+                }
+            )
+
+        # Mode 1: no arguments -> domain summary
+        if domain is None:
+            domain_info = registry.get_domain_info()
+            return json.dumps(
+                {
+                    "domains": [
+                        {
+                            "name": d.name,
+                            "description": d.description,
+                            "tool_count": d.tool_count,
+                            "groups": d.groups,
+                        }
+                        for d in domain_info
+                    ],
+                    "total_tools": registry.tool_count,
+                }
+            )
+
+        # Validate domain
+        if not registry.has_domain(domain):
+            available = registry.get_domain_names()
+            return json.dumps(
+                {
+                    "error": f"Unknown domain '{domain}'. Available domains: {', '.join(available)}"
+                    if available
+                    else f"Unknown domain '{domain}'. No domains are registered."
+                }
+            )
+
+        # Mode 3: domain + group -> tools in that group
+        if group is not None:
+            if not registry.has_group(domain, group):
+                available_groups = registry.get_groups_for_domain(domain)
+                return json.dumps(
+                    {
+                        "error": f"Unknown group '{group}' in domain '{domain}'. "
+                        f"Available groups: {', '.join(available_groups)}"
+                    }
+                )
+            tools = registry.get_tools_by_group(domain, group)
+            return json.dumps(
+                {
+                    "domain": domain,
+                    "group": group,
+                    "tools": [{"name": t.name, "description": t.description} for t in tools],
+                }
+            )
+
+        # Mode 2: domain only -> all tools in domain
+        tools = registry.get_tools_by_domain(domain)
+        return json.dumps(
+            {
+                "domain": domain,
+                "tools": [
+                    {
+                        "name": t.name,
+                        "group": t.group,
+                        "description": t.description,
+                    }
+                    for t in tools
+                ],
+            }
+        )
 
     @mcp.tool()
     async def get_tool_schema(tool_name: str) -> str:
