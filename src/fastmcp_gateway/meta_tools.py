@@ -7,10 +7,11 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from fastmcp import FastMCP
 
+    from fastmcp_gateway.client_manager import UpstreamManager
     from fastmcp_gateway.registry import ToolRegistry
 
 
-def register_meta_tools(mcp: FastMCP, registry: ToolRegistry, upstreams: dict[str, str]) -> None:
+def register_meta_tools(mcp: FastMCP, registry: ToolRegistry, upstream_manager: UpstreamManager) -> None:
     """Register the 3 meta-tools on the FastMCP server."""
 
     @mcp.tool()
