@@ -173,4 +173,39 @@ def register_meta_tools(mcp: FastMCP, registry: ToolRegistry, upstream_manager: 
         Use discover_tools to find available tools, then get_tool_schema
         to see what arguments a tool accepts, then call this to execute it.
         """
-        raise NotImplementedError("execute_tool not yet implemented")
+        # Validate tool exists
+        entry = registry.lookup(tool_name)
+        if entry is None:
+            suggestions = _suggest_tool_names(tool_name, registry.get_all_tool_names())
+            if suggestions:
+                hint = f"Did you mean {', '.join(repr(s) for s in suggestions)}?"
+            else:
+                hint = "Use discover_tools to browse available tools."
+            return json.dumps({"error": f"Unknown tool '{tool_name}'. {hint}"})
+
+        # Route to upstream via fresh client
+        try:
+            result = await upstream_manager.execute_tool(tool_name, arguments)
+        except Exception as exc:  # Broad catch: gateway must not crash from upstream failures
+            return json.dumps(
+                {
+                    "error": f"Tool '{tool_name}' failed: "
+                    f"upstream server '{entry.domain}' returned an error. "
+                    f"Other domains may still be available. ({type(exc).__name__}: {exc})"
+                }
+            )
+
+        # Serialize content blocks to text
+        content_parts: list[str] = []
+        for block in result.content:
+            if hasattr(block, "text"):
+                content_parts.append(block.text)  # type: ignore[union-attr]
+            else:
+                content_parts.append(str(block))
+
+        result_text = "\n".join(content_parts)
+
+        if result.is_error:
+            return json.dumps({"tool": tool_name, "error": result_text})
+
+        return json.dumps({"tool": tool_name, "result": result_text})
