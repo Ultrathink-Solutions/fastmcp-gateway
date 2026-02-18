@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from fastmcp import FastMCP
 
 from fastmcp_gateway.client_manager import UpstreamManager
 from fastmcp_gateway.registry import ToolRegistry
+
+logger = logging.getLogger(__name__)
 
 
 class GatewayServer:
@@ -16,11 +19,32 @@ class GatewayServer:
     Aggregates tools from multiple upstream MCP servers and exposes them
     through 3 meta-tools: discover_tools, get_tool_schema, execute_tool.
 
-    Usage:
+    Parameters
+    ----------
+    upstreams:
+        Mapping of domain name to upstream MCP server URL.
+    name:
+        Name for the FastMCP server instance.
+    instructions:
+        Custom LLM system instructions.  If ``None``, uses a sensible
+        default describing the 3-step discovery workflow.
+    registry_auth_headers:
+        Headers to send to upstreams during startup registry population
+        (runs outside any HTTP request context).
+    upstream_headers:
+        Per-domain headers for tool execution.  Domains listed here use
+        these headers instead of request-passthrough.
+    domain_descriptions:
+        Human-readable descriptions for each domain, shown in the
+        ``discover_tools`` domain summary.
+
+    Usage::
+
         gateway = GatewayServer({
             "apollo": "http://apollo-mcp:8080/mcp",
             "hubspot": "http://hubspot-mcp:8080/mcp",
         })
+        await gateway.populate()
         gateway.run()
     """
 
@@ -30,15 +54,25 @@ class GatewayServer:
         *,
         name: str = "fastmcp-gateway",
         instructions: str | None = None,
+        registry_auth_headers: dict[str, str] | None = None,
+        upstream_headers: dict[str, dict[str, str]] | None = None,
+        domain_descriptions: dict[str, str] | None = None,
     ) -> None:
         self.upstreams = upstreams
         self.registry = ToolRegistry()
-        self.upstream_manager = UpstreamManager(upstreams, self.registry)
+        self._domain_descriptions = domain_descriptions or {}
+        self.upstream_manager = UpstreamManager(
+            upstreams,
+            self.registry,
+            registry_auth_headers=registry_auth_headers,
+            upstream_headers=upstream_headers,
+        )
         self._mcp = FastMCP(
             name,
             instructions=instructions if instructions is not None else self._default_instructions(),
         )
         self._register_meta_tools()
+        self._register_health_routes()
 
     @property
     def mcp(self) -> FastMCP:
@@ -51,7 +85,19 @@ class GatewayServer:
         Call this before serving requests so the registry is populated.
         Returns a mapping of domain -> tool count.
         """
-        return await self.upstream_manager.populate_all()
+        results = await self.upstream_manager.populate_all()
+
+        # Apply domain descriptions after population.
+        for domain, description in self._domain_descriptions.items():
+            if self.registry.has_domain(domain):
+                self.registry.set_domain_description(domain, description)
+            else:
+                logger.warning(
+                    "Domain description for '%s' ignored — domain not populated",
+                    domain,
+                )
+
+        return results
 
     def run(self, **kwargs: Any) -> None:
         """Run the gateway server."""
@@ -62,6 +108,35 @@ class GatewayServer:
         from fastmcp_gateway.meta_tools import register_meta_tools
 
         register_meta_tools(self._mcp, self.registry, self.upstream_manager)
+
+    def _register_health_routes(self) -> None:
+        """Register /healthz and /readyz health check endpoints."""
+        from opentelemetry import trace
+        from starlette.responses import JSONResponse
+
+        tracer = trace.get_tracer(__name__)
+        registry = self.registry
+
+        @self._mcp.custom_route("/healthz", methods=["GET"])
+        async def _healthz(_request: Any) -> Any:
+            with tracer.start_as_current_span("gateway.healthz") as span:
+                span.set_attribute("http.method", "GET")
+                span.set_attribute("http.route", "/healthz")
+                return JSONResponse({"status": "ok"})
+
+        @self._mcp.custom_route("/readyz", methods=["GET"])
+        async def _readyz(_request: Any) -> Any:
+            with tracer.start_as_current_span("gateway.readyz") as span:
+                span.set_attribute("http.method", "GET")
+                span.set_attribute("http.route", "/readyz")
+                tool_count = registry.tool_count
+                span.set_attribute("registry.tool_count", tool_count)
+                if tool_count > 0:
+                    return JSONResponse({"status": "ready", "tools": tool_count})
+                return JSONResponse(
+                    {"status": "not_ready", "tools": 0},
+                    status_code=503,
+                )
 
     @staticmethod
     def _default_instructions() -> str:

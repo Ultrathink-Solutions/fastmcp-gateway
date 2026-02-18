@@ -4,6 +4,10 @@ Persistent clients are used for registry population (list_tools at
 startup/refresh).  Fresh-per-request clients are used for execute_tool
 so that each call inherits the current user's HTTP headers via
 FastMCP's ``get_http_headers()`` ContextVar.
+
+Optionally, per-domain headers can be configured via *upstream_headers*
+to override the ContextVar passthrough for specific domains (e.g. when
+an upstream requires a different auth token).
 """
 
 from __future__ import annotations
@@ -21,6 +25,20 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _set_transport_headers(client: Client, headers: dict[str, str]) -> None:
+    """Merge explicit headers into an HTTP-based client transport.
+
+    Preserves any existing default headers on the transport and overlays
+    the provided *headers* on top.  FastMCP transports created from URLs
+    (SSE / Streamable-HTTP) have a ``headers`` attribute.  Stdio transports
+    do not, but the gateway only creates HTTP clients, so this is safe in
+    practice.
+    """
+    transport: Any = client.transport
+    existing = dict(transport.headers) if transport.headers else {}
+    transport.headers = {**existing, **headers}
+
+
 class UpstreamManager:
     """Manages connections to upstream MCP servers.
 
@@ -30,14 +48,36 @@ class UpstreamManager:
         Mapping of domain name to upstream MCP server URL.
     registry:
         The shared tool registry to populate.
+    registry_auth_headers:
+        Headers to send when populating the registry at startup.
+        Registry clients run outside any HTTP request context, so
+        ``get_http_headers()`` is empty.  Pass auth headers here
+        for upstreams that require authentication on ``list_tools``.
+    upstream_headers:
+        Per-domain headers for tool execution.  When ``execute_tool``
+        routes to a domain listed here, these headers are used instead
+        of the default request-passthrough behaviour.
     """
 
-    def __init__(self, upstreams: dict[str, str], registry: ToolRegistry) -> None:
+    def __init__(
+        self,
+        upstreams: dict[str, str],
+        registry: ToolRegistry,
+        *,
+        registry_auth_headers: dict[str, str] | None = None,
+        upstream_headers: dict[str, dict[str, str]] | None = None,
+    ) -> None:
         self._upstreams = upstreams
         self._registry = registry
+        self._upstream_headers = upstream_headers or {}
 
         # Persistent clients for registry operations (no user context).
-        self._registry_clients: dict[str, Client] = {domain: Client(url) for domain, url in upstreams.items()}
+        self._registry_clients: dict[str, Client] = {}
+        for domain, url in upstreams.items():
+            client = Client(url)
+            if registry_auth_headers:
+                _set_transport_headers(client, registry_auth_headers)
+            self._registry_clients[domain] = client
 
     # ------------------------------------------------------------------
     # Registry population
@@ -99,9 +139,10 @@ class UpstreamManager:
     ) -> CallToolResult:
         """Execute a tool on its upstream server.
 
-        Creates a **fresh** ``Client`` for each call so that FastMCP's
-        ``get_http_headers()`` ContextVar resolves the *current* user's
-        HTTP headers, ensuring per-request auth isolation.
+        Creates a **fresh** ``Client`` for each call.  For domains with
+        explicit *upstream_headers*, those headers are applied directly.
+        For all other domains, FastMCP's ``get_http_headers()`` ContextVar
+        resolves the *current* user's HTTP headers (request passthrough).
 
         Raises ``KeyError`` if *tool_name* is not in the registry.
         """
@@ -110,9 +151,7 @@ class UpstreamManager:
             msg = f"Tool '{tool_name}' not found in registry"
             raise KeyError(msg)
 
-        # Resolve the domain's base client and create a fresh session.
-        base_client = self._registry_clients[entry.domain]
-        fresh_client = base_client.new()
+        fresh_client = self._make_execution_client(entry.domain)
 
         async with fresh_client:
             return await fresh_client.call_tool(
@@ -120,6 +159,20 @@ class UpstreamManager:
                 arguments or {},
                 raise_on_error=False,
             )
+
+    def _make_execution_client(self, domain: str) -> Client:
+        """Create a fresh client for tool execution via ``client.new()``.
+
+        Always uses ``client.new()`` to create a shallow copy of the
+        registry client, ensuring consistent transport configuration.
+        If *domain* has explicit upstream headers, those are merged onto
+        the new client's transport.  Otherwise the client inherits
+        request-passthrough behaviour via the ContextVar.
+        """
+        client = self._registry_clients[domain].new()
+        if domain in self._upstream_headers:
+            _set_transport_headers(client, self._upstream_headers[domain])
+        return client
 
     # ------------------------------------------------------------------
     # Introspection helpers

@@ -36,6 +36,9 @@ dev = [
     "pydantic-ai>=0.1",
 ]
 
+[project.scripts]
+fastmcp-gateway = "fastmcp_gateway.__main__:main"
+
 [project.urls]
 Homepage = "https://github.com/Ultrathink-Solutions/fastmcp-gateway"
 Repository = "https://github.com/Ultrathink-Solutions/fastmcp-gateway"
