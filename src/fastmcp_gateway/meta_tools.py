@@ -12,6 +12,31 @@ if TYPE_CHECKING:
     from fastmcp_gateway.registry import ToolRegistry
 
 
+def _suggest_tool_names(query: str, all_names: list[str], max_suggestions: int = 3) -> list[str]:
+    """Return tool names similar to *query* for error messages.
+
+    Scores based on substring containment, shared prefix segments,
+    and shared word segments (order-independent).
+    """
+    query_lower = query.lower()
+    q_parts = set(query_lower.split("_"))
+    scored: list[tuple[int, str]] = []
+    for name in all_names:
+        name_lower = name.lower()
+        score = 0
+        # Substring match (either direction)
+        if query_lower in name_lower or name_lower in query_lower:
+            score += 3
+        # Shared word segments (order-independent)
+        n_parts = set(name_lower.split("_"))
+        shared = q_parts & n_parts
+        score += len(shared)
+        if score > 0:
+            scored.append((score, name))
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    return [name for _, name in scored[:max_suggestions]]
+
+
 def register_meta_tools(mcp: FastMCP, registry: ToolRegistry, upstream_manager: UpstreamManager) -> None:
     """Register the 3 meta-tools on the FastMCP server."""
 
@@ -118,7 +143,25 @@ def register_meta_tools(mcp: FastMCP, registry: ToolRegistry, upstream_manager: 
         before calling execute_tool. Returns the JSON Schema that describes
         what arguments the tool accepts.
         """
-        raise NotImplementedError("get_tool_schema not yet implemented")
+        entry = registry.lookup(tool_name)
+        if entry is not None:
+            return json.dumps(
+                {
+                    "name": entry.name,
+                    "domain": entry.domain,
+                    "group": entry.group,
+                    "description": entry.description,
+                    "parameters": entry.input_schema,
+                }
+            )
+
+        # Unknown tool — suggest similar names
+        suggestions = _suggest_tool_names(tool_name, registry.get_all_tool_names())
+        if suggestions:
+            hint = f"Did you mean {', '.join(repr(s) for s in suggestions)}?"
+        else:
+            hint = "Use discover_tools to browse available tools."
+        return json.dumps({"error": f"Unknown tool '{tool_name}'. {hint}"})
 
     @mcp.tool()
     async def execute_tool(
