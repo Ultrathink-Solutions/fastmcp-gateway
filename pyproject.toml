@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "fastmcp-gateway"
-version = "0.1.0"
+version = "0.1.1"
 description = "Progressive tool discovery gateway for MCP, built on FastMCP"
 readme = "README.md"
 license = "Apache-2.0"
