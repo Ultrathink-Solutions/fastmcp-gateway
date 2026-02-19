@@ -68,8 +68,25 @@ def _load_json_env(name: str, *, required: bool = False) -> dict[str, Any] | Non
     return value
 
 
-async def _run() -> None:
-    """Build, populate, and run the gateway."""
+async def _populate(gateway: GatewayServer) -> None:
+    """Populate the gateway registry from upstream servers."""
+    results = await gateway.populate()
+    total = sum(results.values())
+    logger.info(
+        "Registry populated: %d tools across %d domains %s",
+        total,
+        len(results),
+        dict(results),
+    )
+
+
+def main() -> None:
+    """CLI entry point."""
+    logging.basicConfig(
+        level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
     upstreams = _load_json_env("GATEWAY_UPSTREAMS", required=True)
     assert upstreams is not None  # guaranteed by required=True
 
@@ -101,25 +118,11 @@ async def _run() -> None:
         domain_descriptions=domain_descriptions,
     )
 
-    results = await gateway.populate()
-    total = sum(results.values())
-    logger.info(
-        "Registry populated: %d tools across %d domains %s",
-        total,
-        len(results),
-        dict(results),
-    )
-
+    # Populate in its own event loop, then run the server (which creates its
+    # own loop via anyio).  Calling gateway.run() from inside asyncio.run()
+    # would fail with "Already running asyncio in this thread".
+    asyncio.run(_populate(gateway))
     gateway.run(host=host, port=port, transport="streamable-http")
-
-
-def main() -> None:
-    """CLI entry point."""
-    logging.basicConfig(
-        level=os.environ.get("LOG_LEVEL", "INFO").upper(),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
-    asyncio.run(_run())
 
 
 if __name__ == "__main__":
