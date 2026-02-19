@@ -1,0 +1,129 @@
+# Example Kubernetes deployment for fastmcp-gateway
+#
+# This deploys the gateway with two upstream MCP servers. Adjust the
+# GATEWAY_UPSTREAMS ConfigMap to match your environment.
+#
+# Apply:
+#   kubectl apply -f deployment.yaml
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fastmcp-gateway-config
+data:
+  GATEWAY_UPSTREAMS: |
+    {
+      "service_a": "http://service-a-mcp:8080/mcp",
+      "service_b": "http://service-b-mcp:8080/mcp"
+    }
+  GATEWAY_DOMAIN_DESCRIPTIONS: |
+    {
+      "service_a": "Service A tools",
+      "service_b": "Service B tools"
+    }
+  GATEWAY_NAME: "my-gateway"
+
+---
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fastmcp-gateway
+  labels:
+    app: fastmcp-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fastmcp-gateway
+  template:
+    metadata:
+      labels:
+        app: fastmcp-gateway
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: gateway
+          image: fastmcp-gateway:latest  # Replace with your registry image
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: fastmcp-gateway-config
+          env:
+            # Optional: auth token for upstream MCP servers
+            # - name: GATEWAY_REGISTRY_AUTH_TOKEN
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: gateway-secrets
+            #       key: registry-auth-token
+            #
+            # Optional: per-domain headers (JSON)
+            # - name: GATEWAY_UPSTREAM_HEADERS
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: gateway-secrets
+            #       key: upstream-headers
+            - name: GATEWAY_HOST
+              value: "0.0.0.0"
+            - name: GATEWAY_PORT
+              value: "8080"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 30
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: fastmcp-gateway
+spec:
+  selector:
+    app: fastmcp-gateway
+  ports:
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP
+  type: ClusterIP
