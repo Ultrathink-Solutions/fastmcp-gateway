@@ -30,6 +30,11 @@ Configure via environment variables:
         Domains listed here use these headers instead of request-passthrough.
         Example: {"ahrefs": {"Authorization": "Bearer <key>"}}
 
+    GATEWAY_REFRESH_INTERVAL
+        Seconds between automatic registry refresh cycles (float).
+        When set, the gateway periodically re-queries all upstreams
+        to detect added/removed tools.  Disabled by default.
+
 Usage::
 
     GATEWAY_UPSTREAMS='{"apollo": "http://localhost:8080/mcp"}' python -m fastmcp_gateway
@@ -40,6 +45,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import sys
 from typing import Any
@@ -109,6 +115,22 @@ def main() -> None:
     if registry_token:
         registry_auth_headers = {"Authorization": f"Bearer {registry_token}"}
 
+    # Background refresh interval (optional).
+    refresh_interval: float | None = None
+    refresh_interval_raw = os.environ.get("GATEWAY_REFRESH_INTERVAL", "")
+    if refresh_interval_raw:
+        try:
+            refresh_interval = float(refresh_interval_raw)
+        except ValueError:
+            logger.error("Invalid GATEWAY_REFRESH_INTERVAL: %s (must be a number)", refresh_interval_raw)
+            sys.exit(1)
+        if not math.isfinite(refresh_interval) or refresh_interval <= 0:
+            logger.error(
+                "Invalid GATEWAY_REFRESH_INTERVAL: %s (must be a positive, finite number)",
+                refresh_interval_raw,
+            )
+            sys.exit(1)
+
     gateway = GatewayServer(
         upstreams,
         name=name,
@@ -116,6 +138,7 @@ def main() -> None:
         registry_auth_headers=registry_auth_headers,
         upstream_headers=upstream_headers,
         domain_descriptions=domain_descriptions,
+        refresh_interval=refresh_interval,
     )
 
     # Populate in its own event loop, then run the server (which creates its

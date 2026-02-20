@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from typing import Any
+from contextlib import asynccontextmanager, suppress
+from typing import TYPE_CHECKING, Any
 
 from fastmcp import FastMCP
 
 from fastmcp_gateway.client_manager import UpstreamManager
 from fastmcp_gateway.registry import ToolRegistry
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +42,10 @@ class GatewayServer:
     domain_descriptions:
         Human-readable descriptions for each domain, shown in the
         ``discover_tools`` domain summary.
+    refresh_interval:
+        If set, the gateway will periodically re-query all upstreams
+        at this interval (in seconds) to keep the registry up-to-date.
+        The background task runs inside the ASGI server lifespan.
 
     Usage::
 
@@ -57,10 +66,13 @@ class GatewayServer:
         registry_auth_headers: dict[str, str] | None = None,
         upstream_headers: dict[str, dict[str, str]] | None = None,
         domain_descriptions: dict[str, str] | None = None,
+        refresh_interval: float | None = None,
     ) -> None:
         self.upstreams = upstreams
         self.registry = ToolRegistry()
         self._domain_descriptions = domain_descriptions or {}
+        self._refresh_interval = refresh_interval
+        self._refresh_task: asyncio.Task[None] | None = None
         self.upstream_manager = UpstreamManager(
             upstreams,
             self.registry,
@@ -70,6 +82,7 @@ class GatewayServer:
         self._mcp = FastMCP(
             name,
             instructions=instructions if instructions is not None else self._default_instructions(),
+            lifespan=self._server_lifespan if refresh_interval else None,
         )
         self._register_meta_tools()
         self._register_health_routes()
@@ -102,6 +115,48 @@ class GatewayServer:
     def run(self, **kwargs: Any) -> None:
         """Run the gateway server."""
         self._mcp.run(**kwargs)
+
+    # ------------------------------------------------------------------
+    # Background refresh
+    # ------------------------------------------------------------------
+
+    @asynccontextmanager
+    async def _server_lifespan(self, _app: FastMCP) -> AsyncIterator[None]:
+        """ASGI lifespan that manages the background refresh task."""
+        self._refresh_task = asyncio.create_task(self._refresh_loop())
+        yield
+        self._refresh_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await self._refresh_task
+        self._refresh_task = None
+
+    async def _refresh_loop(self) -> None:
+        """Periodically re-query all upstreams to keep the registry fresh."""
+        from opentelemetry import trace
+
+        tracer = trace.get_tracer("fastmcp_gateway.gateway")
+        assert self._refresh_interval is not None
+        while True:
+            await asyncio.sleep(self._refresh_interval)
+            with tracer.start_as_current_span("gateway.background_refresh") as span:
+                try:
+                    diffs = await self.upstream_manager.refresh_all()
+                    span.set_attribute("gateway.domains_refreshed", len(diffs))
+                    for diff in diffs:
+                        if diff.added or diff.removed:
+                            logger.info(
+                                "Registry refresh for '%s': +%d -%d tools",
+                                diff.domain,
+                                len(diff.added),
+                                len(diff.removed),
+                            )
+                except Exception:
+                    span.set_attribute("gateway.refresh_failed", True)
+                    logger.exception("Background registry refresh failed")
+
+    # ------------------------------------------------------------------
+    # Internal setup
+    # ------------------------------------------------------------------
 
     def _register_meta_tools(self) -> None:
         """Register the 3 meta-tools on the FastMCP server."""
