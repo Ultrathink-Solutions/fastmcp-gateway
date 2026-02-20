@@ -264,3 +264,37 @@ def register_meta_tools(mcp: FastMCP, registry: ToolRegistry, upstream_manager: 
                 )
 
             return json.dumps({"tool": tool_name, "result": result_text})
+
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, openWorldHint=False))
+    async def refresh_registry() -> str:
+        """Refresh the tool registry by re-querying all upstream MCP servers.
+
+        Returns a summary of changes (tools added/removed per domain).
+        Use this if you suspect the available tools have changed since
+        the gateway started.
+        """
+        with _tracer.start_as_current_span("gateway.refresh_registry") as span:
+            try:
+                diffs = await upstream_manager.refresh_all()
+            except Exception as exc:
+                span.set_attribute("gateway.error_code", "refresh_error")
+                span.record_exception(exc)
+                return error_response(
+                    "refresh_error",
+                    "Failed to refresh the tool registry. Some or all upstreams may be unreachable.",
+                )
+
+            span.set_attribute("gateway.domains_refreshed", len(diffs))
+            return json.dumps(
+                {
+                    "refreshed": [
+                        {
+                            "domain": d.domain,
+                            "added": d.added,
+                            "removed": d.removed,
+                            "tool_count": d.tool_count,
+                        }
+                        for d in diffs
+                    ],
+                }
+            )

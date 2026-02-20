@@ -53,6 +53,17 @@ class DomainInfo(BaseModel):
     tool_count: int
 
 
+class RegistryDiff(BaseModel):
+    """Result of a populate/refresh operation, describing what changed."""
+
+    model_config = ConfigDict(frozen=True)
+
+    domain: str
+    added: list[str]
+    removed: list[str]
+    tool_count: int
+
+
 class ToolRegistry:
     """In-memory tool registry with domain/group organization.
 
@@ -219,7 +230,7 @@ class ToolRegistry:
         *,
         description: str = "",
         group_overrides: dict[str, str] | None = None,
-    ) -> int:
+    ) -> RegistryDiff:
         """Populate the registry with tools from an upstream server.
 
         Each tool dict should have at minimum ``name`` and ``inputSchema`` keys,
@@ -229,10 +240,13 @@ class ToolRegistry:
         Groups are inferred from tool name prefixes unless overridden via
         *group_overrides* (mapping tool name -> explicit group).
 
-        Returns the number of tools registered.
+        Returns a :class:`RegistryDiff` describing what changed.
         """
         with _tracer.start_as_current_span("gateway.registry.populate_domain") as span:
             span.set_attribute("gateway.domain", domain)
+
+            # Snapshot current tool names for diff calculation.
+            old_names = {t.name for t in self.get_tools_by_domain(domain)}
 
             self.clear_domain(domain)
 
@@ -259,10 +273,15 @@ class ToolRegistry:
                     )
                 )
 
-            # Derive count from actual registry index (handles skipped registrations).
-            count = sum(len(names) for names in self._domains.get(domain, {}).values())
-            span.set_attribute("gateway.tool_count", count)
-            return count
+            new_names = {t.name for t in self.get_tools_by_domain(domain)}
+            diff = RegistryDiff(
+                domain=domain,
+                added=sorted(new_names - old_names),
+                removed=sorted(old_names - new_names),
+                tool_count=len(new_names),
+            )
+            span.set_attribute("gateway.tool_count", diff.tool_count)
+            return diff
 
     def set_domain_description(self, domain: str, description: str) -> None:
         """Set a human-readable description for a domain."""

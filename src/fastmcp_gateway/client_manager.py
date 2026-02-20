@@ -22,7 +22,7 @@ from opentelemetry import trace
 if TYPE_CHECKING:
     from fastmcp.client.client import CallToolResult
 
-    from fastmcp_gateway.registry import ToolRegistry
+    from fastmcp_gateway.registry import RegistryDiff, ToolRegistry
 
 logger = logging.getLogger(__name__)
 _tracer = trace.get_tracer("fastmcp_gateway.client_manager")
@@ -116,9 +116,9 @@ class UpstreamManager:
             results: dict[str, int] = {}
             for domain, client in self._registry_clients.items():
                 try:
-                    count = await self._populate_domain(domain, client)
-                    results[domain] = count
-                    logger.info("Populated %d tools from upstream '%s'", count, domain)
+                    diff = await self._populate_domain(domain, client)
+                    results[domain] = diff.tool_count
+                    logger.info("Populated %d tools from upstream '%s'", diff.tool_count, domain)
                 except Exception:
                     logger.exception("Failed to populate upstream '%s' — skipping", domain)
             span.set_attribute("gateway.domain_count", len(results))
@@ -131,9 +131,10 @@ class UpstreamManager:
         Raises ``KeyError`` if *domain* is not a configured upstream.
         """
         client = self._registry_clients[domain]
-        return await self._populate_domain(domain, client)
+        diff = await self._populate_domain(domain, client)
+        return diff.tool_count
 
-    async def _populate_domain(self, domain: str, client: Client) -> int:
+    async def _populate_domain(self, domain: str, client: Client) -> RegistryDiff:
         """Connect to *client*, list its tools, and register them."""
         with _tracer.start_as_current_span("gateway.populate_domain") as span:
             span.set_attribute("gateway.domain", domain)
@@ -150,13 +151,42 @@ class UpstreamManager:
                 for t in mcp_tools
             ]
 
-            count = self._registry.populate_domain(
+            diff = self._registry.populate_domain(
                 domain=domain,
                 upstream_url=str(self._upstreams[domain]),
                 tools=raw_tools,
             )
-            span.set_attribute("gateway.tool_count", count)
-            return count
+            span.set_attribute("gateway.tool_count", diff.tool_count)
+            return diff
+
+    # ------------------------------------------------------------------
+    # Registry refresh
+    # ------------------------------------------------------------------
+
+    async def refresh_all(self) -> list[RegistryDiff]:
+        """Re-populate all domains and return per-domain diffs.
+
+        Unlike :meth:`populate_all`, this returns :class:`RegistryDiff`
+        objects so callers can inspect what changed.
+        """
+        with _tracer.start_as_current_span("gateway.refresh_all") as span:
+            diffs: list[RegistryDiff] = []
+            for domain, client in self._registry_clients.items():
+                try:
+                    diff = await self._populate_domain(domain, client)
+                    diffs.append(diff)
+                except Exception:
+                    logger.exception("Failed to refresh upstream '%s' — skipping", domain)
+            span.set_attribute("gateway.domain_count", len(diffs))
+            return diffs
+
+    async def refresh_domain(self, domain: str) -> RegistryDiff:
+        """Re-populate a single domain and return the diff.
+
+        Raises ``KeyError`` if *domain* is not a configured upstream.
+        """
+        client = self._registry_clients[domain]
+        return await self._populate_domain(domain, client)
 
     # ------------------------------------------------------------------
     # Tool execution (fresh client per request)

@@ -285,14 +285,14 @@ class TestPopulateDomain:
             },
         ]
 
-        count = empty_registry.populate_domain(
+        diff = empty_registry.populate_domain(
             domain="acme",
             upstream_url="http://acme:8080/mcp",
             tools=raw_tools,
             description="Acme Corp API",
         )
 
-        assert count == 3
+        assert diff.tool_count == 3
         assert empty_registry.tool_count == 3
         assert empty_registry.get_domain_names() == ["acme"]
         assert set(empty_registry.get_groups_for_domain("acme")) == {"billing", "users"}
@@ -366,8 +366,10 @@ class TestPopulateDomain:
             {"name": "", "inputSchema": {}},
             {"name": "valid_tool", "inputSchema": {}},
         ]
-        count = empty_registry.populate_domain("dom", "http://x:8080/mcp", raw_tools)
-        assert count == 1
+        diff = empty_registry.populate_domain("dom", "http://x:8080/mcp", raw_tools)
+        assert diff.tool_count == 1
+        assert diff.added == ["valid_tool"]
+        assert diff.removed == []
         assert empty_registry.tool_count == 1
 
     def test_populate_missing_fields_use_defaults(self, empty_registry: ToolRegistry) -> None:
@@ -381,13 +383,13 @@ class TestPopulateDomain:
         assert tool.input_schema == {}
 
     def test_populate_empty_tool_list(self, empty_registry: ToolRegistry) -> None:
-        count = empty_registry.populate_domain(
+        diff = empty_registry.populate_domain(
             "empty",
             "http://x:8080/mcp",
             [],
             description="An empty upstream",
         )
-        assert count == 0
+        assert diff.tool_count == 0
         # Domain shouldn't appear since it has no tools
         assert not empty_registry.has_domain("empty")
 
