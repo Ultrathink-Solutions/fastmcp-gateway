@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 from fastmcp import FastMCP
 
 from fastmcp_gateway.client_manager import UpstreamManager
+from fastmcp_gateway.hooks import HookRunner
 from fastmcp_gateway.registry import ToolRegistry
 
 if TYPE_CHECKING:
@@ -46,6 +47,9 @@ class GatewayServer:
         If set, the gateway will periodically re-query all upstreams
         at this interval (in seconds) to keep the registry up-to-date.
         The background task runs inside the ASGI server lifespan.
+    hooks:
+        Optional list of hook instances for execution lifecycle callbacks.
+        See :class:`~fastmcp_gateway.hooks.Hook` for the protocol.
 
     Usage::
 
@@ -67,12 +71,14 @@ class GatewayServer:
         upstream_headers: dict[str, dict[str, str]] | None = None,
         domain_descriptions: dict[str, str] | None = None,
         refresh_interval: float | None = None,
+        hooks: list[Any] | None = None,
     ) -> None:
         self.upstreams = upstreams
         self.registry = ToolRegistry()
         self._domain_descriptions = domain_descriptions or {}
         self._refresh_interval = refresh_interval
         self._refresh_task: asyncio.Task[None] | None = None
+        self._hook_runner = HookRunner(hooks)
         self.upstream_manager = UpstreamManager(
             upstreams,
             self.registry,
@@ -91,6 +97,19 @@ class GatewayServer:
     def mcp(self) -> FastMCP:
         """Access the underlying FastMCP server instance."""
         return self._mcp
+
+    @property
+    def hook_runner(self) -> HookRunner:
+        """Access the hook runner for advanced use."""
+        return self._hook_runner
+
+    def add_hook(self, hook: Any) -> None:
+        """Register an execution lifecycle hook.
+
+        Hooks are called in registration order.  See
+        :class:`~fastmcp_gateway.hooks.Hook` for the protocol.
+        """
+        self._hook_runner.add(hook)
 
     async def populate(self) -> dict[str, int]:
         """Discover tools from all configured upstreams.
@@ -162,7 +181,7 @@ class GatewayServer:
         """Register the 3 meta-tools on the FastMCP server."""
         from fastmcp_gateway.meta_tools import register_meta_tools
 
-        register_meta_tools(self._mcp, self.registry, self.upstream_manager)
+        register_meta_tools(self._mcp, self.registry, self.upstream_manager, self._hook_runner)
 
     def _register_health_routes(self) -> None:
         """Register /healthz and /readyz health check endpoints."""
