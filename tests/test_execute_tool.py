@@ -95,7 +95,7 @@ class TestExecuteToolUnknown:
     async def test_unknown_tool_with_suggestions(self, mcp_server: FastMCP) -> None:
         data = await _call_execute(mcp_server, "apollo_search")
 
-        assert "error" in data
+        assert data["code"] == "tool_not_found"
         assert "apollo_search" in data["error"]
         assert "Did you mean" in data["error"]
 
@@ -103,7 +103,7 @@ class TestExecuteToolUnknown:
     async def test_unknown_tool_no_suggestions(self, mcp_server: FastMCP) -> None:
         data = await _call_execute(mcp_server, "completely_unrelated_xyz_123")
 
-        assert "error" in data
+        assert data["code"] == "tool_not_found"
         assert "discover_tools" in data["error"]
 
 
@@ -119,9 +119,10 @@ class TestExecuteToolUpstreamError:
 
         data = await _call_execute(mcp_server, "apollo_people_search", {"name": "Jane"})
 
-        assert "error" in data
+        assert data["code"] == "execution_error"
         assert "failed" in data["error"]
-        assert "apollo" in data["error"]
+        assert data["details"]["domain"] == "apollo"
+        assert data["details"]["tool"] == "apollo_people_search"
 
     @pytest.mark.asyncio
     async def test_upstream_tool_error(self, mcp_server: FastMCP, manager: UpstreamManager) -> None:
@@ -132,7 +133,7 @@ class TestExecuteToolUpstreamError:
 
         data = await _call_execute(mcp_server, "apollo_people_search", {"limit": -1})
 
-        assert data["tool"] == "apollo_people_search"
-        assert "error" in data
+        assert data["code"] == "upstream_error"
         assert "Invalid parameter" in data["error"]
+        assert data["details"]["tool"] == "apollo_people_search"
         assert "result" not in data
