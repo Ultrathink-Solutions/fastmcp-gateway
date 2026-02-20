@@ -3,9 +3,11 @@
 import logging
 from typing import Any
 
+from opentelemetry import trace
 from pydantic import BaseModel, ConfigDict
 
 logger = logging.getLogger(__name__)
+_tracer = trace.get_tracer("fastmcp_gateway.registry")
 
 
 def infer_group(domain: str, tool_name: str) -> str:
@@ -229,34 +231,38 @@ class ToolRegistry:
 
         Returns the number of tools registered.
         """
-        self.clear_domain(domain)
+        with _tracer.start_as_current_span("gateway.registry.populate_domain") as span:
+            span.set_attribute("gateway.domain", domain)
 
-        if description:
-            self.set_domain_description(domain, description)
+            self.clear_domain(domain)
 
-        overrides = group_overrides or {}
-        count = 0
-        for raw in tools:
-            name: str = raw.get("name", "")
-            if not name:
-                logger.warning("Skipping tool with empty name in domain %s", domain)
-                continue
+            if description:
+                self.set_domain_description(domain, description)
 
-            group = overrides.get(name, infer_group(domain, name))
+            overrides = group_overrides or {}
+            for raw in tools:
+                name: str = raw.get("name", "")
+                if not name:
+                    logger.warning("Skipping tool with empty name in domain %s", domain)
+                    continue
 
-            self.register_tool(
-                ToolEntry(
-                    name=name,
-                    domain=domain,
-                    group=group,
-                    description=raw.get("description", ""),
-                    input_schema=raw.get("inputSchema", {}),
-                    upstream_url=upstream_url,
+                group = overrides.get(name, infer_group(domain, name))
+
+                self.register_tool(
+                    ToolEntry(
+                        name=name,
+                        domain=domain,
+                        group=group,
+                        description=raw.get("description", ""),
+                        input_schema=raw.get("inputSchema", {}),
+                        upstream_url=upstream_url,
+                    )
                 )
-            )
-            count += 1
 
-        return count
+            # Derive count from actual registry index (handles skipped registrations).
+            count = sum(len(names) for names in self._domains.get(domain, {}).values())
+            span.set_attribute("gateway.tool_count", count)
+            return count
 
     def set_domain_description(self, domain: str, description: str) -> None:
         """Set a human-readable description for a domain."""
@@ -317,14 +323,19 @@ class ToolRegistry:
         All whitespace-separated tokens must appear somewhere in the
         tool's name, original name, or description (AND semantics).
         """
-        query_lower = query.lower()
-        tokens = query_lower.split()
-        results = []
-        for tool in self._tools.values():
-            searchable = f"{tool.name} {tool.original_name or ''} {tool.description}".lower()
-            if all(token in searchable for token in tokens):
-                results.append(tool)
-        return sorted(results, key=lambda t: t.name)
+        with _tracer.start_as_current_span("gateway.registry.search") as span:
+            span.set_attribute("gateway.query", query)
+
+            query_lower = query.lower()
+            tokens = query_lower.split()
+            results = []
+            for tool in self._tools.values():
+                searchable = f"{tool.name} {tool.original_name or ''} {tool.description}".lower()
+                if all(token in searchable for token in tokens):
+                    results.append(tool)
+            results = sorted(results, key=lambda t: t.name)
+            span.set_attribute("gateway.result_count", len(results))
+            return results
 
     def get_all_tool_names(self) -> list[str]:
         """Get all registered tool names (for fuzzy matching)."""

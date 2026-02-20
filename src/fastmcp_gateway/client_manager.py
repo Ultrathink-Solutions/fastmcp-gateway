@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any
 
 from fastmcp import Client
 from fastmcp.server.dependencies import get_http_headers
+from opentelemetry import trace
 
 if TYPE_CHECKING:
     from fastmcp.client.client import CallToolResult
@@ -24,6 +25,7 @@ if TYPE_CHECKING:
     from fastmcp_gateway.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
+_tracer = trace.get_tracer("fastmcp_gateway.client_manager")
 
 
 def get_user_headers(*, include_all: bool = False) -> dict[str, str]:
@@ -110,15 +112,18 @@ class UpstreamManager:
         populated upstream.  Unreachable upstreams are logged and skipped
         (graceful degradation per FR-7).
         """
-        results: dict[str, int] = {}
-        for domain, client in self._registry_clients.items():
-            try:
-                count = await self._populate_domain(domain, client)
-                results[domain] = count
-                logger.info("Populated %d tools from upstream '%s'", count, domain)
-            except Exception:
-                logger.exception("Failed to populate upstream '%s' — skipping", domain)
-        return results
+        with _tracer.start_as_current_span("gateway.populate_all") as span:
+            results: dict[str, int] = {}
+            for domain, client in self._registry_clients.items():
+                try:
+                    count = await self._populate_domain(domain, client)
+                    results[domain] = count
+                    logger.info("Populated %d tools from upstream '%s'", count, domain)
+                except Exception:
+                    logger.exception("Failed to populate upstream '%s' — skipping", domain)
+            span.set_attribute("gateway.domain_count", len(results))
+            span.set_attribute("gateway.total_tools", sum(results.values()))
+            return results
 
     async def populate_domain(self, domain: str) -> int:
         """Re-populate a single domain (used for targeted refresh).
@@ -130,23 +135,28 @@ class UpstreamManager:
 
     async def _populate_domain(self, domain: str, client: Client) -> int:
         """Connect to *client*, list its tools, and register them."""
-        async with client:
-            mcp_tools = await client.list_tools()
+        with _tracer.start_as_current_span("gateway.populate_domain") as span:
+            span.set_attribute("gateway.domain", domain)
 
-        raw_tools: list[dict[str, Any]] = [
-            {
-                "name": t.name,
-                "description": t.description or "",
-                "inputSchema": t.inputSchema,
-            }
-            for t in mcp_tools
-        ]
+            async with client:
+                mcp_tools = await client.list_tools()
 
-        return self._registry.populate_domain(
-            domain=domain,
-            upstream_url=str(self._upstreams[domain]),
-            tools=raw_tools,
-        )
+            raw_tools: list[dict[str, Any]] = [
+                {
+                    "name": t.name,
+                    "description": t.description or "",
+                    "inputSchema": t.inputSchema,
+                }
+                for t in mcp_tools
+            ]
+
+            count = self._registry.populate_domain(
+                domain=domain,
+                upstream_url=str(self._upstreams[domain]),
+                tools=raw_tools,
+            )
+            span.set_attribute("gateway.tool_count", count)
+            return count
 
     # ------------------------------------------------------------------
     # Tool execution (fresh client per request)
@@ -166,19 +176,23 @@ class UpstreamManager:
 
         Raises ``KeyError`` if *tool_name* is not in the registry.
         """
-        entry = self._registry.lookup(tool_name)
-        if entry is None:
-            msg = f"Tool '{tool_name}' not found in registry"
-            raise KeyError(msg)
+        with _tracer.start_as_current_span("gateway.upstream.execute") as span:
+            span.set_attribute("gateway.tool_name", tool_name)
 
-        fresh_client = self._make_execution_client(entry.domain)
+            entry = self._registry.lookup(tool_name)
+            if entry is None:
+                msg = f"Tool '{tool_name}' not found in registry"
+                raise KeyError(msg)
 
-        async with fresh_client:
-            return await fresh_client.call_tool(
-                tool_name,
-                arguments or {},
-                raise_on_error=False,
-            )
+            span.set_attribute("gateway.domain", entry.domain)
+            fresh_client = self._make_execution_client(entry.domain)
+
+            async with fresh_client:
+                return await fresh_client.call_tool(
+                    tool_name,
+                    arguments or {},
+                    raise_on_error=False,
+                )
 
     def _make_execution_client(self, domain: str) -> Client:
         """Create a fresh client for tool execution via ``client.new()``.
