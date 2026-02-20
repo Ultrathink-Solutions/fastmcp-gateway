@@ -97,8 +97,8 @@ class TestRegistryBasics:
         tools = empty_registry.get_tools_by_group("d", "g")
         assert len(tools) == 1
 
-    def test_reregister_cleans_up_stale_index(self, empty_registry: ToolRegistry) -> None:
-        """Re-registering a tool under a different domain/group removes stale index entries."""
+    def test_reregister_different_domain_triggers_collision(self, empty_registry: ToolRegistry) -> None:
+        """Registering same name from different domain triggers collision handling."""
         original = ToolEntry(
             name="moving_tool",
             domain="old_domain",
@@ -109,9 +109,8 @@ class TestRegistryBasics:
         )
         empty_registry.register_tool(original)
         assert empty_registry.has_domain("old_domain")
-        assert empty_registry.has_group("old_domain", "old_group")
 
-        # Re-register under a different domain/group
+        # Register same name from a different domain -> collision
         updated = ToolEntry(
             name="moving_tool",
             domain="new_domain",
@@ -122,15 +121,13 @@ class TestRegistryBasics:
         )
         empty_registry.register_tool(updated)
 
-        # Old index entries should be cleaned up
-        assert not empty_registry.has_domain("old_domain")
-        assert not empty_registry.has_group("old_domain", "old_group")
-
-        # New entries should exist
+        # Both domains should exist with prefixed names
+        assert empty_registry.has_domain("old_domain")
         assert empty_registry.has_domain("new_domain")
-        assert empty_registry.has_group("new_domain", "new_group")
-        assert empty_registry.tool_count == 1
-        assert empty_registry.lookup("moving_tool") is updated
+        assert empty_registry.tool_count == 2
+        assert empty_registry.lookup("old_domain_moving_tool") is not None
+        assert empty_registry.lookup("new_domain_moving_tool") is not None
+        assert empty_registry.lookup("moving_tool") is None
 
 
 # ---------------------------------------------------------------------------

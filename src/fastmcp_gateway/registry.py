@@ -37,6 +37,7 @@ class ToolEntry(BaseModel):
     description: str
     input_schema: dict[str, Any]
     upstream_url: str
+    original_name: str | None = None  # Set when renamed due to collision
 
 
 class DomainInfo(BaseModel):
@@ -61,17 +62,123 @@ class ToolRegistry:
         self._tools: dict[str, ToolEntry] = {}
         self._domains: dict[str, dict[str, list[str]]] = {}  # domain -> group -> [tool_names]
         self._domain_descriptions: dict[str, str] = {}
+        self._collided_names: set[str] = set()  # original names that had cross-domain collisions
 
     @property
     def tool_count(self) -> int:
         return len(self._tools)
 
     def register_tool(self, tool: ToolEntry) -> None:
-        """Register a single tool in the registry."""
-        # Remove stale index entries if the tool was previously registered
-        # under a different domain/group.
+        """Register a single tool, handling name collisions across domains.
+
+        When two domains register tools with the same name, both are
+        auto-prefixed with their domain name (``{domain}_{name}``) and
+        the original name is preserved in :attr:`ToolEntry.original_name`.
+        """
+        existing = self._tools.get(tool.name)
+
+        # Same-domain re-registration: always allow (simple update).
+        # Must be checked before collision logic because _collided_names
+        # would otherwise auto-prefix, which may fail if the prefixed name
+        # is owned by another domain.
+        if existing is not None and existing.domain == tool.domain:
+            self._register_internal(tool)
+            return
+
+        # First collision: same name, different domain
+        if existing is not None and existing.domain != tool.domain:
+            existing_prefixed = f"{existing.domain}_{existing.name}"
+            new_prefixed = f"{tool.domain}_{tool.name}"
+
+            # Check if the existing tool's prefixed name would collide with
+            # a tool from yet another domain.  If so, we cannot safely
+            # unregister the existing tool (it would be lost).  Instead,
+            # keep the existing tool under its current name and only prefix
+            # the new registrant.
+            existing_blocker = self._tools.get(existing_prefixed)
+            if existing_blocker is not None and existing_blocker.domain != existing.domain:
+                logger.warning(
+                    "Tool name collision: '%s' registered by both '%s' and '%s' "
+                    "— cannot rename '%s' to '%s' (owned by domain '%s'), keeping original",
+                    tool.name,
+                    existing.domain,
+                    tool.domain,
+                    existing.name,
+                    existing_prefixed,
+                    existing_blocker.domain,
+                )
+                self._collided_names.add(tool.name)
+                self._register_internal(
+                    tool.model_copy(
+                        update={
+                            "name": new_prefixed,
+                            "original_name": tool.name,
+                        }
+                    )
+                )
+                return
+
+            logger.warning(
+                "Tool name collision: '%s' registered by both '%s' and '%s' — prefixing with domain names",
+                tool.name,
+                existing.domain,
+                tool.domain,
+            )
+            self._collided_names.add(tool.name)
+
+            # Remove existing tool and re-register with domain prefix
+            self._unregister(existing.name)
+            self._register_internal(
+                existing.model_copy(
+                    update={
+                        "name": existing_prefixed,
+                        "original_name": existing.original_name or existing.name,
+                    }
+                )
+            )
+
+            # Register new tool with domain prefix
+            self._register_internal(
+                tool.model_copy(
+                    update={
+                        "name": new_prefixed,
+                        "original_name": tool.name,
+                    }
+                )
+            )
+            return
+
+        # Name previously collided: auto-prefix any new registrant
+        if tool.name in self._collided_names:
+            self._register_internal(
+                tool.model_copy(
+                    update={
+                        "name": f"{tool.domain}_{tool.name}",
+                        "original_name": tool.name,
+                    }
+                )
+            )
+            return
+
+        # No collision — normal registration
+        self._register_internal(tool)
+
+    def _register_internal(self, tool: ToolEntry) -> None:
+        """Register a tool without collision detection (internal use)."""
         old = self._tools.get(tool.name)
-        if old is not None and (old.domain != tool.domain or old.group != tool.group):
+        if old is not None and old.domain != tool.domain:
+            # Guard: refuse to silently overwrite a tool from another domain.
+            # This can happen when collision prefixing produces a name that
+            # matches an existing tool (e.g., domain "a_b" + tool "c" →
+            # "a_b_c" colliding with domain "a"'s existing "b_c").
+            logger.warning(
+                "Cannot register tool '%s' (domain '%s'): name already used by domain '%s' — skipping",
+                tool.name,
+                tool.domain,
+                old.domain,
+            )
+            return
+        if old is not None and old.group != tool.group:
             self._remove_from_index(old.name, old.domain, old.group)
 
         self._tools[tool.name] = tool
@@ -82,6 +189,12 @@ class ToolRegistry:
             self._domains[tool.domain][tool.group] = []
         if tool.name not in self._domains[tool.domain][tool.group]:
             self._domains[tool.domain][tool.group].append(tool.name)
+
+    def _unregister(self, tool_name: str) -> None:
+        """Completely remove a tool from the registry."""
+        tool = self._tools.pop(tool_name, None)
+        if tool is not None:
+            self._remove_from_index(tool_name, tool.domain, tool.group)
 
     def _remove_from_index(self, tool_name: str, domain: str, group: str) -> None:
         """Remove a tool name from the domain/group index."""
@@ -199,16 +312,16 @@ class ToolRegistry:
         return [self._tools[name] for name in sorted(tool_names) if name in self._tools]
 
     def search(self, query: str) -> list[ToolEntry]:
-        """Keyword search across tool names and descriptions.
+        """Keyword search across tool names, original names, and descriptions.
 
         All whitespace-separated tokens must appear somewhere in the
-        tool's name or description (AND semantics).
+        tool's name, original name, or description (AND semantics).
         """
         query_lower = query.lower()
         tokens = query_lower.split()
         results = []
         for tool in self._tools.values():
-            searchable = f"{tool.name} {tool.description}".lower()
+            searchable = f"{tool.name} {tool.original_name or ''} {tool.description}".lower()
             if all(token in searchable for token in tokens):
                 results.append(tool)
         return sorted(results, key=lambda t: t.name)
