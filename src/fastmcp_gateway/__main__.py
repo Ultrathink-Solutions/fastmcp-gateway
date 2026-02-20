@@ -35,6 +35,11 @@ Configure via environment variables:
         When set, the gateway periodically re-queries all upstreams
         to detect added/removed tools.  Disabled by default.
 
+    GATEWAY_HOOK_MODULE
+        Python dotted path to a factory function that returns a list of hook
+        instances.  Format: ``module.path:function_name``.
+        Example: my_package.hooks:create_hooks
+
 Usage::
 
     GATEWAY_UPSTREAMS='{"apollo": "http://localhost:8080/mcp"}' python -m fastmcp_gateway
@@ -43,6 +48,7 @@ Usage::
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 import logging
 import math
@@ -72,6 +78,47 @@ def _load_json_env(name: str, *, required: bool = False) -> dict[str, Any] | Non
         logger.error("%s must be a JSON object, got %s", name, type(value).__name__)
         sys.exit(1)
     return value
+
+
+def _load_hooks() -> list[Any] | None:
+    """Load hooks from the GATEWAY_HOOK_MODULE environment variable.
+
+    Expected format: ``module.path:function_name`` where the function
+    takes no arguments and returns a list of hook instances.
+
+    Returns ``None`` if the env var is not set.
+    """
+    raw = os.environ.get("GATEWAY_HOOK_MODULE", "")
+    if not raw:
+        return None
+
+    if ":" not in raw:
+        logger.error("GATEWAY_HOOK_MODULE must be in 'module.path:function_name' format, got: %s", raw)
+        sys.exit(1)
+
+    module_path, func_name = raw.rsplit(":", 1)
+    try:
+        module = importlib.import_module(module_path)
+    except ImportError as exc:
+        logger.error("Failed to import hook module '%s': %s", module_path, exc)
+        sys.exit(1)
+
+    factory = getattr(module, func_name, None)
+    if factory is None:
+        logger.error("Hook module '%s' has no attribute '%s'", module_path, func_name)
+        sys.exit(1)
+
+    if not callable(factory):
+        logger.error("Hook factory '%s:%s' is not callable", module_path, func_name)
+        sys.exit(1)
+
+    hooks = factory()
+    if not isinstance(hooks, list):
+        logger.error("Hook factory '%s:%s' must return a list, got %s", module_path, func_name, type(hooks).__name__)
+        sys.exit(1)
+
+    logger.info("Loaded %d hook(s) from %s", len(hooks), raw)
+    return hooks
 
 
 async def _populate(gateway: GatewayServer) -> None:
@@ -131,6 +178,9 @@ def main() -> None:
             )
             sys.exit(1)
 
+    # Execution hooks.
+    hooks = _load_hooks()
+
     gateway = GatewayServer(
         upstreams,
         name=name,
@@ -139,6 +189,7 @@ def main() -> None:
         upstream_headers=upstream_headers,
         domain_descriptions=domain_descriptions,
         refresh_interval=refresh_interval,
+        hooks=hooks,
     )
 
     # Populate in its own event loop, then run the server (which creates its

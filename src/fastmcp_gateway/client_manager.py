@@ -52,11 +52,13 @@ def _set_transport_headers(client: Client, headers: dict[str, str]) -> None:
 
     Preserves any existing default headers on the transport and overlays
     the provided *headers* on top.  FastMCP transports created from URLs
-    (SSE / Streamable-HTTP) have a ``headers`` attribute.  Stdio transports
-    do not, but the gateway only creates HTTP clients, so this is safe in
-    practice.
+    (SSE / Streamable-HTTP) have a ``headers`` attribute.  In-process
+    and stdio transports do not — this function is a no-op for those.
     """
     transport: Any = client.transport
+    if not hasattr(transport, "headers"):
+        logger.debug("Transport %s does not support headers — skipping", type(transport).__name__)
+        return
     existing = dict(transport.headers) if transport.headers else {}
     transport.headers = {**existing, **headers}
 
@@ -196,6 +198,8 @@ class UpstreamManager:
         self,
         tool_name: str,
         arguments: dict[str, Any] | None = None,
+        *,
+        extra_headers: dict[str, str] | None = None,
     ) -> CallToolResult:
         """Execute a tool on its upstream server.
 
@@ -203,6 +207,15 @@ class UpstreamManager:
         explicit *upstream_headers*, those headers are applied directly.
         For all other domains, FastMCP's ``get_http_headers()`` ContextVar
         resolves the *current* user's HTTP headers (request passthrough).
+
+        Parameters
+        ----------
+        tool_name:
+            Name of the tool to execute.
+        arguments:
+            Tool arguments.
+        extra_headers:
+            Additional headers from hooks, merged with highest priority.
 
         Raises ``KeyError`` if *tool_name* is not in the registry.
         """
@@ -215,7 +228,7 @@ class UpstreamManager:
                 raise KeyError(msg)
 
             span.set_attribute("gateway.domain", entry.domain)
-            fresh_client = self._make_execution_client(entry.domain)
+            fresh_client = self._make_execution_client(entry.domain, extra_headers=extra_headers)
 
             async with fresh_client:
                 return await fresh_client.call_tool(
@@ -224,7 +237,12 @@ class UpstreamManager:
                     raise_on_error=False,
                 )
 
-    def _make_execution_client(self, domain: str) -> Client:
+    def _make_execution_client(
+        self,
+        domain: str,
+        *,
+        extra_headers: dict[str, str] | None = None,
+    ) -> Client:
         """Create a fresh client for tool execution via ``client.new()``.
 
         Always uses ``client.new()`` to create a shallow copy of the
@@ -232,10 +250,20 @@ class UpstreamManager:
         If *domain* has explicit upstream headers, those are merged onto
         the new client's transport.  Otherwise the client inherits
         request-passthrough behaviour via the ContextVar.
+
+        Header merge priority (highest wins):
+        1. *extra_headers* from hooks (e.g. ``X-User-Subject``)
+        2. Static ``upstream_headers[domain]`` (e.g. per-domain API keys)
+        3. Request passthrough via ContextVar (incoming request headers)
         """
         client = self._registry_clients[domain].new()
+        merged: dict[str, str] = {}
         if domain in self._upstream_headers:
-            _set_transport_headers(client, self._upstream_headers[domain])
+            merged.update(self._upstream_headers[domain])
+        if extra_headers:
+            merged.update(extra_headers)
+        if merged:
+            _set_transport_headers(client, merged)
         return client
 
     # ------------------------------------------------------------------

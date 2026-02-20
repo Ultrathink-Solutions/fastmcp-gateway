@@ -9,6 +9,7 @@ from mcp.types import ToolAnnotations
 from opentelemetry import trace
 
 from fastmcp_gateway.errors import error_response
+from fastmcp_gateway.hooks import ExecutionContext, ExecutionDenied, HookRunner
 
 if TYPE_CHECKING:
     from fastmcp import FastMCP
@@ -44,8 +45,15 @@ def _suggest_tool_names(query: str, all_names: list[str], max_suggestions: int =
     return [name for _, name in scored[:max_suggestions]]
 
 
-def register_meta_tools(mcp: FastMCP, registry: ToolRegistry, upstream_manager: UpstreamManager) -> None:
+def register_meta_tools(
+    mcp: FastMCP,
+    registry: ToolRegistry,
+    upstream_manager: UpstreamManager,
+    hook_runner: HookRunner | None = None,
+) -> None:
     """Register the 3 meta-tools on the FastMCP server."""
+    if hook_runner is None:
+        hook_runner = HookRunner()
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True))
     async def discover_tools(
@@ -230,12 +238,52 @@ def register_meta_tools(mcp: FastMCP, registry: ToolRegistry, upstream_manager: 
 
             span.set_attribute("gateway.domain", entry.domain)
 
+            # Build execution context and run hooks
+            ctx: ExecutionContext | None = None
+            if hook_runner.has_hooks:
+                from fastmcp_gateway.client_manager import get_user_headers
+
+                ctx = ExecutionContext(
+                    tool=entry,
+                    arguments=arguments or {},
+                    headers=get_user_headers(),
+                )
+
+                # Authenticate
+                ctx.user = await hook_runner.run_authenticate(ctx.headers)
+
+                # Before execute — may raise ExecutionDenied
+                try:
+                    await hook_runner.run_before_execute(ctx)
+                except ExecutionDenied as denied:
+                    span.set_attribute("gateway.error_code", denied.code)
+                    return error_response(
+                        denied.code,
+                        denied.message,
+                        tool=tool_name,
+                        domain=entry.domain,
+                    )
+
+                # Use potentially mutated arguments from context
+                arguments = ctx.arguments
+
             # Route to upstream via fresh client
+            execute_kwargs: dict[str, Any] = {}
+            if ctx and ctx.extra_headers:
+                execute_kwargs["extra_headers"] = ctx.extra_headers
             try:
-                result = await upstream_manager.execute_tool(tool_name, arguments)
+                result = await upstream_manager.execute_tool(
+                    tool_name,
+                    arguments,
+                    **execute_kwargs,
+                )
             except Exception as exc:  # Broad catch: gateway must not crash from upstream failures
                 span.set_attribute("gateway.error_code", "execution_error")
                 span.record_exception(exc)
+
+                if ctx is not None and hook_runner.has_hooks:
+                    await hook_runner.run_on_error(ctx, exc)
+
                 return error_response(
                     "execution_error",
                     f"Tool '{tool_name}' failed: "
@@ -257,13 +305,23 @@ def register_meta_tools(mcp: FastMCP, registry: ToolRegistry, upstream_manager: 
 
             if result.is_error:
                 span.set_attribute("gateway.error_code", "upstream_error")
-                return error_response(
+                result_text = error_response(
                     "upstream_error",
                     result_text,
                     tool=tool_name,
                 )
+                # Run after_execute even on upstream errors
+                if ctx is not None and hook_runner.has_hooks:
+                    result_text = await hook_runner.run_after_execute(ctx, result_text, True)
+                return result_text
 
-            return json.dumps({"tool": tool_name, "result": result_text})
+            result_text = json.dumps({"tool": tool_name, "result": result_text})
+
+            # After execute — pipeline transforms
+            if ctx is not None and hook_runner.has_hooks:
+                result_text = await hook_runner.run_after_execute(ctx, result_text, False)
+
+            return result_text
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, openWorldHint=False))
     async def refresh_registry() -> str:
