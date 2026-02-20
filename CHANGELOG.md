@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-02-20
+
+### Added
+
+- **Structured error responses**: New `GatewayError` Pydantic model and `error_response()` helper for consistent, machine-parseable error JSON from all meta-tools — includes `error`, `code`, and `details` fields (#14)
+- **Tool name collision handling**: When two upstream domains register tools with the same name, both are automatically prefixed with their domain name (e.g., `apollo_search`, `hubspot_search`) to prevent silent overwrites — includes secondary collision guard and same-domain update safety (#15)
+- **MCP tool annotations**: All meta-tools now declare `ToolAnnotations` metadata (`readOnlyHint`, `openWorldHint`) so MCP clients can make informed decisions about tool behavior (#16)
+- **Auth passthrough helper**: New public `get_user_headers()` function exposes forwarded HTTP headers from the current MCP request context, useful for consumers building on the gateway (#17)
+- **OpenTelemetry instrumentation**: Gateway-specific spans with domain, tool name, result count, and error code attributes (#18)
+  - Meta-tool spans: `gateway.discover_tools`, `gateway.get_tool_schema`, `gateway.execute_tool`, `gateway.refresh_registry`
+  - Upstream client spans: `gateway.populate_all`, `gateway.populate_domain`, `gateway.upstream.execute`
+  - Registry spans: `gateway.registry.populate_domain`, `gateway.registry.search`
+  - Background refresh span: `gateway.background_refresh`
+- **Registry refresh**: Background polling via `GATEWAY_REFRESH_INTERVAL` env var to keep the tool registry up-to-date, plus a manual `refresh_registry` meta-tool that returns per-domain diffs (added/removed tools) — managed by the ASGI server lifespan with graceful cancellation (#19)
+- **`RegistryDiff` model**: New Pydantic model tracking per-domain changes (added tools, removed tools, tool count) returned by `populate_domain()` and refresh operations (#19)
+
+### Changed
+
+- `ToolEntry` now includes an `original_name` field to track the pre-collision name when tools are auto-prefixed (#15)
+- `ToolRegistry.populate_domain()` now returns `RegistryDiff` instead of `int` for richer change tracking (#19)
+- `UpstreamManager` gained `refresh_all()` and `refresh_domain()` methods returning `RegistryDiff` objects (#19)
+- Bumped version to 0.2.0
+
 ## [0.1.1] - 2026-02-19
 
 ### Fixed
@@ -34,5 +57,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Migrated `ToolEntry` and `DomainInfo` from dataclasses to Pydantic models (#9)
 
+[0.2.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/releases/tag/v0.1.0
