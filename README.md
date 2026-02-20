@@ -5,24 +5,25 @@
 [![License](https://img.shields.io/github/license/Ultrathink-Solutions/fastmcp-gateway)](LICENSE)
 [![CI](https://github.com/Ultrathink-Solutions/fastmcp-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/Ultrathink-Solutions/fastmcp-gateway/actions/workflows/ci.yml)
 
-**Progressive tool discovery gateway for MCP.** Aggregates tools from multiple upstream [MCP](https://modelcontextprotocol.io/) servers and exposes them through 3 meta-tools, enabling LLMs to discover and use hundreds of tools without loading all schemas upfront.
+**Progressive tool discovery gateway for MCP.** Aggregates tools from multiple upstream [MCP](https://modelcontextprotocol.io/) servers and exposes them through 4 meta-tools, enabling LLMs to discover and use hundreds of tools without loading all schemas upfront.
 
 ```text
 LLM
  │
- └── fastmcp-gateway (3 meta-tools)
+ └── fastmcp-gateway (4 meta-tools)
        ├── discover_tools    → browse domains and tools
        ├── get_tool_schema   → get parameter schema for a tool
-       └── execute_tool      → run any discovered tool
-             ├── apollo      (upstream MCP server)
-             ├── hubspot     (upstream MCP server)
-             ├── slack       (upstream MCP server)
-             └── ...
+       ├── execute_tool      → run any discovered tool
+       │     ├── apollo      (upstream MCP server)
+       │     ├── hubspot     (upstream MCP server)
+       │     ├── slack       (upstream MCP server)
+       │     └── ...
+       └── refresh_registry  → re-query upstreams for changes
 ```
 
 ## Why?
 
-When an LLM connects to many MCP servers, it receives all tool schemas at once. With 100+ tools, context windows fill up and tool selection accuracy drops. **fastmcp-gateway** solves this with progressive discovery: the LLM starts with 3 meta-tools and loads individual schemas on demand.
+When an LLM connects to many MCP servers, it receives all tool schemas at once. With 100+ tools, context windows fill up and tool selection accuracy drops. **fastmcp-gateway** solves this with progressive discovery: the LLM starts with 4 meta-tools and loads individual schemas on demand.
 
 ## Install
 
@@ -38,10 +39,13 @@ pip install fastmcp-gateway
 import asyncio
 from fastmcp_gateway import GatewayServer
 
-gateway = GatewayServer({
-    "apollo": "http://apollo-mcp:8080/mcp",
-    "hubspot": "http://hubspot-mcp:8080/mcp",
-})
+gateway = GatewayServer(
+    {
+        "apollo": "http://apollo-mcp:8080/mcp",
+        "hubspot": "http://hubspot-mcp:8080/mcp",
+    },
+    refresh_interval=300,  # Re-query upstreams every 5 minutes (optional)
+)
 
 async def main():
     await gateway.populate()     # Discover tools from upstreams
@@ -57,7 +61,7 @@ export GATEWAY_UPSTREAMS='{"apollo": "http://apollo-mcp:8080/mcp", "hubspot": "h
 python -m fastmcp_gateway
 ```
 
-The gateway starts on `http://0.0.0.0:8080/mcp` and exposes 3 tools to any MCP client.
+The gateway starts on `http://0.0.0.0:8080/mcp` and exposes 4 tools to any MCP client.
 
 ## How It Works
 
@@ -66,6 +70,8 @@ The gateway starts on `http://0.0.0.0:8080/mcp` and exposes 3 tools to any MCP c
 2. **`get_tool_schema("apollo_people_search")`** — Returns the full JSON Schema for a tool's parameters. Supports fuzzy matching.
 
 3. **`execute_tool("apollo_people_search", {"query": "Anthropic"})`** — Routes the call to the correct upstream server and returns the result.
+
+4. **`refresh_registry()`** — Re-query all upstream servers and return a summary of added/removed tools per domain. Useful when upstreams are updated while the gateway is running.
 
 LLMs learn the workflow from the gateway's built-in system instructions and only load schemas for tools they actually need.
 
@@ -83,6 +89,7 @@ All configuration is via environment variables:
 | `GATEWAY_REGISTRY_AUTH_TOKEN` | No | — | Bearer token for upstream discovery |
 | `GATEWAY_DOMAIN_DESCRIPTIONS` | No | — | JSON object: `{"domain": "description", ...}` |
 | `GATEWAY_UPSTREAM_HEADERS` | No | — | JSON object: `{"domain": {"Header": "Value"}, ...}` |
+| `GATEWAY_REFRESH_INTERVAL` | No | Disabled | Seconds between automatic registry refresh cycles |
 | `LOG_LEVEL` | No | `INFO` | Logging level |
 
 ### Per-Upstream Auth
@@ -94,6 +101,35 @@ export GATEWAY_UPSTREAM_HEADERS='{"ahrefs": {"Authorization": "Bearer sk-xxx"}}'
 ```
 
 Domains without overrides use request passthrough (headers from the incoming MCP request are forwarded to the upstream).
+
+## Observability
+
+The gateway emits OpenTelemetry spans for all operations. Bring your own exporter (Logfire, Jaeger, OTLP, etc.) — the gateway uses the `opentelemetry-api` and will pick up any configured `TracerProvider`.
+
+Key spans: `gateway.discover_tools`, `gateway.get_tool_schema`, `gateway.execute_tool`, `gateway.refresh_registry`, `gateway.populate_all`, `gateway.background_refresh`.
+
+Each span includes attributes including `gateway.domain`, `gateway.tool_name`, `gateway.result_count`, and `gateway.error_code` for filtering and alerting.
+
+## Error Handling
+
+All meta-tools return structured JSON errors with a `code` field for programmatic handling and a human-readable `error` message:
+
+```json
+{"error": "Unknown tool 'crm_contacts'.", "code": "tool_not_found", "details": {"suggestions": ["crm_contacts_search"]}}
+```
+
+Error codes: `tool_not_found`, `domain_not_found`, `group_not_found`, `execution_error`, `upstream_error`, `refresh_error`.
+
+## Tool Name Collisions
+
+When two upstream domains register tools with the same name, the gateway automatically prefixes both with their domain name to prevent conflicts:
+
+```text
+apollo registers "search"  →  apollo_search
+hubspot registers "search" →  hubspot_search
+```
+
+The original names remain searchable via `discover_tools(query="search")`.
 
 ## Health Endpoints
 
