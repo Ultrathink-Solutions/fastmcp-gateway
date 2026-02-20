@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING, Any
 
+from mcp.types import ToolAnnotations
+
 from fastmcp_gateway.errors import error_response
 
 if TYPE_CHECKING:
@@ -42,7 +44,7 @@ def _suggest_tool_names(query: str, all_names: list[str], max_suggestions: int =
 def register_meta_tools(mcp: FastMCP, registry: ToolRegistry, upstream_manager: UpstreamManager) -> None:
     """Register the 3 meta-tools on the FastMCP server."""
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True))
     async def discover_tools(
         domain: str | None = None,
         group: str | None = None,
@@ -139,7 +141,7 @@ def register_meta_tools(mcp: FastMCP, registry: ToolRegistry, upstream_manager: 
             }
         )
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
     async def get_tool_schema(tool_name: str) -> str:
         """Get the full parameter schema for a specific tool.
 
@@ -172,7 +174,7 @@ def register_meta_tools(mcp: FastMCP, registry: ToolRegistry, upstream_manager: 
             suggestions=suggestions,
         )
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, openWorldHint=True))
     async def execute_tool(
         tool_name: str,
         arguments: dict[str, Any] | None = None,
