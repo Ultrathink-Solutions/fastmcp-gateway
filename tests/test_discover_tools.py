@@ -105,7 +105,7 @@ class TestDiscoverByDomain:
     async def test_unknown_domain_error(self, mcp_server: FastMCP) -> None:
         data = await _call_discover(mcp_server, domain="salesforce")
 
-        assert "error" in data
+        assert data["code"] == "domain_not_found"
         assert "salesforce" in data["error"]
         assert "apollo" in data["error"]
         assert "hubspot" in data["error"]
@@ -138,7 +138,7 @@ class TestDiscoverByGroup:
     async def test_unknown_group_error(self, mcp_server: FastMCP) -> None:
         data = await _call_discover(mcp_server, domain="apollo", group="nonexistent")
 
-        assert "error" in data
+        assert data["code"] == "group_not_found"
         assert "nonexistent" in data["error"]
         assert "people" in data["error"]
         assert "organizations" in data["error"]
@@ -147,7 +147,7 @@ class TestDiscoverByGroup:
     async def test_unknown_domain_with_group(self, mcp_server: FastMCP) -> None:
         data = await _call_discover(mcp_server, domain="unknown", group="people")
 
-        assert "error" in data
+        assert data["code"] == "domain_not_found"
         assert "Unknown domain" in data["error"]
 
 

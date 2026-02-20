@@ -122,21 +122,21 @@ class TestGetToolSchemaErrors:
     async def test_unknown_tool(self, mcp_server: FastMCP) -> None:
         data = await _call_schema(mcp_server, "nonexistent_xyz")
 
-        assert "error" in data
+        assert data["code"] == "tool_not_found"
         assert "nonexistent_xyz" in data["error"]
 
     @pytest.mark.asyncio
     async def test_suggests_similar_tools(self, mcp_server: FastMCP) -> None:
         data = await _call_schema(mcp_server, "apollo_search")
 
-        assert "error" in data
+        assert data["code"] == "tool_not_found"
         assert "Did you mean" in data["error"]
-        # Should suggest apollo tools
-        assert "apollo_" in data["error"]
+        assert data["details"]["suggestions"]  # non-empty suggestions list
 
     @pytest.mark.asyncio
     async def test_no_suggestions_for_unrelated(self, mcp_server: FastMCP) -> None:
         data = await _call_schema(mcp_server, "completely_unrelated_xyz_123")
 
-        assert "error" in data
+        assert data["code"] == "tool_not_found"
         assert "discover_tools" in data["error"]
+        assert data["details"]["suggestions"] == []

@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING, Any
 
+from fastmcp_gateway.errors import error_response
+
 if TYPE_CHECKING:
     from fastmcp import FastMCP
 
@@ -92,23 +94,25 @@ def register_meta_tools(mcp: FastMCP, registry: ToolRegistry, upstream_manager: 
         # Validate domain
         if not registry.has_domain(domain):
             available = registry.get_domain_names()
-            return json.dumps(
-                {
-                    "error": f"Unknown domain '{domain}'. Available domains: {', '.join(available)}"
-                    if available
-                    else f"Unknown domain '{domain}'. No domains are registered."
-                }
+            return error_response(
+                "domain_not_found",
+                f"Unknown domain '{domain}'. Available domains: {', '.join(available)}"
+                if available
+                else f"Unknown domain '{domain}'. No domains are registered.",
+                domain=domain,
+                available_domains=available,
             )
 
         # Mode 3: domain + group -> tools in that group
         if group is not None:
             if not registry.has_group(domain, group):
                 available_groups = registry.get_groups_for_domain(domain)
-                return json.dumps(
-                    {
-                        "error": f"Unknown group '{group}' in domain '{domain}'. "
-                        f"Available groups: {', '.join(available_groups)}"
-                    }
+                return error_response(
+                    "group_not_found",
+                    f"Unknown group '{group}' in domain '{domain}'. Available groups: {', '.join(available_groups)}",
+                    domain=domain,
+                    group=group,
+                    available_groups=available_groups,
                 )
             tools = registry.get_tools_by_group(domain, group)
             return json.dumps(
@@ -161,7 +165,12 @@ def register_meta_tools(mcp: FastMCP, registry: ToolRegistry, upstream_manager: 
             hint = f"Did you mean {', '.join(repr(s) for s in suggestions)}?"
         else:
             hint = "Use discover_tools to browse available tools."
-        return json.dumps({"error": f"Unknown tool '{tool_name}'. {hint}"})
+        return error_response(
+            "tool_not_found",
+            f"Unknown tool '{tool_name}'. {hint}",
+            tool_name=tool_name,
+            suggestions=suggestions,
+        )
 
     @mcp.tool()
     async def execute_tool(
@@ -181,18 +190,25 @@ def register_meta_tools(mcp: FastMCP, registry: ToolRegistry, upstream_manager: 
                 hint = f"Did you mean {', '.join(repr(s) for s in suggestions)}?"
             else:
                 hint = "Use discover_tools to browse available tools."
-            return json.dumps({"error": f"Unknown tool '{tool_name}'. {hint}"})
+            return error_response(
+                "tool_not_found",
+                f"Unknown tool '{tool_name}'. {hint}",
+                tool_name=tool_name,
+                suggestions=suggestions,
+            )
 
         # Route to upstream via fresh client
         try:
             result = await upstream_manager.execute_tool(tool_name, arguments)
         except Exception as exc:  # Broad catch: gateway must not crash from upstream failures
-            return json.dumps(
-                {
-                    "error": f"Tool '{tool_name}' failed: "
-                    f"upstream server '{entry.domain}' returned an error. "
-                    f"Other domains may still be available. ({type(exc).__name__}: {exc})"
-                }
+            return error_response(
+                "execution_error",
+                f"Tool '{tool_name}' failed: "
+                f"upstream server '{entry.domain}' returned an error. "
+                f"Other domains may still be available. ({type(exc).__name__}: {exc})",
+                tool=tool_name,
+                domain=entry.domain,
+                exception_type=type(exc).__name__,
             )
 
         # Serialize content blocks to text
@@ -206,6 +222,10 @@ def register_meta_tools(mcp: FastMCP, registry: ToolRegistry, upstream_manager: 
         result_text = "\n".join(content_parts)
 
         if result.is_error:
-            return json.dumps({"tool": tool_name, "error": result_text})
+            return error_response(
+                "upstream_error",
+                result_text,
+                tool=tool_name,
+            )
 
         return json.dumps({"tool": tool_name, "result": result_text})
