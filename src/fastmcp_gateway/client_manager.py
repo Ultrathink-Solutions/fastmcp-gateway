@@ -16,6 +16,7 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from fastmcp import Client
+from fastmcp.server.dependencies import get_http_headers
 
 if TYPE_CHECKING:
     from fastmcp.client.client import CallToolResult
@@ -23,6 +24,25 @@ if TYPE_CHECKING:
     from fastmcp_gateway.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
+
+
+def get_user_headers(*, include_all: bool = False) -> dict[str, str]:
+    """Return the HTTP headers from the current incoming MCP request.
+
+    This is a convenience wrapper around FastMCP's request context.
+    Call this from within a tool handler or middleware to access the
+    originating user's headers (e.g. ``Authorization``).
+
+    Returns an empty dict when called outside an HTTP request context
+    (e.g. during startup population).
+
+    Parameters
+    ----------
+    include_all:
+        If ``True``, return all headers including hop-by-hop headers
+        that are normally stripped (``content-length``, ``host``, etc.).
+    """
+    return get_http_headers(include_all=include_all)
 
 
 def _set_transport_headers(client: Client, headers: dict[str, str]) -> None:
