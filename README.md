@@ -90,6 +90,7 @@ All configuration is via environment variables:
 | `GATEWAY_DOMAIN_DESCRIPTIONS` | No | — | JSON object: `{"domain": "description", ...}` |
 | `GATEWAY_UPSTREAM_HEADERS` | No | — | JSON object: `{"domain": {"Header": "Value"}, ...}` |
 | `GATEWAY_REFRESH_INTERVAL` | No | Disabled | Seconds between automatic registry refresh cycles |
+| `GATEWAY_HOOK_MODULE` | No | — | Python module path for execution hooks: `module.path:factory_function` |
 | `LOG_LEVEL` | No | `INFO` | Logging level |
 
 ### Per-Upstream Auth
@@ -101,6 +102,49 @@ export GATEWAY_UPSTREAM_HEADERS='{"ahrefs": {"Authorization": "Bearer sk-xxx"}}'
 ```
 
 Domains without overrides use request passthrough (headers from the incoming MCP request are forwarded to the upstream).
+
+## Execution Hooks
+
+Hooks provide middleware-style lifecycle callbacks around tool execution. Use them for authentication, authorization, token exchange, audit logging, or result transformation.
+
+### Python API
+
+```python
+from fastmcp_gateway import GatewayServer, ExecutionContext, ExecutionDenied
+
+class AuthHook:
+    async def on_authenticate(self, headers: dict[str, str]):
+        token = headers.get("authorization", "").removeprefix("Bearer ")
+        return validate_jwt(token)  # Return user identity or None
+
+    async def before_execute(self, context: ExecutionContext):
+        if not has_permission(context.user, context.tool.domain):
+            raise ExecutionDenied("Insufficient permissions", code="forbidden")
+        # Inject headers for the upstream server
+        context.extra_headers["X-User-Token"] = exchange_token(context.user)
+
+gateway = GatewayServer(upstreams, hooks=[AuthHook()])
+```
+
+### CLI (env var)
+
+Point `GATEWAY_HOOK_MODULE` at a factory function that returns a list of hook instances:
+
+```bash
+export GATEWAY_HOOK_MODULE='my_package.hooks:create_hooks'
+```
+
+### Hook Lifecycle
+
+For each `execute_tool` call:
+
+1. **`on_authenticate(headers)`** — Extract user identity from request headers. Last non-None result wins across multiple hooks.
+2. **`before_execute(context)`** — Validate permissions, mutate arguments, set `extra_headers`. Raise `ExecutionDenied` to block.
+3. **Upstream call** — `extra_headers` merge with highest priority over static `upstream_headers`.
+4. **`after_execute(context, result, is_error)`** — Transform or log the result. Each hook receives the previous hook's output.
+5. **`on_error(context, error)`** — Observability only (exceptions in hooks are logged, not raised).
+
+All methods are optional — implement only the ones you need.
 
 ## Observability
 
