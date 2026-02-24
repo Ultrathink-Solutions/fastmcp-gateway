@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-02-24
+
+### Added
+
+- **Execution hooks system**: Middleware-style lifecycle callbacks around tool execution — implement any subset of `on_authenticate`, `before_execute`, `after_execute`, `on_error` via the `Hook` protocol (#21)
+- **`ExecutionContext` carrier**: Mutable dataclass that flows through the hook pipeline, carrying tool entry, arguments, headers, user identity, `extra_headers`, and hook-to-hook metadata (#21)
+- **`ExecutionDenied` exception**: Hooks can raise this in `before_execute` to block tool execution with a structured error response and custom error code (#21)
+- **`HookRunner` orchestrator**: Manages hook registration and executes lifecycle methods in order — `run_authenticate` (last-non-None wins), `run_before_execute` (chain-halting), `run_after_execute` (result pipeline), `run_on_error` (fault-tolerant) (#21)
+- **`GATEWAY_HOOK_MODULE` env var**: Load hooks from external Python modules at startup via `module.path:factory_function` format (#21)
+- **`extra_headers` on `execute_tool`**: Hooks can inject per-request headers (e.g. `X-User-Token`) that merge with highest priority over static upstream headers (#21)
+- **`GatewayServer.add_hook()` and `.hook_runner`**: Runtime hook registration and access to the hook runner for advanced use cases (#21)
+
+### Changed
+
+- `_make_execution_client()` now supports 3-tier header merge priority: hook `extra_headers` > static `upstream_headers` > ContextVar request passthrough (#21)
+- `register_meta_tools()` accepts an optional `hook_runner` parameter (#21)
+- `GatewayServer.__init__()` accepts an optional `hooks` parameter (#21)
+- Bumped version to 0.3.0
+
 ## [0.2.0] - 2026-02-20
 
 ### Added
@@ -57,6 +76,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Migrated `ToolEntry` and `DomainInfo` from dataclasses to Pydantic models (#9)
 
+[0.3.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/releases/tag/v0.1.0
