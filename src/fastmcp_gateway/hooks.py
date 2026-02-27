@@ -12,6 +12,12 @@ Lifecycle order for ``execute_tool``::
     upstream call
     after_execute(context, result, is_error) -> transformed result
     on_error(context, error) -> observability only (on exception)
+
+Lifecycle order for ``discover_tools`` / ``get_tool_schema``::
+
+    on_authenticate(headers) -> ctx.user
+    registry lookup
+    after_list_tools(tools, context) -> filtered tool list
 """
 
 from __future__ import annotations
@@ -56,6 +62,25 @@ class ExecutionContext:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class ListToolsContext:
+    """Context for tool list filtering in ``after_list_tools`` hooks.
+
+    Attributes
+    ----------
+    domain:
+        Domain being listed (``None`` when listing all domains or searching).
+    headers:
+        Incoming HTTP request headers (lowercase keys).
+    user:
+        User identity set by ``on_authenticate`` (type defined by hook).
+    """
+
+    domain: str | None
+    headers: dict[str, str]
+    user: Any | None = None
+
+
 class ExecutionDenied(Exception):
     """Raised by hooks to deny tool execution.
 
@@ -94,6 +119,10 @@ class Hook(Protocol):
     after_execute(context, result, is_error)
         Called after each tool execution.  Return a (possibly transformed)
         result string.  Each hook receives the previous hook's output.
+    after_list_tools(tools, context)
+        Called after ``discover_tools`` / ``get_tool_schema`` build their
+        tool list.  Return a (possibly filtered) list.  Each hook receives
+        the previous hook's output.
     on_error(context, error)
         Called when execution raises an exception.  Observability only --
         exceptions in hooks are logged, not raised.
@@ -102,6 +131,7 @@ class Hook(Protocol):
     async def on_authenticate(self, headers: dict[str, str]) -> Any | None: ...
     async def before_execute(self, context: ExecutionContext) -> None: ...
     async def after_execute(self, context: ExecutionContext, result: str, is_error: bool) -> str: ...
+    async def after_list_tools(self, tools: list[ToolEntry], context: ListToolsContext) -> list[ToolEntry]: ...
     async def on_error(self, context: ExecutionContext, error: Exception) -> None: ...
 
 
@@ -154,6 +184,15 @@ class HookRunner:
             method = getattr(hook, "after_execute", None)
             if method is not None:
                 current = await method(context, current, is_error)
+        return current
+
+    async def run_after_list_tools(self, tools: list[ToolEntry], context: ListToolsContext) -> list[ToolEntry]:
+        """Execute all ``after_list_tools`` hooks.  Pipelines the tool list."""
+        current = list(tools)
+        for hook in self._hooks:
+            method = getattr(hook, "after_list_tools", None)
+            if method is not None:
+                current = await method(current, context)
         return current
 
     async def run_on_error(self, context: ExecutionContext, error: Exception) -> None:

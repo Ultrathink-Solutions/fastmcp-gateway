@@ -9,13 +9,13 @@ from mcp.types import ToolAnnotations
 from opentelemetry import trace
 
 from fastmcp_gateway.errors import error_response
-from fastmcp_gateway.hooks import ExecutionContext, ExecutionDenied, HookRunner
+from fastmcp_gateway.hooks import ExecutionContext, ExecutionDenied, HookRunner, ListToolsContext
 
 if TYPE_CHECKING:
     from fastmcp import FastMCP
 
     from fastmcp_gateway.client_manager import UpstreamManager
-    from fastmcp_gateway.registry import ToolRegistry
+    from fastmcp_gateway.registry import ToolEntry, ToolRegistry
 
 _tracer = trace.get_tracer("fastmcp_gateway.meta_tools")
 
@@ -55,6 +55,17 @@ def register_meta_tools(
     if hook_runner is None:
         hook_runner = HookRunner()
 
+    async def _filter_tools(tools: list[ToolEntry], domain: str | None) -> list[ToolEntry]:
+        """Authenticate and apply ``after_list_tools`` hooks if any are registered."""
+        if not hook_runner.has_hooks:
+            return tools
+        from fastmcp_gateway.client_manager import get_user_headers
+
+        headers = get_user_headers()
+        user = await hook_runner.run_authenticate(headers)
+        ctx = ListToolsContext(domain=domain, headers=headers, user=user)
+        return await hook_runner.run_after_list_tools(tools, ctx)
+
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True))
     async def discover_tools(
         domain: str | None = None,
@@ -78,7 +89,7 @@ def register_meta_tools(
 
             # Mode 4: keyword search (takes priority when query is provided)
             if query is not None and query.strip():
-                results = registry.search(query)
+                results = await _filter_tools(registry.search(query), None)
                 span.set_attribute("gateway.result_count", len(results))
                 return json.dumps(
                     {
@@ -97,20 +108,36 @@ def register_meta_tools(
 
             # Mode 1: no arguments -> domain summary
             if domain is None:
+                # Collect all tools, apply hook filtering, rebuild summary.
+                all_tools: list[ToolEntry] = []
+                for d in registry.get_domain_names():
+                    all_tools.extend(registry.get_tools_by_domain(d))
+                filtered = await _filter_tools(all_tools, None)
+
+                # Rebuild domain info from (potentially filtered) tools.
                 domain_info = registry.get_domain_info()
-                span.set_attribute("gateway.result_count", len(domain_info))
+                desc_map = {d.name: d.description for d in domain_info}
+                by_domain: dict[str, list[ToolEntry]] = {}
+                for t in filtered:
+                    by_domain.setdefault(t.domain, []).append(t)
+
+                result_domains = []
+                for dname in sorted(by_domain):
+                    dtools = by_domain[dname]
+                    result_domains.append(
+                        {
+                            "name": dname,
+                            "description": desc_map.get(dname, ""),
+                            "tool_count": len(dtools),
+                            "groups": sorted({t.group for t in dtools}),
+                        }
+                    )
+
+                span.set_attribute("gateway.result_count", len(result_domains))
                 return json.dumps(
                     {
-                        "domains": [
-                            {
-                                "name": d.name,
-                                "description": d.description,
-                                "tool_count": d.tool_count,
-                                "groups": d.groups,
-                            }
-                            for d in domain_info
-                        ],
-                        "total_tools": registry.tool_count,
+                        "domains": result_domains,
+                        "total_tools": len(filtered),
                     }
                 )
 
@@ -142,7 +169,7 @@ def register_meta_tools(
                         group=group,
                         available_groups=available_groups,
                     )
-                tools = registry.get_tools_by_group(domain, group)
+                tools = await _filter_tools(registry.get_tools_by_group(domain, group), domain)
                 span.set_attribute("gateway.result_count", len(tools))
                 return json.dumps(
                     {
@@ -153,7 +180,7 @@ def register_meta_tools(
                 )
 
             # Mode 2: domain only -> all tools in domain
-            tools = registry.get_tools_by_domain(domain)
+            tools = await _filter_tools(registry.get_tools_by_domain(domain), domain)
             span.set_attribute("gateway.result_count", len(tools))
             return json.dumps(
                 {
@@ -182,6 +209,12 @@ def register_meta_tools(
 
             entry = registry.lookup(tool_name)
             if entry is not None:
+                # Verify the tool is visible after hook filtering.
+                filtered = await _filter_tools([entry], entry.domain)
+                if not filtered:
+                    entry = None  # Treat as not found
+
+            if entry is not None:
                 span.set_attribute("gateway.domain", entry.domain)
                 return json.dumps(
                     {
@@ -193,7 +226,7 @@ def register_meta_tools(
                     }
                 )
 
-            # Unknown tool — suggest similar names
+            # Unknown tool (or filtered out) — suggest similar names
             suggestions = _suggest_tool_names(tool_name, registry.get_all_tool_names())
             if suggestions:
                 hint = f"Did you mean {', '.join(repr(s) for s in suggestions)}?"
