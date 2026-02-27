@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-02-27
+
+### Added
+
+- **`after_list_tools` hook phase**: New lifecycle callback for filtering tool lists before returning to clients — enables per-user access control over tool visibility via SpiceDB or similar authorization systems (#23)
+- **`ListToolsContext` dataclass**: Context carrier for `after_list_tools` hooks with `domain`, `headers`, and `user` fields (#23)
+- **`HookRunner.run_after_list_tools()`**: Pipelines tool lists through registered hooks, with input list copying to prevent mutation (#23)
+- **Hook integration in `discover_tools`**: All 4 query modes (domain summary, domain tools, domain+group, keyword search) now pass through `after_list_tools` hooks — domain summary is rebuilt from filtered results (#23)
+- **Hook integration in `get_tool_schema`**: Hidden tools return `tool_not_found` to prevent information leakage (#23)
+- **`ListToolsContext` exported from `fastmcp_gateway`**: Available as a public API for hook implementations (#23)
+
+### Changed
+
+- `register_meta_tools()` now authenticates and applies `after_list_tools` hooks before returning tool lists (#23)
+- Bumped version to 0.4.0
+
 ## [0.3.0] - 2026-02-24
 
 ### Added
@@ -76,6 +92,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Migrated `ToolEntry` and `DomainInfo` from dataclasses to Pydantic models (#9)
 
+[0.4.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.1.0...v0.1.1
