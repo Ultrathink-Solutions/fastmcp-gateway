@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from fastmcp_gateway.hooks import ExecutionContext, ExecutionDenied, Hook, HookRunner
+from fastmcp_gateway.hooks import ExecutionContext, ExecutionDenied, Hook, HookRunner, ListToolsContext
 from fastmcp_gateway.registry import ToolEntry
 
 
@@ -105,6 +105,9 @@ class TestHookProtocol:
 
             async def after_execute(self, context: ExecutionContext, result: str, is_error: bool) -> str:
                 return result
+
+            async def after_list_tools(self, tools: list[ToolEntry], context: ListToolsContext) -> list[ToolEntry]:
+                return tools
 
             async def on_error(self, context: ExecutionContext, error: Exception) -> None:
                 pass

@@ -3,7 +3,7 @@
 from fastmcp_gateway.client_manager import get_user_headers
 from fastmcp_gateway.errors import GatewayError
 from fastmcp_gateway.gateway import GatewayServer
-from fastmcp_gateway.hooks import ExecutionContext, ExecutionDenied, Hook, HookRunner
+from fastmcp_gateway.hooks import ExecutionContext, ExecutionDenied, Hook, HookRunner, ListToolsContext
 
 __all__ = [
     "ExecutionContext",
@@ -12,6 +12,7 @@ __all__ = [
     "GatewayServer",
     "Hook",
     "HookRunner",
+    "ListToolsContext",
     "get_user_headers",
 ]
 __version__ = "0.3.0"
