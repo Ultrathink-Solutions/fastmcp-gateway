@@ -40,6 +40,13 @@ Configure via environment variables:
         instances.  Format: ``module.path:function_name``.
         Example: my_package.hooks:create_hooks
 
+    GATEWAY_REGISTRATION_TOKEN
+        Shared secret that protects the dynamic registration REST endpoints
+        (POST/DELETE/GET /registry/servers).  When set, the gateway exposes
+        these endpoints and requires callers to send
+        ``Authorization: Bearer <token>``.  When not set, the endpoints are
+        not mounted (default — backwards-compatible).
+
 Usage::
 
     GATEWAY_UPSTREAMS='{"apollo": "http://localhost:8080/mcp"}' python -m fastmcp_gateway
@@ -181,6 +188,9 @@ def main() -> None:
     # Execution hooks.
     hooks = _load_hooks()
 
+    # Dynamic registration token (optional).
+    registration_token = os.environ.get("GATEWAY_REGISTRATION_TOKEN") or None
+
     gateway = GatewayServer(
         upstreams,
         name=name,
@@ -190,6 +200,7 @@ def main() -> None:
         domain_descriptions=domain_descriptions,
         refresh_interval=refresh_interval,
         hooks=hooks,
+        registration_token=registration_token,
     )
 
     # Populate in its own event loop, then run the server (which creates its

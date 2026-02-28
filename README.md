@@ -91,6 +91,7 @@ All configuration is via environment variables:
 | `GATEWAY_UPSTREAM_HEADERS` | No | — | JSON object: `{"domain": {"Header": "Value"}, ...}` |
 | `GATEWAY_REFRESH_INTERVAL` | No | Disabled | Seconds between automatic registry refresh cycles |
 | `GATEWAY_HOOK_MODULE` | No | — | Python module path for execution hooks: `module.path:factory_function` |
+| `GATEWAY_REGISTRATION_TOKEN` | No | — | Shared secret for dynamic registration endpoints (see below) |
 | `LOG_LEVEL` | No | `INFO` | Logging level |
 
 ### Per-Upstream Auth
@@ -103,9 +104,54 @@ export GATEWAY_UPSTREAM_HEADERS='{"ahrefs": {"Authorization": "Bearer sk-xxx"}}'
 
 Domains without overrides use request passthrough (headers from the incoming MCP request are forwarded to the upstream).
 
+## Dynamic Upstream Registration
+
+When `GATEWAY_REGISTRATION_TOKEN` is set, the gateway exposes REST endpoints for runtime upstream management — add, remove, and list upstream MCP servers without restarting.
+
+### Endpoints
+
+All endpoints require `Authorization: Bearer <token>` matching the configured token.
+
+**Register an upstream:**
+
+```bash
+curl -X POST http://gateway:8080/registry/servers \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"domain": "apollo", "url": "http://apollo-mcp:8080/mcp", "description": "Apollo.io CRM"}'
+```
+
+Response: `{"registered": "apollo", "url": "...", "tools_discovered": 12, "tools_added": ["search", ...]}`
+
+**Deregister an upstream:**
+
+```bash
+curl -X DELETE http://gateway:8080/registry/servers/apollo \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+**List registered upstreams:**
+
+```bash
+curl http://gateway:8080/registry/servers \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### Python API
+
+```python
+gateway = GatewayServer(upstreams, registration_token="secret-token")
+```
+
+When the token is not set (default), the registration endpoints are **not** mounted — existing deployments are unaffected.
+
+### Thread Safety
+
+All registry mutations (populate, add, remove, refresh) are serialized with an `asyncio.Lock` to prevent concurrent corruption.
+
 ## Execution Hooks
 
-Hooks provide middleware-style lifecycle callbacks around tool execution. Use them for authentication, authorization, token exchange, audit logging, or result transformation.
+Hooks provide middleware-style lifecycle callbacks around tool execution and discovery. Use them for authentication, authorization, token exchange, audit logging, or result transformation.
 
 ### Python API
 
@@ -146,6 +192,21 @@ For each `execute_tool` call:
 
 All methods are optional — implement only the ones you need.
 
+### Tool Visibility Hooks
+
+The `after_list_tools` hook phase lets you filter tool lists before returning them to clients — useful for per-user access control:
+
+```python
+from fastmcp_gateway import ListToolsContext
+
+class AccessControlHook:
+    async def after_list_tools(self, context: ListToolsContext, tools: list) -> list:
+        # Filter tools based on user permissions
+        return [t for t in tools if has_access(context.user, t.domain)]
+```
+
+Hidden tools also return `tool_not_found` from `get_tool_schema` to prevent information leakage.
+
 ## Observability
 
 The gateway emits OpenTelemetry spans for all operations. Bring your own exporter (Logfire, Jaeger, OTLP, etc.) — the gateway uses the `opentelemetry-api` and will pick up any configured `TracerProvider`.
@@ -174,6 +235,21 @@ hubspot registers "search" →  hubspot_search
 ```
 
 The original names remain searchable via `discover_tools(query="search")`.
+
+## MCP Handshake Instructions
+
+After `populate()`, the gateway automatically builds domain-aware instructions that are included in the MCP `InitializeResult` handshake. MCP clients immediately know what tool domains are available without calling `discover_tools()` first:
+
+```text
+You have access to a tool discovery gateway with tools across these domains:
+
+- **apollo** (12 tools) — Apollo.io CRM and sales intelligence
+- **hubspot** (8 tools) — HubSpot CRM for contacts, companies, and deals
+
+Workflow: discover_tools() → get_tool_schema() → execute_tool()
+```
+
+Instructions are automatically rebuilt when the registry changes during background refresh or dynamic registration. Custom `instructions=` passed at construction time are never overwritten.
 
 ## Health Endpoints
 
