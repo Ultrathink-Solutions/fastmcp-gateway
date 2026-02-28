@@ -50,6 +50,12 @@ class GatewayServer:
     hooks:
         Optional list of hook instances for execution lifecycle callbacks.
         See :class:`~fastmcp_gateway.hooks.Hook` for the protocol.
+    registration_token:
+        Shared secret that protects the ``/registry/servers`` REST
+        endpoints.  When set, the gateway exposes POST / DELETE / GET
+        routes for dynamic upstream registration.  Callers must send
+        ``Authorization: Bearer <token>``.  When ``None`` (default),
+        the registration endpoints are **not** mounted.
 
     Usage::
 
@@ -72,6 +78,7 @@ class GatewayServer:
         domain_descriptions: dict[str, str] | None = None,
         refresh_interval: float | None = None,
         hooks: list[Any] | None = None,
+        registration_token: str | None = None,
     ) -> None:
         self.upstreams = upstreams
         self.registry = ToolRegistry()
@@ -80,6 +87,8 @@ class GatewayServer:
         self._refresh_interval = refresh_interval
         self._refresh_task: asyncio.Task[None] | None = None
         self._hook_runner = HookRunner(hooks)
+        self._registration_token = registration_token
+        self._registry_lock = asyncio.Lock()
         self.upstream_manager = UpstreamManager(
             upstreams,
             self.registry,
@@ -93,6 +102,8 @@ class GatewayServer:
         )
         self._register_meta_tools()
         self._register_health_routes()
+        if registration_token:
+            self._register_registry_routes()
 
     @property
     def mcp(self) -> FastMCP:
@@ -118,13 +129,14 @@ class GatewayServer:
         Call this before serving requests so the registry is populated.
         Returns a mapping of domain -> tool count.
         """
-        results = await self.upstream_manager.populate_all()
-        self._apply_domain_descriptions()
+        async with self._registry_lock:
+            results = await self.upstream_manager.populate_all()
+            self._apply_domain_descriptions()
 
-        # Rebuild MCP instructions to include the domain summary so that
-        # MCP clients see available domains during the initialization
-        # handshake — no separate discover_tools() call required.
-        self._update_instructions()
+            # Rebuild MCP instructions to include the domain summary so that
+            # MCP clients see available domains during the initialization
+            # handshake — no separate discover_tools() call required.
+            self._update_instructions()
 
         return results
 
@@ -172,21 +184,22 @@ class GatewayServer:
             await asyncio.sleep(self._refresh_interval)
             with tracer.start_as_current_span("gateway.background_refresh") as span:
                 try:
-                    diffs = await self.upstream_manager.refresh_all()
-                    span.set_attribute("gateway.domains_refreshed", len(diffs))
-                    changed = False
-                    for diff in diffs:
-                        if diff.added or diff.removed:
-                            changed = True
-                            logger.info(
-                                "Registry refresh for '%s': +%d -%d tools",
-                                diff.domain,
-                                len(diff.added),
-                                len(diff.removed),
-                            )
-                    if changed:
-                        self._apply_domain_descriptions()
-                        self._update_instructions()
+                    async with self._registry_lock:
+                        diffs = await self.upstream_manager.refresh_all()
+                        span.set_attribute("gateway.domains_refreshed", len(diffs))
+                        changed = False
+                        for diff in diffs:
+                            if diff.added or diff.removed:
+                                changed = True
+                                logger.info(
+                                    "Registry refresh for '%s': +%d -%d tools",
+                                    diff.domain,
+                                    len(diff.added),
+                                    len(diff.removed),
+                                )
+                        if changed:
+                            self._apply_domain_descriptions()
+                            self._update_instructions()
                 except Exception:
                     span.set_attribute("gateway.refresh_failed", True)
                     logger.exception("Background registry refresh failed")
@@ -229,6 +242,126 @@ class GatewayServer:
                     {"status": "not_ready", "tools": 0},
                     status_code=503,
                 )
+
+    def _register_registry_routes(self) -> None:
+        """Register /registry/servers REST endpoints for dynamic upstream management.
+
+        Only mounted when ``registration_token`` is provided at construction.
+        All endpoints require ``Authorization: Bearer <token>`` matching
+        the configured ``GATEWAY_REGISTRATION_TOKEN``.
+        """
+        import json as _json
+
+        from starlette.requests import Request  # noqa: TC002 - runtime use
+        from starlette.responses import JSONResponse
+
+        token = self._registration_token
+        gateway = self  # Capture for closures.
+
+        def _check_auth(request: Request) -> JSONResponse | None:
+            """Return an error response if the request is not authorized."""
+            auth = request.headers.get("authorization", "")
+            if auth != f"Bearer {token}":
+                return JSONResponse(
+                    {"error": "Unauthorized", "code": "unauthorized"},
+                    status_code=401,
+                )
+            return None
+
+        @self._mcp.custom_route("/registry/servers", methods=["POST"])
+        async def _register_server(request: Request) -> JSONResponse:
+            auth_err = _check_auth(request)
+            if auth_err:
+                return auth_err
+
+            try:
+                body = await request.json()
+            except _json.JSONDecodeError:
+                return JSONResponse(
+                    {"error": "Invalid JSON body", "code": "bad_request"},
+                    status_code=400,
+                )
+
+            domain = body.get("domain")
+            url = body.get("url")
+            if not domain or not url:
+                return JSONResponse(
+                    {"error": "'domain' and 'url' are required", "code": "bad_request"},
+                    status_code=400,
+                )
+
+            description = body.get("description")
+            headers = body.get("headers")
+
+            async with gateway._registry_lock:
+                diff = await gateway.upstream_manager.add_upstream(
+                    domain,
+                    url,
+                    headers=headers,
+                )
+                if description:
+                    gateway.registry.set_domain_description(domain, description)
+                gateway._apply_domain_descriptions()
+                gateway._update_instructions()
+
+            return JSONResponse(
+                {
+                    "registered": domain,
+                    "url": url,
+                    "tools_discovered": diff.tool_count,
+                    "tools_added": diff.added,
+                }
+            )
+
+        @self._mcp.custom_route("/registry/servers/{domain}", methods=["DELETE"])
+        async def _deregister_server(request: Request) -> JSONResponse:
+            auth_err = _check_auth(request)
+            if auth_err:
+                return auth_err
+
+            domain = request.path_params.get("domain", "")
+            if not domain:
+                return JSONResponse(
+                    {"error": "'domain' path parameter is required", "code": "bad_request"},
+                    status_code=400,
+                )
+
+            async with gateway._registry_lock:
+                try:
+                    removed = gateway.upstream_manager.remove_upstream(domain)
+                except KeyError:
+                    return JSONResponse(
+                        {"error": f"Domain '{domain}' is not registered", "code": "not_found"},
+                        status_code=404,
+                    )
+                gateway._update_instructions()
+
+            return JSONResponse(
+                {
+                    "deregistered": domain,
+                    "tools_removed": removed,
+                }
+            )
+
+        @self._mcp.custom_route("/registry/servers", methods=["GET"])
+        async def _list_servers(request: Request) -> JSONResponse:
+            auth_err = _check_auth(request)
+            if auth_err:
+                return auth_err
+
+            upstreams = gateway.upstream_manager.list_upstreams()
+            servers = []
+            for domain, url in sorted(upstreams.items()):
+                tools = gateway.registry.get_tools_by_domain(domain)
+                servers.append(
+                    {
+                        "domain": domain,
+                        "url": url,
+                        "tool_count": len(tools),
+                        "description": gateway.registry._domain_descriptions.get(domain, ""),
+                    }
+                )
+            return JSONResponse({"servers": servers, "total": len(servers)})
 
     def _update_instructions(self) -> None:
         """Rebuild MCP instructions from the current registry state.

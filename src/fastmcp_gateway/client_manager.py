@@ -273,6 +273,81 @@ class UpstreamManager:
         return client
 
     # ------------------------------------------------------------------
+    # Dynamic upstream management
+    # ------------------------------------------------------------------
+
+    async def add_upstream(
+        self,
+        domain: str,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        registry_auth_headers: dict[str, str] | None = None,
+    ) -> RegistryDiff:
+        """Add a new upstream at runtime and populate its tools.
+
+        If the domain already exists, its URL and headers are updated and
+        the registry is re-populated (idempotent upsert).
+
+        Parameters
+        ----------
+        domain:
+            Domain name for the upstream (e.g. ``"apollo"``).
+        url:
+            MCP server URL (e.g. ``"http://apollo:8080/mcp"``).
+        headers:
+            Per-domain headers for tool execution (e.g. auth tokens).
+        registry_auth_headers:
+            Headers for registry population (list_tools calls).
+        """
+        with _tracer.start_as_current_span("gateway.add_upstream") as span:
+            span.set_attribute("gateway.domain", domain)
+            span.set_attribute("gateway.url", url)
+
+            self._upstreams[domain] = url
+            if headers:
+                self._upstream_headers[domain] = headers
+
+            client = Client(url)
+            if registry_auth_headers:
+                _set_transport_headers(client, registry_auth_headers)
+            self._registry_clients[domain] = client
+
+            diff = await self._populate_domain(domain, client)
+            logger.info(
+                "Registered upstream '%s' (%s): %d tools",
+                domain,
+                url,
+                diff.tool_count,
+            )
+            return diff
+
+    def remove_upstream(self, domain: str) -> list[str]:
+        """Remove an upstream and all its tools from the registry.
+
+        Returns the list of tool names that were removed.
+        Raises ``KeyError`` if the domain is not registered.
+        """
+        with _tracer.start_as_current_span("gateway.remove_upstream") as span:
+            span.set_attribute("gateway.domain", domain)
+
+            if domain not in self._upstreams:
+                msg = f"Domain '{domain}' is not a registered upstream"
+                raise KeyError(msg)
+
+            # Collect tool names before clearing.
+            removed = [t.name for t in self._registry.get_tools_by_domain(domain)]
+
+            self._registry.clear_domain(domain)
+            self._upstreams.pop(domain, None)
+            self._registry_clients.pop(domain, None)
+            self._upstream_headers.pop(domain, None)
+
+            span.set_attribute("gateway.tools_removed", len(removed))
+            logger.info("Deregistered upstream '%s': removed %d tools", domain, len(removed))
+            return removed
+
+    # ------------------------------------------------------------------
     # Introspection helpers
     # ------------------------------------------------------------------
 
@@ -284,3 +359,11 @@ class UpstreamManager:
     def upstream_url(self, domain: str) -> str:
         """Return the URL for a domain.  Raises ``KeyError`` if unknown."""
         return self._upstreams[domain]
+
+    def list_upstreams(self) -> dict[str, str]:
+        """Return a snapshot of all registered upstreams (domain -> URL).
+
+        Values are coerced to strings so that in-process FastMCP server
+        references are safely serializable.
+        """
+        return {domain: str(url) for domain, url in self._upstreams.items()}

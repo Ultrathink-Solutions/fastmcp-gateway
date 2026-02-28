@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-02-28
+
+### Added
+
+- **Dynamic upstream registration API**: REST endpoints for runtime upstream management — add, remove, and list upstream MCP servers without restarting the gateway (#28, ULT-1233)
+  - `POST /registry/servers` — Register a new upstream with domain, URL, description, and optional auth headers
+  - `DELETE /registry/servers/{domain}` — Deregister an upstream and remove all its tools
+  - `GET /registry/servers` — List all registered upstreams with tool counts
+- **`GATEWAY_REGISTRATION_TOKEN` env var**: Shared secret that protects the registration endpoints — when not set, endpoints are not mounted (backwards-compatible) (#28)
+- **`UpstreamManager.add_upstream()`**: Add a new upstream at runtime, create a persistent client, and populate its tools into the registry — supports idempotent upsert (#28)
+- **`UpstreamManager.remove_upstream()`**: Remove an upstream and all its tools from the registry at runtime (#28)
+- **`UpstreamManager.list_upstreams()`**: Return a snapshot of all registered upstreams (domain to URL mapping) (#28)
+- **`GatewayServer(registration_token=)`**: New constructor parameter to enable the registration API (#28)
+- **Registry thread safety**: `asyncio.Lock` protects all registry mutation paths (populate, add, remove, refresh) to prevent concurrent corruption (#28)
+
 ## [0.5.1] - 2026-02-28
 
 ### Fixed
@@ -112,6 +127,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Migrated `ToolEntry` and `DomainInfo` from dataclasses to Pydantic models (#9)
 
+[0.6.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.3.0...v0.4.0
