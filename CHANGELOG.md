@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.1] - 2026-02-28
+
+### Fixed
+
+- **Timing-safe token comparison**: Registration endpoint auth now uses `hmac.compare_digest` to prevent timing side-channel attacks (#30, ULT-1233)
+- **Stale headers on upsert**: `add_upstream()` now clears old `upstream_headers` when re-registering without headers, instead of silently preserving them (#30)
+- **Client resource leak**: `remove_upstream()` is now async and properly closes the persistent `Client` connection (#30)
+- **GET endpoint read consistency**: `GET /registry/servers` now holds `_registry_lock` to prevent reading partially-mutated state during concurrent registration (#30)
+
+### Added
+
+- **URL scheme validation**: `POST /registry/servers` rejects URLs that don't use `http://` or `https://` scheme (#30)
+- **Headers payload validation**: `POST /registry/servers` rejects `headers` values that aren't `dict[str, str]`, preventing downstream 500s from malformed input (#30)
+- **Token entropy warning**: Logs a warning at startup when `GATEWAY_REGISTRATION_TOKEN` is shorter than 16 characters (#30)
+- **`ToolRegistry.get_domain_description()`**: Public accessor for domain descriptions, replacing direct access to the private `_domain_descriptions` dict (#30)
+
 ## [0.6.0] - 2026-02-28
 
 ### Added
@@ -127,6 +143,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Migrated `ToolEntry` and `DomainInfo` from dataclasses to Pydantic models (#9)
 
+[0.6.1]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.4.0...v0.5.0

@@ -287,6 +287,10 @@ class ToolRegistry:
         """Set a human-readable description for a domain."""
         self._domain_descriptions[domain] = description
 
+    def get_domain_description(self, domain: str) -> str:
+        """Return the description for a domain, or empty string if unset."""
+        return self._domain_descriptions.get(domain, "")
+
     def clear_domain(self, domain: str) -> None:
         """Remove all tools for a domain (used during refresh)."""
         if domain in self._domains:
