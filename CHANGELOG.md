@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-02-28
+
+### Added
+
+- **Dynamic MCP instructions after `populate()`**: The gateway now automatically builds domain-aware instructions that are returned in the MCP `InitializeResult` handshake — MCP clients immediately know what tool domains are available without calling `discover_tools()` first (#25, ULT-1220)
+- **Domain summary in instructions**: Each domain's name, tool count, and description (if configured) are included in the auto-generated instructions
+- **Background refresh updates instructions**: When the registry changes during background refresh, instructions are automatically rebuilt to reflect new/removed domains (#25)
+
+### Changed
+
+- Extracted `_apply_domain_descriptions()` method for reuse in both `populate()` and background refresh paths (#25)
+- Custom `instructions=` passed at construction time are never overwritten by dynamic content (#25)
+- Bumped version to 0.5.0
+
 ## [0.4.0] - 2026-02-27
 
 ### Added
@@ -92,6 +106,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Migrated `ToolEntry` and `DomainInfo` from dataclasses to Pydantic models (#9)
 
+[0.5.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.1.1...v0.2.0
