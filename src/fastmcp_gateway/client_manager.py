@@ -230,9 +230,15 @@ class UpstreamManager:
             span.set_attribute("gateway.domain", entry.domain)
             fresh_client = self._make_execution_client(entry.domain, extra_headers=extra_headers)
 
+            # Use the original (upstream) tool name when dispatching.
+            # Collision-prefixed names (e.g., "snowflake_get_server_info")
+            # exist only in the gateway registry — the upstream server only
+            # knows the original name ("get_server_info").
+            upstream_name = entry.original_name or entry.name
+
             async with fresh_client:
                 return await fresh_client.call_tool(
-                    tool_name,
+                    upstream_name,
                     arguments or {},
                     raise_on_error=False,
                 )
