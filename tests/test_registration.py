@@ -142,7 +142,7 @@ class TestUpstreamManagerAddRemove:
         await manager.populate_all()
         assert registry.tool_count == 3
 
-        removed = manager.remove_upstream("support")
+        removed = await manager.remove_upstream("support")
         assert "support_tickets_list" in removed
         assert registry.tool_count == 2
         assert "support" not in manager.domains
@@ -157,7 +157,7 @@ class TestUpstreamManagerAddRemove:
         await manager.populate_all()
 
         with pytest.raises(KeyError, match="not a registered upstream"):
-            manager.remove_upstream("nonexistent")
+            await manager.remove_upstream("nonexistent")
 
     @pytest.mark.asyncio
     async def test_list_upstreams(self, sales_server: FastMCP, support_server: FastMCP) -> None:
@@ -347,6 +347,36 @@ class TestRegistrationValidation:
                 headers=_auth_headers(),
             )
         assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_invalid_url_scheme_returns_400(
+        self,
+        gateway_with_registration: GatewayServer,
+    ) -> None:
+        async with await _http_client(gateway_with_registration) as client:
+            resp = await client.post(
+                "/registry/servers",
+                json={"domain": "evil", "url": "file:///etc/passwd"},
+                headers=_auth_headers(),
+            )
+        assert resp.status_code == 400
+        body = resp.json()
+        assert body["code"] == "bad_request"
+        assert isinstance(body.get("error"), str)
+
+    @pytest.mark.asyncio
+    async def test_invalid_headers_returns_400(
+        self,
+        gateway_with_registration: GatewayServer,
+    ) -> None:
+        async with await _http_client(gateway_with_registration) as client:
+            resp = await client.post(
+                "/registry/servers",
+                json={"domain": "test", "url": "http://example.com/mcp", "headers": [1, 2]},
+                headers=_auth_headers(),
+            )
+        assert resp.status_code == 400
+        assert resp.json()["code"] == "bad_request"
 
     @pytest.mark.asyncio
     async def test_invalid_json_returns_400(

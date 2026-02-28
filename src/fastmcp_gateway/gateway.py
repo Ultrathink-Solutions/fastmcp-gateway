@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 from contextlib import asynccontextmanager, suppress
 from typing import TYPE_CHECKING, Any
@@ -89,6 +90,8 @@ class GatewayServer:
         self._hook_runner = HookRunner(hooks)
         self._registration_token = registration_token
         self._registry_lock = asyncio.Lock()
+        if registration_token and len(registration_token) < 16:
+            logger.warning("GATEWAY_REGISTRATION_TOKEN is shorter than 16 characters — consider using a stronger token")
         self.upstream_manager = UpstreamManager(
             upstreams,
             self.registry,
@@ -258,10 +261,15 @@ class GatewayServer:
         token = self._registration_token
         gateway = self  # Capture for closures.
 
+        expected_header = f"Bearer {token}"
+
         def _check_auth(request: Request) -> JSONResponse | None:
-            """Return an error response if the request is not authorized."""
+            """Return an error response if the request is not authorized.
+
+            Uses ``hmac.compare_digest`` to prevent timing side-channel attacks.
+            """
             auth = request.headers.get("authorization", "")
-            if auth != f"Bearer {token}":
+            if not hmac.compare_digest(auth, expected_header):
                 return JSONResponse(
                     {"error": "Unauthorized", "code": "unauthorized"},
                     status_code=401,
@@ -289,9 +297,27 @@ class GatewayServer:
                     {"error": "'domain' and 'url' are required", "code": "bad_request"},
                     status_code=400,
                 )
+            if not isinstance(domain, str) or not isinstance(url, str):
+                return JSONResponse(
+                    {"error": "'domain' and 'url' must be strings", "code": "bad_request"},
+                    status_code=400,
+                )
+            if not url.startswith(("http://", "https://")):
+                return JSONResponse(
+                    {"error": "'url' must use http:// or https:// scheme", "code": "bad_request"},
+                    status_code=400,
+                )
 
             description = body.get("description")
             headers = body.get("headers")
+            if headers is not None and (
+                not isinstance(headers, dict)
+                or not all(isinstance(k, str) and isinstance(v, str) for k, v in headers.items())
+            ):
+                return JSONResponse(
+                    {"error": "'headers' must be an object of string:string pairs", "code": "bad_request"},
+                    status_code=400,
+                )
 
             async with gateway._registry_lock:
                 diff = await gateway.upstream_manager.add_upstream(
@@ -328,7 +354,7 @@ class GatewayServer:
 
             async with gateway._registry_lock:
                 try:
-                    removed = gateway.upstream_manager.remove_upstream(domain)
+                    removed = await gateway.upstream_manager.remove_upstream(domain)
                 except KeyError:
                     return JSONResponse(
                         {"error": f"Domain '{domain}' is not registered", "code": "not_found"},
@@ -349,18 +375,19 @@ class GatewayServer:
             if auth_err:
                 return auth_err
 
-            upstreams = gateway.upstream_manager.list_upstreams()
-            servers = []
-            for domain, url in sorted(upstreams.items()):
-                tools = gateway.registry.get_tools_by_domain(domain)
-                servers.append(
-                    {
-                        "domain": domain,
-                        "url": url,
-                        "tool_count": len(tools),
-                        "description": gateway.registry._domain_descriptions.get(domain, ""),
-                    }
-                )
+            async with gateway._registry_lock:
+                upstreams = gateway.upstream_manager.list_upstreams()
+                servers = []
+                for domain, url in sorted(upstreams.items()):
+                    tools = gateway.registry.get_tools_by_domain(domain)
+                    servers.append(
+                        {
+                            "domain": domain,
+                            "url": url,
+                            "tool_count": len(tools),
+                            "description": gateway.registry.get_domain_description(domain),
+                        }
+                    )
             return JSONResponse({"servers": servers, "total": len(servers)})
 
     def _update_instructions(self) -> None:

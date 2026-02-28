@@ -307,6 +307,8 @@ class UpstreamManager:
             self._upstreams[domain] = url
             if headers:
                 self._upstream_headers[domain] = headers
+            else:
+                self._upstream_headers.pop(domain, None)
 
             client = Client(url)
             if registry_auth_headers:
@@ -322,9 +324,10 @@ class UpstreamManager:
             )
             return diff
 
-    def remove_upstream(self, domain: str) -> list[str]:
+    async def remove_upstream(self, domain: str) -> list[str]:
         """Remove an upstream and all its tools from the registry.
 
+        Closes the persistent registry client to free resources.
         Returns the list of tool names that were removed.
         Raises ``KeyError`` if the domain is not registered.
         """
@@ -340,8 +343,16 @@ class UpstreamManager:
 
             self._registry.clear_domain(domain)
             self._upstreams.pop(domain, None)
-            self._registry_clients.pop(domain, None)
+            client = self._registry_clients.pop(domain, None)
             self._upstream_headers.pop(domain, None)
+
+            # Close the client to release connection resources.
+            if client is not None:
+                try:
+                    async with client:
+                        pass  # __aexit__ closes the session
+                except Exception:
+                    logger.debug("Error closing client for domain '%s'", domain, exc_info=True)
 
             span.set_attribute("gateway.tools_removed", len(removed))
             logger.info("Deregistered upstream '%s': removed %d tools", domain, len(removed))
