@@ -198,6 +198,59 @@ class TestExecuteTool:
         )
 
     @pytest.mark.asyncio
+    async def test_execute_collision_prefixed_uses_original_name(self, registry: ToolRegistry) -> None:
+        """Collision-prefixed tools must dispatch with the original upstream name."""
+        fake_result = MagicMock()
+        fake_result.content = []
+        fake_result.is_error = False
+
+        fresh_client = AsyncMock()
+        fresh_client.__aenter__ = AsyncMock(return_value=fresh_client)
+        fresh_client.__aexit__ = AsyncMock(return_value=None)
+        fresh_client.call_tool = AsyncMock(return_value=fake_result)
+
+        base_client = MagicMock()
+        base_client.new = MagicMock(return_value=fresh_client)
+
+        def make_client(url: str) -> MagicMock:
+            return base_client
+
+        with patch("fastmcp_gateway.client_manager.Client", side_effect=make_client):
+            manager = UpstreamManager(
+                {
+                    "snowflake": "http://snowflake:8080/mcp",
+                    "axon": "http://axon:8080/mcp",
+                },
+                registry,
+            )
+
+        # Both domains register a tool named "get_server_info" — triggers collision
+        registry.populate_domain(
+            "snowflake",
+            "http://snowflake:8080/mcp",
+            [{"name": "get_server_info", "inputSchema": {}}],
+        )
+        registry.populate_domain(
+            "axon",
+            "http://axon:8080/mcp",
+            [{"name": "get_server_info", "inputSchema": {}}],
+        )
+
+        # Registry should have prefixed names
+        assert registry.lookup("snowflake_get_server_info") is not None
+        assert registry.lookup("snowflake_get_server_info").original_name == "get_server_info"  # type: ignore[union-attr]
+
+        result = await manager.execute_tool("snowflake_get_server_info")
+
+        assert result is fake_result
+        # Must call upstream with the ORIGINAL name, not the prefixed one
+        fresh_client.call_tool.assert_called_once_with(
+            "get_server_info",
+            {},
+            raise_on_error=False,
+        )
+
+    @pytest.mark.asyncio
     async def test_execute_unknown_tool_raises(self, registry: ToolRegistry) -> None:
         with patch("fastmcp_gateway.client_manager.Client"):
             manager = UpstreamManager({"svc": "http://svc:8080/mcp"}, registry)
