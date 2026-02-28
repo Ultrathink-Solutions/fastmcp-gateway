@@ -76,6 +76,7 @@ class GatewayServer:
         self.upstreams = upstreams
         self.registry = ToolRegistry()
         self._domain_descriptions = domain_descriptions or {}
+        self._custom_instructions = instructions  # None → auto-build from registry
         self._refresh_interval = refresh_interval
         self._refresh_task: asyncio.Task[None] | None = None
         self._hook_runner = HookRunner(hooks)
@@ -118,8 +119,22 @@ class GatewayServer:
         Returns a mapping of domain -> tool count.
         """
         results = await self.upstream_manager.populate_all()
+        self._apply_domain_descriptions()
 
-        # Apply domain descriptions after population.
+        # Rebuild MCP instructions to include the domain summary so that
+        # MCP clients see available domains during the initialization
+        # handshake — no separate discover_tools() call required.
+        self._update_instructions()
+
+        return results
+
+    def _apply_domain_descriptions(self) -> None:
+        """Apply configured descriptions to domains currently in the registry.
+
+        Called after both initial population and background refresh so that
+        domains appearing late (e.g., a server that was down at startup but
+        comes back during refresh) still receive their descriptions.
+        """
         for domain, description in self._domain_descriptions.items():
             if self.registry.has_domain(domain):
                 self.registry.set_domain_description(domain, description)
@@ -128,8 +143,6 @@ class GatewayServer:
                     "Domain description for '%s' ignored — domain not populated",
                     domain,
                 )
-
-        return results
 
     def run(self, **kwargs: Any) -> None:
         """Run the gateway server."""
@@ -161,14 +174,19 @@ class GatewayServer:
                 try:
                     diffs = await self.upstream_manager.refresh_all()
                     span.set_attribute("gateway.domains_refreshed", len(diffs))
+                    changed = False
                     for diff in diffs:
                         if diff.added or diff.removed:
+                            changed = True
                             logger.info(
                                 "Registry refresh for '%s': +%d -%d tools",
                                 diff.domain,
                                 len(diff.added),
                                 len(diff.removed),
                             )
+                    if changed:
+                        self._apply_domain_descriptions()
+                        self._update_instructions()
                 except Exception:
                     span.set_attribute("gateway.refresh_failed", True)
                     logger.exception("Background registry refresh failed")
@@ -211,6 +229,44 @@ class GatewayServer:
                     {"status": "not_ready", "tools": 0},
                     status_code=503,
                 )
+
+    def _update_instructions(self) -> None:
+        """Rebuild MCP instructions from the current registry state.
+
+        Skipped when the caller supplied custom *instructions* at construction
+        time — those take precedence and are never overwritten.
+        """
+        if self._custom_instructions is not None:
+            return
+        self._mcp.instructions = self._build_instructions()
+
+    def _build_instructions(self) -> str:
+        """Build instructions that include the domain summary from the registry.
+
+        The MCP spec's ``instructions`` field in ``InitializeResult`` is the
+        primary mechanism for a server to communicate high-level context to
+        the LLM during the handshake — before the client calls ``tools/list``.
+        Including the domain summary here means any MCP client immediately
+        knows what tool domains are available without a separate discovery step.
+        """
+        domain_info = self.registry.get_domain_info()
+        if not domain_info:
+            return self._default_instructions()
+
+        lines = [
+            "You have access to a tool discovery gateway with tools across these domains:\n",
+        ]
+        for info in domain_info:
+            desc = f" \u2014 {info.description}" if info.description else ""
+            lines.append(f"- **{info.name}** ({info.tool_count} tools){desc}")
+
+        lines.append("")
+        lines.append(
+            "Workflow: discover_tools() \u2192 get_tool_schema() \u2192 execute_tool()\n"
+            'Use `discover_tools(domain="...")` to see tools in a specific domain.\n'
+            "Skip discovery for tools you've already used in this conversation."
+        )
+        return "\n".join(lines)
 
     @staticmethod
     def _default_instructions() -> str:
