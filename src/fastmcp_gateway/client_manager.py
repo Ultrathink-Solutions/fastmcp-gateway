@@ -94,6 +94,7 @@ class UpstreamManager:
         self._upstreams = upstreams
         self._registry = registry
         self._upstream_headers = upstream_headers or {}
+        self._registry_auth_headers = registry_auth_headers
 
         # Persistent clients for registry operations (no user context).
         self._registry_clients: dict[str, Client] = {}
@@ -310,9 +311,14 @@ class UpstreamManager:
             else:
                 self._upstream_headers.pop(domain, None)
 
+            # Use explicitly provided registry_auth_headers, or fall back
+            # to the default configured at startup (GATEWAY_REGISTRY_AUTH_TOKEN).
+            # None-check (not truthiness) so callers can pass {} to explicitly
+            # disable auth for a specific upstream even when startup auth exists.
+            effective_auth = registry_auth_headers if registry_auth_headers is not None else self._registry_auth_headers
             client = Client(url)
-            if registry_auth_headers:
-                _set_transport_headers(client, registry_auth_headers)
+            if effective_auth:
+                _set_transport_headers(client, effective_auth)
             self._registry_clients[domain] = client
 
             diff = await self._populate_domain(domain, client)

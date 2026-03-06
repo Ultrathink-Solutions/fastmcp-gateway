@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.2] - 2026-03-06
+
+### Fixed
+
+- **Dynamic registration auth**: `add_upstream()` now inherits the startup `registry_auth_headers` (from `GATEWAY_REGISTRY_AUTH_TOKEN`) when no explicit auth headers are provided. Previously, dynamically registered upstreams had no authentication during tool discovery, causing 401 errors from upstream servers that require auth on `list_tools`. (#31)
+
 ## [0.6.1] - 2026-02-28
 
 ### Fixed
@@ -143,6 +149,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Migrated `ToolEntry` and `DomainInfo` from dataclasses to Pydantic models (#9)
 
+[0.6.2]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.5.0...v0.5.1
