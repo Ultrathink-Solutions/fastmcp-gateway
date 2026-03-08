@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.3] - 2026-03-08
+
+### Fixed
+
+- **Registration endpoint auth passthrough**: `POST /registry/servers` now passes the `headers` payload as `registry_auth_headers` to `add_upstream()`, so the initial `list_tools` discovery call authenticates with the upstream. Previously, headers from the registration request were only stored for tool execution but not used during discovery, causing 401 errors when the registry-controller registered authenticated upstreams.
+
 ## [0.6.2] - 2026-03-06
 
 ### Fixed
@@ -149,6 +155,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Migrated `ToolEntry` and `DomainInfo` from dataclasses to Pydantic models (#9)
 
+[0.6.3]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.5.1...v0.6.0

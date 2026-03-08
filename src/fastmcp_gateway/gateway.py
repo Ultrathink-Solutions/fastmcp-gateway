@@ -324,6 +324,7 @@ class GatewayServer:
                     domain,
                     url,
                     headers=headers,
+                    registry_auth_headers=headers,
                 )
                 if description:
                     gateway.registry.set_domain_description(domain, description)
