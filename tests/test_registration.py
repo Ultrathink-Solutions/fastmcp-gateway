@@ -429,3 +429,46 @@ class TestConcurrentRegistration:
         assert gateway.registry.has_domain("sales")
         assert gateway.registry.has_domain("support")
         assert gateway.registry.tool_count == 3  # 2 sales + 1 support
+
+
+# ---------------------------------------------------------------------------
+# Registration passes auth headers for upstream discovery
+# ---------------------------------------------------------------------------
+
+
+class TestRegistrationAuthHeaders:
+    @pytest.mark.asyncio
+    async def test_register_passes_headers_for_discovery(
+        self,
+        sales_server: FastMCP,
+        support_server: FastMCP,
+    ) -> None:
+        """Registration request headers are passed as registry_auth_headers.
+
+        When the registry-controller sends ``headers`` in the registration
+        payload, those headers must be used for the initial ``list_tools``
+        discovery call (``registry_auth_headers``), not just stored for
+        later tool execution.  Without this, authenticated upstreams
+        reject the discovery connection with 401.
+        """
+        gateway = GatewayServer(
+            {"sales": sales_server},  # type: ignore[dict-item]
+            registration_token=REGISTRATION_TOKEN,
+        )
+        await gateway.populate()
+
+        upstream_auth = {"authorization": "Bearer upstream-token"}
+
+        # Register with headers — simulates what the REST endpoint does
+        async with gateway._registry_lock:
+            diff = await gateway.upstream_manager.add_upstream(
+                "support",
+                support_server,  # type: ignore[arg-type]
+                headers=upstream_auth,
+                registry_auth_headers=upstream_auth,
+            )
+
+        assert diff.tool_count == 1
+        assert gateway.registry.tool_count == 3
+        # Verify headers are stored for execution
+        assert gateway.upstream_manager._upstream_headers.get("support") == upstream_auth
