@@ -239,12 +239,7 @@ class GatewayServer:
                 span.set_attribute("http.route", "/readyz")
                 tool_count = registry.tool_count
                 span.set_attribute("registry.tool_count", tool_count)
-                if tool_count > 0:
-                    return JSONResponse({"status": "ready", "tools": tool_count})
-                return JSONResponse(
-                    {"status": "not_ready", "tools": 0},
-                    status_code=503,
-                )
+                return JSONResponse({"status": "ready", "tools": tool_count})
 
     def _register_registry_routes(self) -> None:
         """Register /registry/servers REST endpoints for dynamic upstream management.
