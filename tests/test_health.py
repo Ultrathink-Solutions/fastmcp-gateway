@@ -71,14 +71,14 @@ class TestHealthz:
 
 class TestReadyz:
     @pytest.mark.asyncio
-    async def test_returns_503_when_empty(self, empty_gateway: GatewayServer) -> None:
+    async def test_returns_200_when_empty(self, empty_gateway: GatewayServer) -> None:
         transport = _http_app(empty_gateway.mcp)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.get("/readyz")
 
-        assert response.status_code == 503
+        assert response.status_code == 200
         data = response.json()
-        assert data["status"] == "not_ready"
+        assert data["status"] == "ready"
         assert data["tools"] == 0
 
     @pytest.mark.asyncio
