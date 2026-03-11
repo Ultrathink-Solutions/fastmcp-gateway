@@ -27,7 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Timing-safe token comparison**: Registration endpoint auth now uses `hmac.compare_digest` to prevent timing side-channel attacks (#30, ULT-1233)
+- **Timing-safe token comparison**: Registration endpoint auth now uses `hmac.compare_digest` to prevent timing side-channel attacks (#30)
 - **Stale headers on upsert**: `add_upstream()` now clears old `upstream_headers` when re-registering without headers, instead of silently preserving them (#30)
 - **Client resource leak**: `remove_upstream()` is now async and properly closes the persistent `Client` connection (#30)
 - **GET endpoint read consistency**: `GET /registry/servers` now holds `_registry_lock` to prevent reading partially-mutated state during concurrent registration (#30)
@@ -43,7 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Dynamic upstream registration API**: REST endpoints for runtime upstream management — add, remove, and list upstream MCP servers without restarting the gateway (#28, ULT-1233)
+- **Dynamic upstream registration API**: REST endpoints for runtime upstream management — add, remove, and list upstream MCP servers without restarting the gateway (#28)
   - `POST /registry/servers` — Register a new upstream with domain, URL, description, and optional auth headers
   - `DELETE /registry/servers/{domain}` — Deregister an upstream and remove all its tools
   - `GET /registry/servers` — List all registered upstreams with tool counts
@@ -58,13 +58,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Collision-prefixed tool dispatch**: `execute_tool` now sends the original upstream tool name (e.g., `get_server_info`) instead of the collision-prefixed gateway name (e.g., `snowflake_get_server_info`) when routing to upstream servers — upstream MCP servers only know their original tool names (#27, ULT-1222)
+- **Collision-prefixed tool dispatch**: `execute_tool` now sends the original upstream tool name (e.g., `get_server_info`) instead of the collision-prefixed gateway name (e.g., `snowflake_get_server_info`) when routing to upstream servers — upstream MCP servers only know their original tool names (#27)
 
 ## [0.5.0] - 2026-02-28
 
 ### Added
 
-- **Dynamic MCP instructions after `populate()`**: The gateway now automatically builds domain-aware instructions that are returned in the MCP `InitializeResult` handshake — MCP clients immediately know what tool domains are available without calling `discover_tools()` first (#25, ULT-1220)
+- **Dynamic MCP instructions after `populate()`**: The gateway now automatically builds domain-aware instructions that are returned in the MCP `InitializeResult` handshake — MCP clients immediately know what tool domains are available without calling `discover_tools()` first (#25)
 - **Domain summary in instructions**: Each domain's name, tool count, and description (if configured) are included in the auto-generated instructions
 - **Background refresh updates instructions**: When the registry changes during background refresh, instructions are automatically rebuilt to reflect new/removed domains (#25)
 

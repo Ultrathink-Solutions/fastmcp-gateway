@@ -27,3 +27,7 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+
+# AI tool configs (may contain internal context)
+.claude/
+CLAUDE.md

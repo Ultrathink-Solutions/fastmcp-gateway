@@ -185,7 +185,7 @@ reviews:
 # CHAT SETTINGS
 # ==============================================================================
 chat:
-  auto_reply: true
+  auto_reply: false
 
 # ==============================================================================
 # KNOWLEDGE BASE
@@ -196,11 +196,6 @@ knowledge_base:
 
   issues:
     scope: auto
-
-  linear:
-    usage: enabled
-    team_keys:
-      - "ULT"
 
   code_guidelines:
     enabled: true
