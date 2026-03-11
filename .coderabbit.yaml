@@ -50,22 +50,22 @@ reviews:
       - name: "Issue Scope Alignment"
         mode: "error"
         instructions: |
-          Verify the PR changes align with the linked Linear issue scope:
+          Verify the PR changes align with the stated scope in the PR title and description:
 
           1. SCOPE CHECK: The PR must address at least a meaningful portion of the
-             linked issue. A PR that only adds minor comments or formatting without
-             substantive progress toward the issue goal should FAIL.
+             stated goal. A PR that only adds minor comments or formatting without
+             substantive progress should FAIL.
 
           2. NO SCOPE CREEP: The PR should not contain significant unrelated changes
-             that aren't mentioned in the issue. Small opportunistic fixes are OK,
-             but major unrelated features or refactors should be in separate PRs.
+             that aren't mentioned in the PR description. Small opportunistic fixes
+             are OK, but major unrelated features or refactors should be in separate PRs.
 
-          3. INCREMENTAL PROGRESS: For large issues, partial implementations are
+          3. INCREMENTAL PROGRESS: For large changes, partial implementations are
              acceptable if they represent a coherent, working increment. The PR
-             description should clarify what portion of the issue is addressed.
+             description should clarify what portion is addressed.
 
-          PASS if the changes meaningfully advance the linked issue's goals.
-          FAIL if the changes are cosmetic-only or mostly unrelated to the issue.
+          PASS if the changes meaningfully advance the PR's stated goals.
+          FAIL if the changes are cosmetic-only or mostly unrelated to the PR description.
 
       - name: "Architecture Alignment"
         mode: "warning"
