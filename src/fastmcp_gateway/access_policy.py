@@ -24,7 +24,9 @@ Build a policy and pass it to :class:`GatewayServer`::
         access_policy=policy,
     )
 
-Or pass per-upstream filters inline::
+Or pass per-upstream filters inline — filter objects are recognised by
+the presence of ``allowed_tools`` and/or ``denied_tools`` (a bare
+``{"url": "..."}`` is treated as a fastmcp transport dict instead)::
 
     gateway = GatewayServer({
         "crm": {
@@ -111,31 +113,36 @@ def normalize_upstreams(
 ) -> tuple[dict[str, Any], AccessPolicy | None]:
     """Split an upstreams mapping into (transport specs, policy).
 
-    Accepts all existing transport forms unchanged::
+    Existing transport forms are passed through unchanged::
 
         {"crm": "http://crm:8080/mcp"}                                 # URL string
         {"crm": <FastMCP instance>}                                    # in-process
         {"crm": {"mcpServers": ...}}                                   # MCP spec dict
+        {"crm": {"url": "http://crm:8080/mcp", "transport": "..."}}    # transport dict
 
-    In addition, a filter object is recognised when the value is a dict
-    containing a ``url`` key::
+    A value is treated as a **gateway filter object** only when it is a
+    dict that contains ``allowed_tools`` and/or ``denied_tools``.  A
+    filter object must also include ``url``::
 
-        {"crm": {"url": "http://crm:8080/mcp"}}
         {"crm": {"url": "http://crm:8080/mcp", "allowed_tools": [...]}}
         {"crm": {"url": "http://crm:8080/mcp", "denied_tools": [...]}}
+        {"crm": {"url": "http://crm:8080/mcp", "allowed_tools": [...], "denied_tools": [...]}}
+
+    A bare ``{"url": ...}`` dict (no filter keys) is **not** treated as a
+    filter object — it falls through to :class:`fastmcp.Client` as a
+    transport dict, so users of fastmcp's richer transport configuration
+    are not affected.
 
     Mixed shapes are allowed.  When any filter dict specifies
     ``allowed_tools`` or ``denied_tools``, an :class:`AccessPolicy` is
-    built and returned; otherwise returns ``None``.
+    built and returned as the second element; otherwise returns ``None``.
 
     Returns a tuple ``(normalized, policy)`` where ``normalized`` has the
-    same keys as *upstreams* with every filter dict replaced by its raw
-    URL string.  Non-filter values (URLs, FastMCP instances, spec dicts)
-    pass through untouched, preserving back-compat with every form
-    :class:`fastmcp.Client` already accepts.
+    same keys as *upstreams* with every filter dict replaced by its
+    ``url`` string.  Non-filter values pass through untouched.
 
-    Raises ``ValueError`` when a filter dict has malformed ``url`` or
-    ``allowed_tools`` / ``denied_tools`` entries.
+    Raises ``ValueError`` when a filter dict has a malformed ``url`` or
+    non-string-list ``allowed_tools`` / ``denied_tools`` entries.
     """
     normalized: dict[str, Any] = {}
     allow: dict[str, list[str]] = {}

@@ -242,6 +242,51 @@ class TestRegistryFiltering:
         assert diff.tool_count == 1
         assert diff.added == ["crm_search"]
 
+    def test_rule_written_in_prefixed_form_matches_bare_upstream_name(self) -> None:
+        """A rule naming the fully-qualified ``{domain}_{tool}`` form must
+        also match upstreams whose bare tool name is ``{tool}``.
+
+        The registered name will become the prefixed form after
+        :meth:`ToolRegistry.register_tool`'s collision logic runs, so both
+        shapes should be accepted so users don't have to guess which form to
+        write their rules against.
+        """
+        registry = ToolRegistry()
+        policy = AccessPolicy(allow={"crm": ["crm_get_server_info"]})
+
+        diff = registry.populate_domain(
+            "crm",
+            "http://crm:8080/mcp",
+            [
+                # Upstream advertises "get_server_info" (no domain prefix).
+                {"name": "get_server_info", "inputSchema": {}},
+                {"name": "delete_account", "inputSchema": {}},
+            ],
+            policy=policy,
+        )
+        # The rule ``crm_get_server_info`` matches via the policy's
+        # prefix-aware check even though the upstream name is bare.
+        assert diff.tool_count == 1
+        assert "get_server_info" in diff.added
+
+    def test_rule_written_in_bare_form_also_matches(self) -> None:
+        """A rule written as the bare upstream name still works (matched via
+        the ``original_name`` check)."""
+        registry = ToolRegistry()
+        policy = AccessPolicy(allow={"crm": ["get_server_info"]})
+
+        diff = registry.populate_domain(
+            "crm",
+            "http://crm:8080/mcp",
+            [
+                {"name": "get_server_info", "inputSchema": {}},
+                {"name": "delete_account", "inputSchema": {}},
+            ],
+            policy=policy,
+        )
+        assert diff.tool_count == 1
+        assert "get_server_info" in diff.added
+
 
 # ---------------------------------------------------------------------------
 # GatewayServer constructor wiring
@@ -286,6 +331,7 @@ class TestGatewayIntegration:
 
         return patch("fastmcp_gateway.client_manager.Client", _StubClient)
 
+    @pytest.mark.asyncio
     async def test_object_shaped_upstreams_filter_through_registry(self) -> None:
         tools = [
             {"name": "crm_search_people", "inputSchema": {}},
@@ -306,6 +352,7 @@ class TestGatewayIntegration:
         assert set(gw.registry.get_all_tool_names()) == {"crm_search_people"}
         assert gw.upstreams == {"crm": "http://crm:8080/mcp"}
 
+    @pytest.mark.asyncio
     async def test_explicit_access_policy_wins_over_inline(self) -> None:
         explicit = AccessPolicy(allow={"crm": ["crm_read_*"]})
         tools = [
@@ -327,6 +374,7 @@ class TestGatewayIntegration:
         # Explicit policy wins: only crm_read_* survives.
         assert set(gw.registry.get_all_tool_names()) == {"crm_read_item"}
 
+    @pytest.mark.asyncio
     async def test_plain_upstreams_have_no_policy_filter(self) -> None:
         tools = [
             {"name": "crm_search", "inputSchema": {}},
@@ -338,6 +386,7 @@ class TestGatewayIntegration:
             await gw.populate()
         assert set(gw.registry.get_all_tool_names()) == {"crm_search", "crm_delete"}
 
+    @pytest.mark.asyncio
     async def test_policy_propagates_to_registry(self) -> None:
         policy = AccessPolicy(allow={"crm": ["crm_search_*"]})
         tools = [

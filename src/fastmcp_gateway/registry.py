@@ -266,16 +266,25 @@ class ToolRegistry:
 
             overrides = group_overrides or {}
             filtered_count = 0
+            prefix = f"{domain}_"
             for raw in tools:
                 name: str = raw.get("name", "")
                 if not name:
                     logger.warning("Skipping tool with empty name in domain %s", domain)
                     continue
 
-                if policy is not None and not policy.is_allowed(domain, name):
-                    filtered_count += 1
-                    logger.debug("Tool '%s' in domain '%s' filtered by access policy", name, domain)
-                    continue
+                # Collision renaming (see register_tool) may rewrite this tool's
+                # registered name to ``{domain}_{name}``.  Evaluate policy
+                # against both forms so rules written in either shape apply to
+                # the final registered name — a rule like
+                # ``allowed_tools: ["crm_get_server_info"]`` works even when
+                # the upstream advertises the tool bare as ``get_server_info``.
+                if policy is not None:
+                    prefixed_name = name if name.startswith(prefix) else prefix + name
+                    if not policy.is_allowed(domain, prefixed_name, original_name=name):
+                        filtered_count += 1
+                        logger.debug("Tool '%s' in domain '%s' filtered by access policy", name, domain)
+                        continue
 
                 group = overrides.get(name, infer_group(domain, name))
 
