@@ -22,6 +22,7 @@ from opentelemetry import trace
 if TYPE_CHECKING:
     from fastmcp.client.client import CallToolResult
 
+    from fastmcp_gateway.access_policy import AccessPolicy
     from fastmcp_gateway.registry import RegistryDiff, ToolRegistry
 
 logger = logging.getLogger(__name__)
@@ -81,20 +82,26 @@ class UpstreamManager:
         Per-domain headers for tool execution.  When ``execute_tool``
         routes to a domain listed here, these headers are used instead
         of the default request-passthrough behaviour.
+    policy:
+        Optional :class:`~fastmcp_gateway.access_policy.AccessPolicy` applied
+        to every registry population (startup, refresh, and dynamic registration).
+        Tools rejected by the policy never enter the registry.
     """
 
     def __init__(
         self,
-        upstreams: dict[str, str],
+        upstreams: dict[str, Any],
         registry: ToolRegistry,
         *,
         registry_auth_headers: dict[str, str] | None = None,
         upstream_headers: dict[str, dict[str, str]] | None = None,
+        policy: AccessPolicy | None = None,
     ) -> None:
         self._upstreams = upstreams
         self._registry = registry
         self._upstream_headers = upstream_headers or {}
         self._registry_auth_headers = registry_auth_headers
+        self._policy = policy
 
         # Persistent clients for registry operations (no user context).
         self._registry_clients: dict[str, Client] = {}
@@ -158,6 +165,7 @@ class UpstreamManager:
                 domain=domain,
                 upstream_url=str(self._upstreams[domain]),
                 tools=raw_tools,
+                policy=self._policy,
             )
             span.set_attribute("gateway.tool_count", diff.tool_count)
             return diff

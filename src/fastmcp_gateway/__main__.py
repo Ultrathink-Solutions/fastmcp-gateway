@@ -4,7 +4,22 @@ Configure via environment variables:
 
     GATEWAY_UPSTREAMS (required)
         JSON object mapping domain names to upstream MCP server URLs.
-        Example: {"apollo": "http://apollo:8080/mcp", "hubspot": "http://hubspot:8080/mcp"}
+        Values may be either a URL string (simple form) or an object with
+        ``url`` plus optional ``allowed_tools`` / ``denied_tools`` lists of
+        fnmatch glob patterns.  Mixed shapes are allowed.
+        Example (simple):
+            {"apollo": "http://apollo:8080/mcp", "hubspot": "http://hubspot:8080/mcp"}
+        Example (with filters):
+            {
+              "apollo": {
+                "url": "http://apollo:8080/mcp",
+                "allowed_tools": ["apollo_search_*", "apollo_contact_*"]
+              },
+              "hubspot": {
+                "url": "http://hubspot:8080/mcp",
+                "denied_tools": ["*_delete"]
+              }
+            }
 
     GATEWAY_NAME
         Server name (default: "fastmcp-gateway").

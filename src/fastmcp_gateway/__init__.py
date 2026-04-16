@@ -1,11 +1,13 @@
 """Progressive tool discovery gateway for MCP, built on FastMCP."""
 
+from fastmcp_gateway.access_policy import AccessPolicy
 from fastmcp_gateway.client_manager import get_user_headers
 from fastmcp_gateway.errors import GatewayError
 from fastmcp_gateway.gateway import GatewayServer
 from fastmcp_gateway.hooks import ExecutionContext, ExecutionDenied, Hook, HookRunner, ListToolsContext
 
 __all__ = [
+    "AccessPolicy",
     "ExecutionContext",
     "ExecutionDenied",
     "GatewayError",
@@ -15,4 +17,4 @@ __all__ = [
     "ListToolsContext",
     "get_user_headers",
 ]
-__version__ = "0.6.1"
+__version__ = "0.7.0"
