@@ -1,10 +1,15 @@
 """Tool registry: in-memory store for discovered tools from upstream MCP servers."""
 
+from __future__ import annotations
+
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from opentelemetry import trace
 from pydantic import BaseModel, ConfigDict
+
+if TYPE_CHECKING:
+    from fastmcp_gateway.access_policy import AccessPolicy
 
 logger = logging.getLogger(__name__)
 _tracer = trace.get_tracer("fastmcp_gateway.registry")
@@ -230,6 +235,7 @@ class ToolRegistry:
         *,
         description: str = "",
         group_overrides: dict[str, str] | None = None,
+        policy: AccessPolicy | None = None,
     ) -> RegistryDiff:
         """Populate the registry with tools from an upstream server.
 
@@ -239,6 +245,11 @@ class ToolRegistry:
 
         Groups are inferred from tool name prefixes unless overridden via
         *group_overrides* (mapping tool name -> explicit group).
+
+        When *policy* is provided, tools rejected by
+        :meth:`AccessPolicy.is_allowed` are skipped and never enter the
+        registry -- callers of :meth:`lookup`, :meth:`search`, etc. will
+        behave as if those tools don't exist.
 
         Returns a :class:`RegistryDiff` describing what changed.
         """
@@ -254,11 +265,26 @@ class ToolRegistry:
                 self.set_domain_description(domain, description)
 
             overrides = group_overrides or {}
+            filtered_count = 0
+            prefix = f"{domain}_"
             for raw in tools:
                 name: str = raw.get("name", "")
                 if not name:
                     logger.warning("Skipping tool with empty name in domain %s", domain)
                     continue
+
+                # Collision renaming (see register_tool) may rewrite this tool's
+                # registered name to ``{domain}_{name}``.  Evaluate policy
+                # against both forms so rules written in either shape apply to
+                # the final registered name — a rule like
+                # ``allowed_tools: ["crm_get_server_info"]`` works even when
+                # the upstream advertises the tool bare as ``get_server_info``.
+                if policy is not None:
+                    prefixed_name = name if name.startswith(prefix) else prefix + name
+                    if not policy.is_allowed(domain, prefixed_name, original_name=name):
+                        filtered_count += 1
+                        logger.debug("Tool '%s' in domain '%s' filtered by access policy", name, domain)
+                        continue
 
                 group = overrides.get(name, infer_group(domain, name))
 
@@ -272,6 +298,8 @@ class ToolRegistry:
                         upstream_url=upstream_url,
                     )
                 )
+            if filtered_count > 0:
+                span.set_attribute("gateway.policy_filtered_count", filtered_count)
 
             new_names = {t.name for t in self.get_tools_by_domain(domain)}
             diff = RegistryDiff(

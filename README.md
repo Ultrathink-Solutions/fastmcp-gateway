@@ -81,7 +81,7 @@ All configuration is via environment variables:
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `GATEWAY_UPSTREAMS` | Yes | — | JSON object: `{"domain": "url", ...}` |
+| `GATEWAY_UPSTREAMS` | Yes | — | JSON object: `{"domain": "url", ...}` or `{"domain": {"url": "...", "allowed_tools": [...], "denied_tools": [...]}}` (see Access Control) |
 | `GATEWAY_NAME` | No | `fastmcp-gateway` | Server name |
 | `GATEWAY_HOST` | No | `0.0.0.0` | Bind address |
 | `GATEWAY_PORT` | No | `8080` | Bind port |
@@ -148,6 +148,57 @@ When the token is not set (default), the registration endpoints are **not** moun
 ### Thread Safety
 
 All registry mutations (populate, add, remove, refresh) are serialized with an `asyncio.Lock` to prevent concurrent corruption.
+
+## Access Control
+
+Restrict which downstream tools are exposed through the gateway using per-upstream allow/deny lists with glob matching. Policies are applied during registry population — blocked tools never enter the registry, so every meta-tool (`discover_tools`, `get_tool_schema`, `execute_tool`, search) sees the filtered view automatically.
+
+### Configuration (env var)
+
+Extend `GATEWAY_UPSTREAMS` values with optional `allowed_tools` / `denied_tools` lists. Simple string values still work as before.
+
+```bash
+export GATEWAY_UPSTREAMS='{
+  "apollo": {
+    "url": "http://apollo:8080/mcp",
+    "allowed_tools": ["apollo_search_*", "apollo_contact_*"]
+  },
+  "hubspot": {
+    "url": "http://hubspot:8080/mcp",
+    "denied_tools": ["*_delete"]
+  },
+  "linear": "http://linear:8080/mcp"
+}'
+```
+
+### Configuration (Python API)
+
+Pass per-upstream filters inline, or build an `AccessPolicy` and pass it explicitly.
+
+```python
+from fastmcp_gateway import AccessPolicy, GatewayServer
+
+policy = AccessPolicy(
+    allow={
+        "apollo":  ["apollo_search_*", "apollo_contact_*"],
+        "hubspot": ["*"],
+    },
+    deny={"apollo": ["*_delete"]},
+)
+gateway = GatewayServer(
+    {"apollo": "http://apollo:8080/mcp", "hubspot": "http://hubspot:8080/mcp"},
+    access_policy=policy,
+)
+```
+
+### Semantics
+
+Patterns use `fnmatch.fnmatchcase` (case-sensitive `*` / `?` globs). Matched against both the registered tool name and its `original_name` so collision-prefix renames can't bypass policy.
+
+- **`allow`**: when non-empty, only domains listed here are exposed, and only their tools matching at least one pattern. Domains absent from a non-empty `allow` map are fully denied. Leave empty to allow every domain by default.
+- **`deny`**: always applied after `allow`. A tool matching a `deny` pattern is blocked even if it also matches an `allow` pattern.
+
+When both object-shaped `upstreams` and an explicit `access_policy=` are provided, the explicit argument wins.
 
 ## Execution Hooks
 

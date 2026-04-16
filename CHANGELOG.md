@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-04-16
+
+### Added
+
+- **Per-upstream access policy**: new `AccessPolicy` dataclass for allow/deny tool filtering with `fnmatch` glob patterns. Rules are keyed by domain and matched against both the registered tool name and its `original_name` so collision-prefix renames can't bypass policy.
+- **Dual-form rule matching**: a rule may be written in either the fully-qualified `{domain}_{tool}` form or the bare upstream `{tool}` form — both match the same tool regardless of whether collision handling renames it at registration time. Rule authors don't have to predict whether a collision will occur.
+- **Object-shaped `GATEWAY_UPSTREAMS`**: env var values may now be either a URL string (existing form, back-compat) or an object with `url` plus `allowed_tools` and/or `denied_tools` lists. A dict counts as a filter config only when it contains one of those filter keys, so fastmcp-native transport dicts that happen to include a bare `"url"` pass through unchanged. Mixed shapes are allowed in the same config.
+- **`GatewayServer(access_policy=)`**: new constructor parameter accepting an `AccessPolicy` directly. When both object-shaped upstreams and an explicit `access_policy` are provided, the explicit argument wins.
+- **`GatewayServer.access_policy` property**: public read-only accessor for the effective policy resolved during construction. Useful for introspection and testing without reaching into private attributes.
+- **Registry-level filtering**: policy is applied during `ToolRegistry.populate_domain`, so rejected tools never enter the registry. Every consumer (`discover_tools`, `get_tool_schema`, `execute_tool`, `search`, `get_all_tool_names`) sees the filtered view automatically — including dynamic registrations via `POST /registry/servers`.
+
+### Changed
+
+- `GatewayServer` constructor `upstreams` parameter now accepts mixed `str | dict[str, Any]` values. Pure string values preserve existing behaviour.
+- `UpstreamManager.__init__()` accepts an optional `policy` kwarg, forwarded to every registry population call.
+- `ToolRegistry.populate_domain()` accepts an optional `policy` kwarg; rejected tools are skipped with a DEBUG log and surface as a `gateway.policy_filtered_count` span attribute.
+- Bumped version to 0.7.0.
+
 ## [0.6.4] - 2026-03-09
 
 ### Fixed
@@ -161,6 +179,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Migrated `ToolEntry` and `DomainInfo` from dataclasses to Pydantic models (#9)
 
+[0.7.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.6.4...v0.7.0
 [0.6.4]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.6.3...v0.6.4
 [0.6.3]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.6.1...v0.6.2

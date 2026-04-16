@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 from fastmcp import FastMCP
 
+from fastmcp_gateway.access_policy import AccessPolicy, normalize_upstreams
 from fastmcp_gateway.client_manager import UpstreamManager
 from fastmcp_gateway.hooks import HookRunner
 from fastmcp_gateway.registry import ToolRegistry
@@ -29,7 +30,10 @@ class GatewayServer:
     Parameters
     ----------
     upstreams:
-        Mapping of domain name to upstream MCP server URL.
+        Mapping of domain name to upstream MCP server URL.  Values may also
+        be object-shaped (``{"url": ..., "allowed_tools": [...], "denied_tools": [...]}``);
+        the per-entry filters are collected into an :class:`AccessPolicy`
+        unless an explicit *access_policy* is passed (which wins).
     name:
         Name for the FastMCP server instance.
     instructions:
@@ -57,6 +61,13 @@ class GatewayServer:
         routes for dynamic upstream registration.  Callers must send
         ``Authorization: Bearer <token>``.  When ``None`` (default),
         the registration endpoints are **not** mounted.
+    access_policy:
+        Optional :class:`AccessPolicy` applied to every registry population
+        (startup, refresh, dynamic registration).  Tools rejected by the
+        policy never enter the registry.  When ``None`` (default) and
+        *upstreams* contains no per-entry filters, no filtering is applied.
+        When both *access_policy* and per-entry filters are provided, the
+        explicit *access_policy* wins (per-entry filters are ignored).
 
     Usage::
 
@@ -70,7 +81,7 @@ class GatewayServer:
 
     def __init__(
         self,
-        upstreams: dict[str, str],
+        upstreams: dict[str, Any],
         *,
         name: str = "fastmcp-gateway",
         instructions: str | None = None,
@@ -80,8 +91,15 @@ class GatewayServer:
         refresh_interval: float | None = None,
         hooks: list[Any] | None = None,
         registration_token: str | None = None,
+        access_policy: AccessPolicy | None = None,
     ) -> None:
-        self.upstreams = upstreams
+        # Accept either a plain URL mapping or an object-shaped mapping with
+        # per-entry allowed_tools / denied_tools.  The explicit access_policy
+        # kwarg wins when both are provided.
+        normalized_urls, inline_policy = normalize_upstreams(upstreams)
+        effective_policy = access_policy if access_policy is not None else inline_policy
+
+        self.upstreams = normalized_urls
         self.registry = ToolRegistry()
         self._domain_descriptions = domain_descriptions or {}
         self._custom_instructions = instructions  # None → auto-build from registry
@@ -89,14 +107,16 @@ class GatewayServer:
         self._refresh_task: asyncio.Task[None] | None = None
         self._hook_runner = HookRunner(hooks)
         self._registration_token = registration_token
+        self._access_policy = effective_policy
         self._registry_lock = asyncio.Lock()
         if registration_token and len(registration_token) < 16:
             logger.warning("GATEWAY_REGISTRATION_TOKEN is shorter than 16 characters — consider using a stronger token")
         self.upstream_manager = UpstreamManager(
-            upstreams,
+            normalized_urls,
             self.registry,
             registry_auth_headers=registry_auth_headers,
             upstream_headers=upstream_headers,
+            policy=effective_policy,
         )
         self._mcp = FastMCP(
             name,
@@ -112,6 +132,16 @@ class GatewayServer:
     def mcp(self) -> FastMCP:
         """Access the underlying FastMCP server instance."""
         return self._mcp
+
+    @property
+    def access_policy(self) -> AccessPolicy | None:
+        """The effective :class:`AccessPolicy` in use, or ``None`` if unset.
+
+        Reflects the resolved policy after considering both the explicit
+        *access_policy* constructor argument and any inline filters parsed
+        from object-shaped *upstreams* entries.
+        """
+        return self._access_policy
 
     @property
     def hook_runner(self) -> HookRunner:
