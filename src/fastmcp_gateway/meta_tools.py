@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from mcp.types import ToolAnnotations
 from opentelemetry import trace
 
 from fastmcp_gateway.errors import error_response
 from fastmcp_gateway.hooks import ExecutionContext, ExecutionDenied, HookRunner, ListToolsContext
+from fastmcp_gateway.signatures import tool_to_signature
 
 if TYPE_CHECKING:
     from fastmcp import FastMCP
@@ -18,6 +19,17 @@ if TYPE_CHECKING:
     from fastmcp_gateway.registry import ToolEntry, ToolRegistry
 
 _tracer = trace.get_tracer("fastmcp_gateway.meta_tools")
+
+
+def _signatures_block(tools: list[ToolEntry]) -> str:
+    """Render *tools* as a plain-text block of Python-style signatures.
+
+    Each tool spans up to two lines (signature plus optional description),
+    separated by blank lines to keep the listing scannable.
+    """
+    if not tools:
+        return ""
+    return "\n\n".join(tool_to_signature(t) for t in tools)
 
 
 def _suggest_tool_names(query: str, all_names: list[str], max_suggestions: int = 3) -> list[str]:
@@ -71,6 +83,7 @@ def register_meta_tools(
         domain: str | None = None,
         group: str | None = None,
         query: str | None = None,
+        format: Literal["schema", "signatures"] = "schema",
     ) -> str:
         """Browse available tools by domain, group, or keyword.
 
@@ -78,6 +91,13 @@ def register_meta_tools(
         Call with a domain to see groups and tools within that domain.
         Call with a domain and group to see tools in that specific group.
         Call with a query to search across all tools by keyword.
+
+        Set ``format="signatures"`` to receive each tool rendered as a
+        Python-style function signature (``name(arg: type, ...) -> any``)
+        instead of the default JSON schema summary.  Useful when the LLM
+        will subsequently write code that calls the tool directly.  The
+        domain summary (no-arguments form) ignores ``format`` and always
+        returns JSON.
         """
         with _tracer.start_as_current_span("gateway.discover_tools") as span:
             if domain:
@@ -86,11 +106,15 @@ def register_meta_tools(
                 span.set_attribute("gateway.group", group)
             if query:
                 span.set_attribute("gateway.query", query)
+            if format != "schema":
+                span.set_attribute("gateway.format", format)
 
             # Mode 4: keyword search (takes priority when query is provided)
             if query is not None and query.strip():
                 results = await _filter_tools(registry.search(query), None)
                 span.set_attribute("gateway.result_count", len(results))
+                if format == "signatures":
+                    return _signatures_block(results)
                 return json.dumps(
                     {
                         "query": query,
@@ -171,6 +195,8 @@ def register_meta_tools(
                     )
                 tools = await _filter_tools(registry.get_tools_by_group(domain, group), domain)
                 span.set_attribute("gateway.result_count", len(tools))
+                if format == "signatures":
+                    return _signatures_block(tools)
                 return json.dumps(
                     {
                         "domain": domain,
@@ -182,6 +208,8 @@ def register_meta_tools(
             # Mode 2: domain only -> all tools in domain
             tools = await _filter_tools(registry.get_tools_by_domain(domain), domain)
             span.set_attribute("gateway.result_count", len(tools))
+            if format == "signatures":
+                return _signatures_block(tools)
             return json.dumps(
                 {
                     "domain": domain,

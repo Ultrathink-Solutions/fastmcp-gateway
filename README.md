@@ -65,7 +65,7 @@ The gateway starts on `http://0.0.0.0:8080/mcp` and exposes 4 tools to any MCP c
 
 ## How It Works
 
-1. **`discover_tools()`** — Call with no arguments to see all domains and tool counts. Call with `domain="apollo"` to see that domain's tools with descriptions.
+1. **`discover_tools()`** — Call with no arguments to see all domains and tool counts. Call with `domain="apollo"` to see that domain's tools with descriptions. Pass `format="signatures"` to receive Python-style function signatures (`apollo_search(query: str, limit: int = None) -> any`) instead of the default JSON summary — useful when the LLM will subsequently write code against the listed tools.
 
 2. **`get_tool_schema("apollo_people_search")`** — Returns the full JSON Schema for a tool's parameters. Supports fuzzy matching.
 

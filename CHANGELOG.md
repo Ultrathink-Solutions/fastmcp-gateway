@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1] - 2026-04-16
+
+### Added
+
+- **Python-style tool signatures**: new `discover_tools(format="signatures")` rendering mode returns each tool as a plain-text Python function signature (`name(arg: type, …) -> any`) instead of a JSON summary. Easier for LLMs that will subsequently write code against the listed tools than mentally translating JSON Schema.
+- **`fastmcp_gateway.signatures` module**: new public helpers `extract_params`, `format_schema`, and `tool_to_signature` for anyone building their own rendering on top of the registry.
+
+### Notes
+
+- `format="schema"` remains the default; existing consumers see no change.
+- The mode-1 domain summary (no-arguments call) ignores `format` and always returns JSON, since it reports domain counts rather than a tool list.
+
 ## [0.7.0] - 2026-04-16
 
 ### Added
@@ -179,6 +191,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Migrated `ToolEntry` and `DomainInfo` from dataclasses to Pydantic models (#9)
 
+[0.7.1]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.6.4...v0.7.0
 [0.6.4]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.6.3...v0.6.4
 [0.6.3]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.6.2...v0.6.3
