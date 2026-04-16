@@ -154,12 +154,11 @@ def _load_code_mode_config() -> tuple[bool, Any | None, bool]:
     if not enabled:
         return False, None, False
 
-    # Defer the import so systems without the extra installed don't pay the cost.
-    try:
-        from fastmcp_gateway.code_mode import CodeModeLimits
-    except RuntimeError as exc:
-        logger.error("GATEWAY_CODE_MODE=true but code-mode extra is not installed: %s", exc)
-        sys.exit(1)
+    # Defer the import so systems with code mode disabled don't pay the cost.
+    # The missing-extra case is handled later when GatewayServer constructs
+    # CodeModeRunner (see main()); this import itself cannot fail because
+    # CodeModeLimits is a plain dataclass with no pydantic-monty dependency.
+    from fastmcp_gateway.code_mode import CodeModeLimits
 
     # Each override is optional; when omitted we keep the dataclass default.
     overrides: dict[str, Any] = {}
