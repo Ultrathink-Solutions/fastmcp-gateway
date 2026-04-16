@@ -175,6 +175,69 @@ class TestAuthorizer:
         assert calls[0][0] == "alice"
         assert calls[0][1]["headers"] == {"x-test": "yes"}
 
+    @pytest.mark.asyncio
+    async def test_authorizer_auto_discovered_from_hook(self) -> None:
+        """When code_mode=True and no explicit authorizer is passed, the
+        gateway discovers ``authorize_code_mode`` on any supplied hook.
+
+        Matches the duck-typed convention used elsewhere in the hook
+        protocol (``on_authenticate``, ``before_execute``, …) and lets
+        deployments that already own an auth hook avoid threading a
+        second callback through their config.
+        """
+        hook_calls: list[Any] = []
+
+        class HookWithAuthorizer:
+            async def authorize_code_mode(self, user: Any, _ctx: dict[str, Any]) -> bool:
+                hook_calls.append(user)
+                return False  # deny → proves the hook method is what fires
+
+        gw = _make_gateway(hooks=[HookWithAuthorizer()])
+        _seed_registry(gw)
+
+        # Reach through the same runner the meta-tool uses.  Constructing
+        # a standalone runner would skip the auto-discovery path, so we
+        # call via the gateway's own plumbing.
+        from fastmcp_gateway.code_mode import CodeModeRunner
+
+        runner = CodeModeRunner(
+            gw.registry,
+            gw.upstream_manager,
+            gw.hook_runner,
+            authorizer=gw._code_mode_authorizer,
+        )
+        with pytest.raises(ExecutionDenied):
+            await runner.run("1 + 1", headers={}, user="alice")
+        assert hook_calls == ["alice"]
+
+    @pytest.mark.asyncio
+    async def test_explicit_authorizer_wins_over_hook(self) -> None:
+        """An explicit code_mode_authorizer must NOT be overridden by hook discovery."""
+        explicit_calls: list[Any] = []
+
+        async def explicit(user: Any, _ctx: dict[str, Any]) -> bool:
+            explicit_calls.append(user)
+            return False
+
+        class HookWithAuthorizer:
+            async def authorize_code_mode(self, _user: Any, _ctx: dict[str, Any]) -> bool:
+                raise AssertionError("hook must NOT be consulted when explicit is set")
+
+        gw = _make_gateway(hooks=[HookWithAuthorizer()], code_mode_authorizer=explicit)
+        _seed_registry(gw)
+
+        from fastmcp_gateway.code_mode import CodeModeRunner
+
+        runner = CodeModeRunner(
+            gw.registry,
+            gw.upstream_manager,
+            gw.hook_runner,
+            authorizer=gw._code_mode_authorizer,
+        )
+        with pytest.raises(ExecutionDenied):
+            await runner.run("1 + 1", headers={}, user="alice")
+        assert explicit_calls == ["alice"]
+
 
 # ---------------------------------------------------------------------------
 # Finding 6.1 — callable namespace respects after_list_tools
