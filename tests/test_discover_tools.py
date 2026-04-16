@@ -214,3 +214,59 @@ class TestDiscoverByQuery:
 
         assert "domains" in data
         assert "total_tools" in data
+
+
+# ---------------------------------------------------------------------------
+# format="signatures" — plain-text Python-signature output
+# ---------------------------------------------------------------------------
+
+
+async def _call_discover_text(mcp: FastMCP, **kwargs: object) -> str:
+    """Helper: call discover_tools and return the raw string (skip JSON parse)."""
+    async with Client(mcp) as client:
+        result = await client.call_tool("discover_tools", {k: v for k, v in kwargs.items() if v is not None})
+    if result.data is not None:
+        return str(result.data)
+    content_block = result.content[0]
+    return content_block.text  # type: ignore[union-attr]
+
+
+class TestDiscoverSignaturesFormat:
+    @pytest.mark.asyncio
+    async def test_domain_mode_signatures(self, mcp_server: FastMCP) -> None:
+        """format=signatures returns plain-text sigs for domain-only mode."""
+        out = await _call_discover_text(mcp_server, domain="apollo", format="signatures")
+
+        # Should contain signature lines, not JSON.
+        assert "apollo_people_search(" in out
+        assert "apollo_people_enrich(" in out
+        assert "-> any" in out
+        # Descriptions are rendered on indented continuation lines.
+        assert "Search for people" in out
+
+    @pytest.mark.asyncio
+    async def test_group_mode_signatures(self, mcp_server: FastMCP) -> None:
+        out = await _call_discover_text(mcp_server, domain="apollo", group="people", format="signatures")
+        assert "apollo_people_search(" in out
+        assert "apollo_people_enrich(" in out
+        # organizations group should NOT appear
+        assert "apollo_org_search(" not in out
+
+    @pytest.mark.asyncio
+    async def test_query_mode_signatures(self, mcp_server: FastMCP) -> None:
+        out = await _call_discover_text(mcp_server, query="deals", format="signatures")
+        assert "hubspot_deals_list(" in out
+
+    @pytest.mark.asyncio
+    async def test_domain_summary_ignores_format(self, mcp_server: FastMCP) -> None:
+        """Mode 1 (no-args) always returns JSON, ignoring format param."""
+        out = await _call_discover_text(mcp_server, format="signatures")
+        parsed = json.loads(out)
+        assert "domains" in parsed
+
+    @pytest.mark.asyncio
+    async def test_schema_format_unchanged(self, mcp_server: FastMCP) -> None:
+        """Default format=schema still returns JSON."""
+        data = await _call_discover(mcp_server, domain="apollo")
+        assert data["domain"] == "apollo"
+        assert "tools" in data
