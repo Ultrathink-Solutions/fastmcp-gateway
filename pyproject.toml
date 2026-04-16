@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "fastmcp-gateway"
-version = "0.7.1"
+version = "0.8.0"
 description = "Progressive tool discovery gateway for MCP, built on FastMCP"
 readme = "README.md"
 license = "Apache-2.0"
@@ -31,10 +31,14 @@ dependencies = [
 dev = [
     "opentelemetry-sdk>=1.39.1",
     "pydantic-ai>=0.1",
+    "pydantic-monty>=0.0.12",
     "pyright>=1.1",
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
     "ruff>=0.9",
+]
+code-mode = [
+    "pydantic-monty>=0.0.12",
 ]
 
 [project.scripts]

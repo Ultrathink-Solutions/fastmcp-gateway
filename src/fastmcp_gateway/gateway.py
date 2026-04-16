@@ -68,6 +68,32 @@ class GatewayServer:
         *upstreams* contains no per-entry filters, no filtering is applied.
         When both *access_policy* and per-entry filters are provided, the
         explicit *access_policy* wins (per-entry filters are ignored).
+    code_mode:
+        When ``True``, exposes an additional ``execute_code`` meta-tool
+        that runs LLM-authored Python against the registered tools
+        inside a Monty sandbox.  Experimental, off by default.  Requires
+        the ``code-mode`` optional extra (``pip install
+        "fastmcp-gateway[code-mode]"``).  See
+        :mod:`fastmcp_gateway.code_mode` for safety notes.
+    code_mode_authorizer:
+        Optional async callback ``(user, context) -> bool`` that gates
+        *each* ``execute_code`` call at session level.  Returning
+        ``False`` raises ``ExecutionDenied``.  When ``None`` and
+        ``code_mode=True``, the gateway auto-discovers the callback by
+        scanning *hooks* for any object that exposes an
+        ``authorize_code_mode`` async method (mirroring the duck-typed
+        convention used by the rest of the hook protocol).  When no
+        match is found either, any authenticated caller may use code
+        mode.  Has no effect when ``code_mode=False``.
+    code_mode_limits:
+        Optional :class:`~fastmcp_gateway.code_mode.CodeModeLimits`
+        overriding the default duration / memory / allocation / recursion /
+        nested-call caps.  Has no effect when ``code_mode=False``.
+    code_mode_audit_verbatim:
+        When ``True``, raw LLM-authored code is emitted at DEBUG level
+        in addition to the default hash+metadata INFO audit record.
+        High-PII-risk; do not enable in production without review.
+        Has no effect when ``code_mode=False``.
 
     Usage::
 
@@ -92,6 +118,10 @@ class GatewayServer:
         hooks: list[Any] | None = None,
         registration_token: str | None = None,
         access_policy: AccessPolicy | None = None,
+        code_mode: bool = False,
+        code_mode_authorizer: Any | None = None,
+        code_mode_limits: Any | None = None,
+        code_mode_audit_verbatim: bool = False,
     ) -> None:
         # Accept either a plain URL mapping or an object-shaped mapping with
         # per-entry allowed_tools / denied_tools.  The explicit access_policy
@@ -108,6 +138,30 @@ class GatewayServer:
         self._hook_runner = HookRunner(hooks)
         self._registration_token = registration_token
         self._access_policy = effective_policy
+        self._code_mode = code_mode
+        # Auto-discover a code_mode_authorizer from the hook chain when the
+        # caller didn't pass one explicitly.  Any hook exposing a *callable*
+        # ``authorize_code_mode`` async method is picked up, matching the
+        # same duck-typed convention the hook protocol uses for
+        # ``on_authenticate`` / ``before_execute`` / etc.  We verify
+        # ``callable`` so a hook that accidentally stores a non-callable
+        # under that attribute doesn't blow up at invocation time.
+        if code_mode and code_mode_authorizer is None and hooks:
+            for hook in hooks:
+                discovered = getattr(hook, "authorize_code_mode", None)
+                if discovered is None:
+                    continue
+                if not callable(discovered):
+                    logger.warning(
+                        "Hook %s has a non-callable 'authorize_code_mode' attribute; ignoring",
+                        type(hook).__name__,
+                    )
+                    continue
+                code_mode_authorizer = discovered
+                break
+        self._code_mode_authorizer = code_mode_authorizer
+        self._code_mode_limits = code_mode_limits
+        self._code_mode_audit_verbatim = code_mode_audit_verbatim
         self._registry_lock = asyncio.Lock()
         if registration_token and len(registration_token) < 16:
             logger.warning("GATEWAY_REGISTRATION_TOKEN is shorter than 16 characters — consider using a stronger token")
@@ -242,10 +296,37 @@ class GatewayServer:
     # ------------------------------------------------------------------
 
     def _register_meta_tools(self) -> None:
-        """Register the 3 meta-tools on the FastMCP server."""
+        """Register the meta-tools on the FastMCP server.
+
+        The fourth meta-tool (``execute_code``) is only registered when
+        ``code_mode=True`` was passed to the constructor.  When enabled,
+        a :class:`~fastmcp_gateway.code_mode.CodeModeRunner` is
+        constructed here so the ``pydantic-monty`` import is deferred
+        until code mode is actually requested.
+        """
         from fastmcp_gateway.meta_tools import register_meta_tools
 
-        register_meta_tools(self._mcp, self.registry, self.upstream_manager, self._hook_runner)
+        code_mode_runner = None
+        if self._code_mode:
+            from fastmcp_gateway.code_mode import CodeModeLimits, CodeModeRunner
+
+            limits = self._code_mode_limits or CodeModeLimits()
+            code_mode_runner = CodeModeRunner(
+                self.registry,
+                self.upstream_manager,
+                self._hook_runner,
+                limits=limits,
+                authorizer=self._code_mode_authorizer,
+                audit_verbatim=self._code_mode_audit_verbatim,
+            )
+
+        register_meta_tools(
+            self._mcp,
+            self.registry,
+            self.upstream_manager,
+            self._hook_runner,
+            code_mode_runner=code_mode_runner,
+        )
 
     def _register_health_routes(self) -> None:
         """Register /healthz and /readyz health check endpoints."""

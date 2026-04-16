@@ -62,6 +62,22 @@ Configure via environment variables:
         ``Authorization: Bearer <token>``.  When not set, the endpoints are
         not mounted (default — backwards-compatible).
 
+    GATEWAY_CODE_MODE
+        Set to ``true`` to enable the experimental ``execute_code``
+        meta-tool.  Off by default.  Requires the optional ``code-mode``
+        extra (``pip install "fastmcp-gateway[code-mode]"``).
+
+    GATEWAY_CODE_MODE_MAX_DURATION_SECS, GATEWAY_CODE_MODE_MAX_MEMORY,
+    GATEWAY_CODE_MODE_MAX_ALLOCATIONS, GATEWAY_CODE_MODE_MAX_RECURSION_DEPTH,
+    GATEWAY_CODE_MODE_MAX_NESTED_CALLS
+        Optional resource caps for each ``execute_code`` invocation.
+        Missing values use the CodeModeLimits defaults.
+
+    GATEWAY_CODE_MODE_AUDIT_VERBATIM
+        When ``true``, raw LLM-authored code is emitted at DEBUG level
+        in audit logs.  High PII risk; leave off unless explicitly
+        required for incident response.
+
 Usage::
 
     GATEWAY_UPSTREAMS='{"apollo": "http://localhost:8080/mcp"}' python -m fastmcp_gateway
@@ -78,6 +94,7 @@ import os
 import sys
 from typing import Any
 
+from fastmcp_gateway.code_mode import CodeModeUnavailableError
 from fastmcp_gateway.gateway import GatewayServer
 
 logger = logging.getLogger("fastmcp_gateway")
@@ -100,6 +117,104 @@ def _load_json_env(name: str, *, required: bool = False) -> dict[str, Any] | Non
         logger.error("%s must be a JSON object, got %s", name, type(value).__name__)
         sys.exit(1)
     return value
+
+
+_TRUE_TOKENS = frozenset({"true", "1", "yes", "on"})
+_FALSE_TOKENS = frozenset({"false", "0", "no", "off"})
+
+
+def _bool_env(name: str, default: bool = False) -> bool:
+    """Parse a boolean env var with strict token matching.
+
+    Recognised: ``true`` / ``1`` / ``yes`` / ``on`` for True, and
+    ``false`` / ``0`` / ``no`` / ``off`` for False (case-insensitive).
+    An empty value returns *default*.  Any other value is rejected --
+    typos like ``GATEWAY_CODE_MODE=treu`` should fail fast instead of
+    silently disabling a security-relevant feature.
+    """
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in _TRUE_TOKENS:
+        return True
+    if raw in _FALSE_TOKENS:
+        return False
+    logger.error(
+        "Invalid %s: %r (expected one of: %s)",
+        name,
+        raw,
+        ", ".join(sorted(_TRUE_TOKENS | _FALSE_TOKENS)),
+    )
+    sys.exit(1)
+
+
+def _float_env(name: str) -> float | None:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        logger.error("Invalid %s: %s (must be a number)", name, raw)
+        sys.exit(1)
+
+
+def _int_env(name: str) -> int | None:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        logger.error("Invalid %s: %s (must be an integer)", name, raw)
+        sys.exit(1)
+
+
+def _load_code_mode_config() -> tuple[bool, Any | None, bool]:
+    """Parse the code-mode env vars into (flag, CodeModeLimits | None, verbatim)."""
+    enabled = _bool_env("GATEWAY_CODE_MODE", default=False)
+    if not enabled:
+        return False, None, False
+
+    # Defer the import so systems with code mode disabled don't pay the cost.
+    # The missing-extra case is handled later when GatewayServer constructs
+    # CodeModeRunner (see main()); this import itself cannot fail because
+    # CodeModeLimits is a plain dataclass with no pydantic-monty dependency.
+    from fastmcp_gateway.code_mode import CodeModeLimits
+
+    # Each override is optional; when omitted we keep the dataclass default.
+    # Every limit must be strictly positive and finite -- zero or negative
+    # values would either degrade the sandbox to "no limit" (dangerous) or
+    # make it reject every call (useless).  NaN / inf are never valid here.
+    overrides: dict[str, Any] = {}
+
+    duration = _float_env("GATEWAY_CODE_MODE_MAX_DURATION_SECS")
+    if duration is not None:
+        if not math.isfinite(duration) or duration <= 0:
+            logger.error(
+                "Invalid GATEWAY_CODE_MODE_MAX_DURATION_SECS: %s (must be finite and > 0)",
+                duration,
+            )
+            sys.exit(1)
+        overrides["max_duration_secs"] = duration
+
+    for var_name, limit_name in (
+        ("GATEWAY_CODE_MODE_MAX_MEMORY", "max_memory"),
+        ("GATEWAY_CODE_MODE_MAX_ALLOCATIONS", "max_allocations"),
+        ("GATEWAY_CODE_MODE_MAX_RECURSION_DEPTH", "max_recursion_depth"),
+        ("GATEWAY_CODE_MODE_MAX_NESTED_CALLS", "max_nested_calls"),
+    ):
+        value = _int_env(var_name)
+        if value is None:
+            continue
+        if value <= 0:
+            logger.error("Invalid %s: %d (must be > 0)", var_name, value)
+            sys.exit(1)
+        overrides[limit_name] = value
+
+    limits = CodeModeLimits(**overrides) if overrides else CodeModeLimits()
+    verbatim = _bool_env("GATEWAY_CODE_MODE_AUDIT_VERBATIM", default=False)
+    return True, limits, verbatim
 
 
 def _load_hooks() -> list[Any] | None:
@@ -206,17 +321,35 @@ def main() -> None:
     # Dynamic registration token (optional).
     registration_token = os.environ.get("GATEWAY_REGISTRATION_TOKEN") or None
 
-    gateway = GatewayServer(
-        upstreams,
-        name=name,
-        instructions=instructions,
-        registry_auth_headers=registry_auth_headers,
-        upstream_headers=upstream_headers,
-        domain_descriptions=domain_descriptions,
-        refresh_interval=refresh_interval,
-        hooks=hooks,
-        registration_token=registration_token,
-    )
+    # Code mode (experimental, off by default).
+    code_mode, code_mode_limits, code_mode_audit_verbatim = _load_code_mode_config()
+
+    try:
+        gateway = GatewayServer(
+            upstreams,
+            name=name,
+            instructions=instructions,
+            registry_auth_headers=registry_auth_headers,
+            upstream_headers=upstream_headers,
+            domain_descriptions=domain_descriptions,
+            refresh_interval=refresh_interval,
+            hooks=hooks,
+            registration_token=registration_token,
+            code_mode=code_mode,
+            code_mode_limits=code_mode_limits,
+            code_mode_audit_verbatim=code_mode_audit_verbatim,
+        )
+    except CodeModeUnavailableError as exc:
+        # Friendly handling for the one construction-time error with a
+        # clear operator action.  CodeModeRunner raises this lazily inside
+        # GatewayServer._register_meta_tools when the [code-mode] extra
+        # isn't installed.  Any other construction error propagates with
+        # its full traceback so real bugs surface in logs.
+        logger.error(
+            "GATEWAY_CODE_MODE=true but the [code-mode] extra is not installed: %s",
+            exc,
+        )
+        sys.exit(1)
 
     # Populate in its own event loop, then run the server (which creates its
     # own loop via anyio).  Calling gateway.run() from inside asyncio.run()

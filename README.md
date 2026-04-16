@@ -92,6 +92,13 @@ All configuration is via environment variables:
 | `GATEWAY_REFRESH_INTERVAL` | No | Disabled | Seconds between automatic registry refresh cycles |
 | `GATEWAY_HOOK_MODULE` | No | — | Python module path for execution hooks: `module.path:factory_function` |
 | `GATEWAY_REGISTRATION_TOKEN` | No | — | Shared secret for dynamic registration endpoints (see below) |
+| `GATEWAY_CODE_MODE` | No | `false` | Enable the experimental `execute_code` meta-tool (see Code Mode) |
+| `GATEWAY_CODE_MODE_MAX_DURATION_SECS` | No | `30` | Per-run wall-clock cap for `execute_code` |
+| `GATEWAY_CODE_MODE_MAX_MEMORY` | No | `268435456` | Per-run heap memory cap (bytes) for `execute_code` |
+| `GATEWAY_CODE_MODE_MAX_ALLOCATIONS` | No | `10000000` | Per-run allocation cap for `execute_code` |
+| `GATEWAY_CODE_MODE_MAX_RECURSION_DEPTH` | No | `200` | Per-run stack depth cap for `execute_code` |
+| `GATEWAY_CODE_MODE_MAX_NESTED_CALLS` | No | `50` | Max number of upstream tool calls one `execute_code` run may make |
+| `GATEWAY_CODE_MODE_AUDIT_VERBATIM` | No | `false` | Emit raw code body at DEBUG in audit logs (PII-sensitive) |
 | `LOG_LEVEL` | No | `INFO` | Logging level |
 
 ### Per-Upstream Auth
@@ -257,6 +264,69 @@ class AccessControlHook:
 ```
 
 Hidden tools also return `tool_not_found` from `get_tool_schema` to prevent information leakage.
+
+## Code Mode (Experimental)
+
+**Experimental, off by default.** Code mode exposes a fifth meta-tool, `execute_code`, that runs LLM-authored Python in a [Monty](https://github.com/pydantic/monty) sandbox. Every registered tool is pre-bound as a named async callable inside the sandbox, so the model can chain calls — and use `asyncio.gather` to fan out — in a single round-trip without intermediate payloads passing through the agent's context window.
+
+> **Not for analytical workloads.** The Monty sandbox is sized for small-payload cross-tool chaining (dozens of rows, kilobytes of JSON). Large-payload data analysis belongs in a dedicated analytics server with a full Python sandbox.
+
+### Install the extra
+
+```bash
+pip install "fastmcp-gateway[code-mode]"
+```
+
+### Enable
+
+```python
+from fastmcp_gateway import GatewayServer
+
+async def may_use_code_mode(user, context) -> bool:
+    return user.id in {"alice", "bob"}  # bind this to your policy engine
+
+gateway = GatewayServer(
+    {"crm": "http://crm:8080/mcp", "analytics": "http://analytics:8080/mcp"},
+    code_mode=True,
+    code_mode_authorizer=may_use_code_mode,  # optional; any authenticated caller allowed when None
+)
+```
+
+Or via env vars:
+
+```bash
+export GATEWAY_CODE_MODE=true
+export GATEWAY_CODE_MODE_MAX_DURATION_SECS=30
+export GATEWAY_CODE_MODE_MAX_NESTED_CALLS=50
+```
+
+### How the LLM uses it
+
+Call `discover_tools(format="signatures")` to get readable Python signatures first, then write code that calls those functions:
+
+```python
+# What the LLM emits as the `code` argument to execute_code:
+people = await crm_search(query="Anthropic", limit=5)
+emails = [p["email"] for p in people["people"]]
+{"count": len(emails), "emails": emails}
+```
+
+### Safety guarantees
+
+- Every nested tool call goes through the same `before_execute` / `after_execute` hook pipeline as a direct `execute_tool`, so access policies and audit hooks apply unchanged.
+- Only tools surviving `after_list_tools` filtering are bound into the sandbox namespace — unauthorized tool names never appear as callables, so an attacker can't enumerate them by reading the sandbox scope.
+- Outer-request headers and user identity are captured once at the boundary and closed over in each wrapper; the sandbox's worker thread never reads the auth ContextVar directly.
+- Resource limits (duration, memory, allocations, recursion depth, nested-call count) apply to every run.
+- Audit: the default `code_mode.invoked` INFO record carries `code_sha256`, `tool_names_invoked`, `step_count`, and `duration_ms`. Raw code is only emitted at DEBUG when `code_mode_audit_verbatim=True` — enable only for debugging; raw LLM code is PII-sensitive.
+
+### Constructor reference
+
+| Parameter | Default | Description |
+|---|---|---|
+| `code_mode` | `False` | Master switch; gates `execute_code` registration |
+| `code_mode_authorizer` | `None` | Async `(user, context) -> bool` per-call permission check |
+| `code_mode_limits` | `CodeModeLimits()` | `max_duration_secs=30`, `max_memory=256 MiB`, `max_allocations=10M`, `max_recursion_depth=200`, `max_nested_calls=50` |
+| `code_mode_audit_verbatim` | `False` | Emit raw code at DEBUG (PII-risk; leave off in prod) |
 
 ## Observability
 

@@ -62,8 +62,18 @@ def register_meta_tools(
     registry: ToolRegistry,
     upstream_manager: UpstreamManager,
     hook_runner: HookRunner | None = None,
+    *,
+    code_mode_runner: Any | None = None,
 ) -> None:
-    """Register the 3 meta-tools on the FastMCP server."""
+    """Register the meta-tools on the FastMCP server.
+
+    Always registers ``discover_tools``, ``get_tool_schema``,
+    ``execute_tool``, and ``refresh_registry``.
+
+    When *code_mode_runner* is provided (see
+    :class:`~fastmcp_gateway.code_mode.CodeModeRunner`), additionally
+    registers an experimental ``execute_code`` meta-tool.
+    """
     if hook_runner is None:
         hook_runner = HookRunner()
 
@@ -417,3 +427,43 @@ def register_meta_tools(
                     ],
                 }
             )
+
+    # ------------------------------------------------------------------
+    # Optional experimental meta-tool: execute_code
+    # ------------------------------------------------------------------
+    if code_mode_runner is not None:
+
+        @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, openWorldHint=True))
+        async def execute_code(code: str) -> str:
+            """Run LLM-authored Python that orchestrates multiple tool calls.
+
+            Experimental.  Every registered tool is exposed as a named
+            async callable inside a secure Monty sandbox; write code that
+            chains them together and returns a compact result so
+            intermediate payloads do not pass through the agent's
+            context.
+
+            Example::
+
+                people = await apollo_search(query="...", limit=5)
+                {
+                    "emails": [p["email"] for p in people["people"]],
+                }
+
+            - Call ``discover_tools(domain=..., format="signatures")``
+              first to learn each tool's signature.
+            - Do **not** use this for large analytical datasets; it is
+              sized for small-payload cross-tool chaining.
+            - All access control and audit hooks that apply to
+              ``execute_tool`` also apply per nested call here.
+            """
+            from fastmcp_gateway.client_manager import get_user_headers
+
+            with _tracer.start_as_current_span("gateway.execute_code") as span:
+                headers = get_user_headers()
+                user = await hook_runner.run_authenticate(headers)
+                try:
+                    return await code_mode_runner.run(code, headers=headers, user=user)
+                except ExecutionDenied as exc:
+                    span.set_attribute("gateway.error_code", exc.code)
+                    return error_response(exc.code, exc.message)
