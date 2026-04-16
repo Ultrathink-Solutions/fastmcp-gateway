@@ -62,6 +62,22 @@ Configure via environment variables:
         ``Authorization: Bearer <token>``.  When not set, the endpoints are
         not mounted (default — backwards-compatible).
 
+    GATEWAY_CODE_MODE
+        Set to ``true`` to enable the experimental ``execute_code``
+        meta-tool.  Off by default.  Requires the optional ``code-mode``
+        extra (``pip install "fastmcp-gateway[code-mode]"``).
+
+    GATEWAY_CODE_MODE_MAX_DURATION_SECS, GATEWAY_CODE_MODE_MAX_MEMORY,
+    GATEWAY_CODE_MODE_MAX_ALLOCATIONS, GATEWAY_CODE_MODE_MAX_RECURSION_DEPTH,
+    GATEWAY_CODE_MODE_MAX_NESTED_CALLS
+        Optional resource caps for each ``execute_code`` invocation.
+        Missing values use the CodeModeLimits defaults.
+
+    GATEWAY_CODE_MODE_AUDIT_VERBATIM
+        When ``true``, raw LLM-authored code is emitted at DEBUG level
+        in audit logs.  High PII risk; leave off unless explicitly
+        required for incident response.
+
 Usage::
 
     GATEWAY_UPSTREAMS='{"apollo": "http://localhost:8080/mcp"}' python -m fastmcp_gateway
@@ -100,6 +116,72 @@ def _load_json_env(name: str, *, required: bool = False) -> dict[str, Any] | Non
         logger.error("%s must be a JSON object, got %s", name, type(value).__name__)
         sys.exit(1)
     return value
+
+
+def _bool_env(name: str, default: bool = False) -> bool:
+    """Parse a boolean env var: ``"true"``/``"1"``/``"yes"`` (case-insensitive) → True."""
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"true", "1", "yes", "on"}
+
+
+def _float_env(name: str) -> float | None:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        logger.error("Invalid %s: %s (must be a number)", name, raw)
+        sys.exit(1)
+
+
+def _int_env(name: str) -> int | None:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        logger.error("Invalid %s: %s (must be an integer)", name, raw)
+        sys.exit(1)
+
+
+def _load_code_mode_config() -> tuple[bool, Any | None, bool]:
+    """Parse the code-mode env vars into (flag, CodeModeLimits | None, verbatim)."""
+    enabled = _bool_env("GATEWAY_CODE_MODE", default=False)
+    if not enabled:
+        return False, None, False
+
+    # Defer the import so systems without the extra installed don't pay the cost.
+    try:
+        from fastmcp_gateway.code_mode import CodeModeLimits
+    except RuntimeError as exc:
+        logger.error("GATEWAY_CODE_MODE=true but code-mode extra is not installed: %s", exc)
+        sys.exit(1)
+
+    # Each override is optional; when omitted we keep the dataclass default.
+    overrides: dict[str, Any] = {}
+    duration = _float_env("GATEWAY_CODE_MODE_MAX_DURATION_SECS")
+    if duration is not None:
+        overrides["max_duration_secs"] = duration
+    memory = _int_env("GATEWAY_CODE_MODE_MAX_MEMORY")
+    if memory is not None:
+        overrides["max_memory"] = memory
+    allocations = _int_env("GATEWAY_CODE_MODE_MAX_ALLOCATIONS")
+    if allocations is not None:
+        overrides["max_allocations"] = allocations
+    recursion = _int_env("GATEWAY_CODE_MODE_MAX_RECURSION_DEPTH")
+    if recursion is not None:
+        overrides["max_recursion_depth"] = recursion
+    nested = _int_env("GATEWAY_CODE_MODE_MAX_NESTED_CALLS")
+    if nested is not None:
+        overrides["max_nested_calls"] = nested
+
+    limits = CodeModeLimits(**overrides) if overrides else CodeModeLimits()
+    verbatim = _bool_env("GATEWAY_CODE_MODE_AUDIT_VERBATIM", default=False)
+    return True, limits, verbatim
 
 
 def _load_hooks() -> list[Any] | None:
@@ -206,6 +288,9 @@ def main() -> None:
     # Dynamic registration token (optional).
     registration_token = os.environ.get("GATEWAY_REGISTRATION_TOKEN") or None
 
+    # Code mode (experimental, off by default).
+    code_mode, code_mode_limits, code_mode_audit_verbatim = _load_code_mode_config()
+
     gateway = GatewayServer(
         upstreams,
         name=name,
@@ -216,6 +301,9 @@ def main() -> None:
         refresh_interval=refresh_interval,
         hooks=hooks,
         registration_token=registration_token,
+        code_mode=code_mode,
+        code_mode_limits=code_mode_limits,
+        code_mode_audit_verbatim=code_mode_audit_verbatim,
     )
 
     # Populate in its own event loop, then run the server (which creates its

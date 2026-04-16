@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-04-16
+
+### Added (experimental)
+
+- **`execute_code` meta-tool**: new experimental tool that runs LLM-authored Python in a [Monty](https://github.com/pydantic/monty) sandbox, with every registered tool exposed as a named async callable inside. Lets the model chain multiple upstream calls — and use `asyncio.gather` to fan-out — in a single round-trip, keeping intermediate payloads out of the agent's context window. Marked **experimental, off by default**.
+- **New `GatewayServer` constructor parameters** (all no-ops when `code_mode=False`):
+  - `code_mode: bool = False` — gates `execute_code` registration.
+  - `code_mode_authorizer: Callable | None` — optional async `(user, context) -> bool` session-level permission check. Typed as `Any` in the public surface so extensions can bind their own identity types without leaking them into OSS.
+  - `code_mode_limits: CodeModeLimits | None` — resource caps (duration, memory, allocations, recursion, nested-call count).
+  - `code_mode_audit_verbatim: bool = False` — when `True`, raw code body is emitted at DEBUG; default hash+metadata-only audit preserves PII hygiene.
+- **`fastmcp_gateway.code_mode` module**: `CodeModeRunner`, `CodeModeLimits`, `CodeModeUnavailableError`.
+- **Env-var configuration**: `GATEWAY_CODE_MODE`, `GATEWAY_CODE_MODE_MAX_DURATION_SECS`, `GATEWAY_CODE_MODE_MAX_MEMORY`, `GATEWAY_CODE_MODE_MAX_ALLOCATIONS`, `GATEWAY_CODE_MODE_MAX_RECURSION_DEPTH`, `GATEWAY_CODE_MODE_MAX_NESTED_CALLS`, `GATEWAY_CODE_MODE_AUDIT_VERBATIM`.
+- **Optional extra**: install with `pip install "fastmcp-gateway[code-mode]"` to pull in `pydantic-monty>=0.0.12`.
+
+### Safety guarantees
+
+- Every nested tool call goes through the same `before_execute` / `after_execute` hook pipeline as a direct `execute_tool`, so access policies, authz, and audit survive unchanged.
+- The sandbox's callable namespace is built from the result of `after_list_tools` hook filtering — tools a user can't see don't even appear as function names.
+- Outer-request headers and user identity are captured once at the boundary and closed over in each wrapper; never read via ContextVar from inside Monty's worker thread.
+- Structured content from upstream tools round-trips as indexable Python dicts; `asyncio.gather` works inside the sandbox.
+
+### Notes
+
+- Intended for small-payload cross-tool chaining. Large-payload analytical workloads belong in a dedicated analytics server with a full Python sandbox — don't use `execute_code` for dataset crunching.
+
 ## [0.7.1] - 2026-04-16
 
 ### Added
@@ -191,6 +216,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Migrated `ToolEntry` and `DomainInfo` from dataclasses to Pydantic models (#9)
 
+[0.8.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.6.4...v0.7.0
 [0.6.4]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.6.3...v0.6.4
