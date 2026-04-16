@@ -94,6 +94,7 @@ import os
 import sys
 from typing import Any
 
+from fastmcp_gateway.code_mode import CodeModeUnavailableError
 from fastmcp_gateway.gateway import GatewayServer
 
 logger = logging.getLogger("fastmcp_gateway")
@@ -118,12 +119,33 @@ def _load_json_env(name: str, *, required: bool = False) -> dict[str, Any] | Non
     return value
 
 
+_TRUE_TOKENS = frozenset({"true", "1", "yes", "on"})
+_FALSE_TOKENS = frozenset({"false", "0", "no", "off"})
+
+
 def _bool_env(name: str, default: bool = False) -> bool:
-    """Parse a boolean env var: ``"true"``/``"1"``/``"yes"`` (case-insensitive) → True."""
+    """Parse a boolean env var with strict token matching.
+
+    Recognised: ``true`` / ``1`` / ``yes`` / ``on`` for True, and
+    ``false`` / ``0`` / ``no`` / ``off`` for False (case-insensitive).
+    An empty value returns *default*.  Any other value is rejected --
+    typos like ``GATEWAY_CODE_MODE=treu`` should fail fast instead of
+    silently disabling a security-relevant feature.
+    """
     raw = os.environ.get(name, "").strip().lower()
     if not raw:
         return default
-    return raw in {"true", "1", "yes", "on"}
+    if raw in _TRUE_TOKENS:
+        return True
+    if raw in _FALSE_TOKENS:
+        return False
+    logger.error(
+        "Invalid %s: %r (expected one of: %s)",
+        name,
+        raw,
+        ", ".join(sorted(_TRUE_TOKENS | _FALSE_TOKENS)),
+    )
+    sys.exit(1)
 
 
 def _float_env(name: str) -> float | None:
@@ -161,22 +183,34 @@ def _load_code_mode_config() -> tuple[bool, Any | None, bool]:
     from fastmcp_gateway.code_mode import CodeModeLimits
 
     # Each override is optional; when omitted we keep the dataclass default.
+    # Every limit must be strictly positive and finite -- zero or negative
+    # values would either degrade the sandbox to "no limit" (dangerous) or
+    # make it reject every call (useless).  NaN / inf are never valid here.
     overrides: dict[str, Any] = {}
+
     duration = _float_env("GATEWAY_CODE_MODE_MAX_DURATION_SECS")
     if duration is not None:
+        if not math.isfinite(duration) or duration <= 0:
+            logger.error(
+                "Invalid GATEWAY_CODE_MODE_MAX_DURATION_SECS: %s (must be finite and > 0)",
+                duration,
+            )
+            sys.exit(1)
         overrides["max_duration_secs"] = duration
-    memory = _int_env("GATEWAY_CODE_MODE_MAX_MEMORY")
-    if memory is not None:
-        overrides["max_memory"] = memory
-    allocations = _int_env("GATEWAY_CODE_MODE_MAX_ALLOCATIONS")
-    if allocations is not None:
-        overrides["max_allocations"] = allocations
-    recursion = _int_env("GATEWAY_CODE_MODE_MAX_RECURSION_DEPTH")
-    if recursion is not None:
-        overrides["max_recursion_depth"] = recursion
-    nested = _int_env("GATEWAY_CODE_MODE_MAX_NESTED_CALLS")
-    if nested is not None:
-        overrides["max_nested_calls"] = nested
+
+    for var_name, limit_name in (
+        ("GATEWAY_CODE_MODE_MAX_MEMORY", "max_memory"),
+        ("GATEWAY_CODE_MODE_MAX_ALLOCATIONS", "max_allocations"),
+        ("GATEWAY_CODE_MODE_MAX_RECURSION_DEPTH", "max_recursion_depth"),
+        ("GATEWAY_CODE_MODE_MAX_NESTED_CALLS", "max_nested_calls"),
+    ):
+        value = _int_env(var_name)
+        if value is None:
+            continue
+        if value <= 0:
+            logger.error("Invalid %s: %d (must be > 0)", var_name, value)
+            sys.exit(1)
+        overrides[limit_name] = value
 
     limits = CodeModeLimits(**overrides) if overrides else CodeModeLimits()
     verbatim = _bool_env("GATEWAY_CODE_MODE_AUDIT_VERBATIM", default=False)
@@ -305,22 +339,17 @@ def main() -> None:
             code_mode_limits=code_mode_limits,
             code_mode_audit_verbatim=code_mode_audit_verbatim,
         )
-    except Exception as exc:
-        # Friendly handling for the one construction-time error that has a
-        # clear operator action: the [code-mode] extra is not installed.
-        # `CodeModeRunner` raises CodeModeUnavailableError lazily inside
-        # `GatewayServer._register_meta_tools`, so we can't catch it at the
-        # earlier CodeModeLimits import site.  Any other construction error
-        # is unexpected and re-raised so the traceback surfaces in logs.
-        from fastmcp_gateway.code_mode import CodeModeUnavailableError
-
-        if isinstance(exc, CodeModeUnavailableError):
-            logger.error(
-                "GATEWAY_CODE_MODE=true but the [code-mode] extra is not installed: %s",
-                exc,
-            )
-            sys.exit(1)
-        raise
+    except CodeModeUnavailableError as exc:
+        # Friendly handling for the one construction-time error with a
+        # clear operator action.  CodeModeRunner raises this lazily inside
+        # GatewayServer._register_meta_tools when the [code-mode] extra
+        # isn't installed.  Any other construction error propagates with
+        # its full traceback so real bugs surface in logs.
+        logger.error(
+            "GATEWAY_CODE_MODE=true but the [code-mode] extra is not installed: %s",
+            exc,
+        )
+        sys.exit(1)
 
     # Populate in its own event loop, then run the server (which creates its
     # own loop via anyio).  Calling gateway.run() from inside asyncio.run()
