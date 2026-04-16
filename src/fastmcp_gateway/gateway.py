@@ -140,16 +140,25 @@ class GatewayServer:
         self._access_policy = effective_policy
         self._code_mode = code_mode
         # Auto-discover a code_mode_authorizer from the hook chain when the
-        # caller didn't pass one explicitly.  Any hook exposing an
+        # caller didn't pass one explicitly.  Any hook exposing a *callable*
         # ``authorize_code_mode`` async method is picked up, matching the
         # same duck-typed convention the hook protocol uses for
-        # ``on_authenticate`` / ``before_execute`` / etc.
+        # ``on_authenticate`` / ``before_execute`` / etc.  We verify
+        # ``callable`` so a hook that accidentally stores a non-callable
+        # under that attribute doesn't blow up at invocation time.
         if code_mode and code_mode_authorizer is None and hooks:
             for hook in hooks:
                 discovered = getattr(hook, "authorize_code_mode", None)
-                if discovered is not None:
-                    code_mode_authorizer = discovered
-                    break
+                if discovered is None:
+                    continue
+                if not callable(discovered):
+                    logger.warning(
+                        "Hook %s has a non-callable 'authorize_code_mode' attribute; ignoring",
+                        type(hook).__name__,
+                    )
+                    continue
+                code_mode_authorizer = discovered
+                break
         self._code_mode_authorizer = code_mode_authorizer
         self._code_mode_limits = code_mode_limits
         self._code_mode_audit_verbatim = code_mode_audit_verbatim

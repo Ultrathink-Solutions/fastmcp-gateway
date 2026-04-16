@@ -475,3 +475,42 @@ len(results)
             )
         assert out == "3"
         assert stub.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_error_result_propagates_is_error_to_hook(self) -> None:
+        """An upstream that returns ``isError=True`` must flow as ``is_error=True``
+        into ``after_execute`` so audit hooks can log the failure correctly.
+
+        Exercises the `_FakeCallResult.isError` path that earlier sandbox
+        ergonomics tests don't touch.
+        """
+        after_calls: list[tuple[str, bool]] = []
+
+        class CaptureAfter:
+            async def after_execute(self, _ctx: Any, result: str, is_error: bool) -> str:
+                after_calls.append((result, is_error))
+                return result
+
+        gw = _make_gateway(hooks=[CaptureAfter()])
+        _seed_registry(gw)
+        runner = _runner(gw)
+
+        error_result = _FakeCallResult(
+            text="upstream exploded",
+            is_error=True,
+        )
+        stub = _stub_execute_tool({"crm_count": error_result})
+        with patch.object(gw.upstream_manager, "execute_tool", stub):
+            # The sandbox code still returns normally; the wrapper passes
+            # the textual payload through and records is_error for audit.
+            out = await runner.run(
+                "await crm_count()",
+                headers={},
+                user="alice",
+            )
+
+        assert out == "upstream exploded"
+        assert len(after_calls) == 1
+        result_text, is_error = after_calls[0]
+        assert is_error is True
+        assert result_text == "upstream exploded"

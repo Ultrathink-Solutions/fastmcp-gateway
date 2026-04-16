@@ -458,13 +458,12 @@ def register_meta_tools(
               ``execute_tool`` also apply per nested call here.
             """
             from fastmcp_gateway.client_manager import get_user_headers
-            from fastmcp_gateway.hooks import ExecutionDenied as _ExecutionDenied
 
             with _tracer.start_as_current_span("gateway.execute_code") as span:
                 headers = get_user_headers()
                 user = await hook_runner.run_authenticate(headers)
                 try:
                     return await code_mode_runner.run(code, headers=headers, user=user)
-                except _ExecutionDenied as exc:
+                except ExecutionDenied as exc:
                     span.set_attribute("gateway.error_code", exc.code)
                     return error_response(exc.code, exc.message)

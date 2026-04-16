@@ -291,20 +291,37 @@ def main() -> None:
     # Code mode (experimental, off by default).
     code_mode, code_mode_limits, code_mode_audit_verbatim = _load_code_mode_config()
 
-    gateway = GatewayServer(
-        upstreams,
-        name=name,
-        instructions=instructions,
-        registry_auth_headers=registry_auth_headers,
-        upstream_headers=upstream_headers,
-        domain_descriptions=domain_descriptions,
-        refresh_interval=refresh_interval,
-        hooks=hooks,
-        registration_token=registration_token,
-        code_mode=code_mode,
-        code_mode_limits=code_mode_limits,
-        code_mode_audit_verbatim=code_mode_audit_verbatim,
-    )
+    try:
+        gateway = GatewayServer(
+            upstreams,
+            name=name,
+            instructions=instructions,
+            registry_auth_headers=registry_auth_headers,
+            upstream_headers=upstream_headers,
+            domain_descriptions=domain_descriptions,
+            refresh_interval=refresh_interval,
+            hooks=hooks,
+            registration_token=registration_token,
+            code_mode=code_mode,
+            code_mode_limits=code_mode_limits,
+            code_mode_audit_verbatim=code_mode_audit_verbatim,
+        )
+    except Exception as exc:
+        # Friendly handling for the one construction-time error that has a
+        # clear operator action: the [code-mode] extra is not installed.
+        # `CodeModeRunner` raises CodeModeUnavailableError lazily inside
+        # `GatewayServer._register_meta_tools`, so we can't catch it at the
+        # earlier CodeModeLimits import site.  Any other construction error
+        # is unexpected and re-raised so the traceback surfaces in logs.
+        from fastmcp_gateway.code_mode import CodeModeUnavailableError
+
+        if isinstance(exc, CodeModeUnavailableError):
+            logger.error(
+                "GATEWAY_CODE_MODE=true but the [code-mode] extra is not installed: %s",
+                exc,
+            )
+            sys.exit(1)
+        raise
 
     # Populate in its own event loop, then run the server (which creates its
     # own loop via anyio).  Calling gateway.run() from inside asyncio.run()

@@ -223,11 +223,12 @@ class CodeModeRunner:
                 raise ExecutionDenied("code_mode is not permitted for this user", code="forbidden")
 
         with _tracer.start_as_current_span("gateway.execute_code") as span:
-            code_sha = hashlib.sha256(code.encode("utf-8")).hexdigest()
+            code_bytes = code.encode("utf-8")
+            code_sha = hashlib.sha256(code_bytes).hexdigest()
             audit = _CodeModeAudit(
                 code_session_id=str(uuid.uuid4()),
                 code_sha256=code_sha,
-                code_byte_len=len(code.encode("utf-8")),
+                code_byte_len=len(code_bytes),
                 code_line_count=code.count("\n") + (1 if code and not code.endswith("\n") else 0),
                 user_subject=_subject_of(user),
             )
