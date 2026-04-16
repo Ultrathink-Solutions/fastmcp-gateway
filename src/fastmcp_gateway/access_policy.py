@@ -168,16 +168,18 @@ def normalize_upstreams(
     return normalized, policy
 
 
-_FILTER_KEYS = frozenset({"url", "allowed_tools", "denied_tools"})
+_FILTER_KEYS = frozenset({"allowed_tools", "denied_tools"})
 
 
 def _is_filter_dict(value: Any) -> bool:
     """Return ``True`` when *value* looks like a gateway filter config.
 
-    A filter config is any ``dict`` containing at least one of
-    :data:`_FILTER_KEYS`.  This distinguishes filter configs from MCP
-    spec dicts (which typically have ``mcpServers`` at the top level and
-    never any of these keys).
+    A filter config is any ``dict`` containing ``allowed_tools`` or
+    ``denied_tools``.  We deliberately don't treat a bare ``url`` key as
+    a filter-config signal because transport-config dicts accepted by
+    :class:`fastmcp.Client` (e.g. ``{"url": "...", "transport": "...",
+    "headers": {...}}``) also use ``url`` — matching on ``url`` alone
+    would misclassify those and strip out non-filter keys.
     """
     return isinstance(value, dict) and not _FILTER_KEYS.isdisjoint(value)
 

@@ -134,6 +134,16 @@ class GatewayServer:
         return self._mcp
 
     @property
+    def access_policy(self) -> AccessPolicy | None:
+        """The effective :class:`AccessPolicy` in use, or ``None`` if unset.
+
+        Reflects the resolved policy after considering both the explicit
+        *access_policy* constructor argument and any inline filters parsed
+        from object-shaped *upstreams* entries.
+        """
+        return self._access_policy
+
+    @property
     def hook_runner(self) -> HookRunner:
         """Access the hook runner for advanced use."""
         return self._hook_runner

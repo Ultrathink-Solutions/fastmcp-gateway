@@ -1,5 +1,7 @@
 """Tool registry: in-memory store for discovered tools from upstream MCP servers."""
 
+from __future__ import annotations
+
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -233,7 +235,7 @@ class ToolRegistry:
         *,
         description: str = "",
         group_overrides: dict[str, str] | None = None,
-        policy: "AccessPolicy | None" = None,
+        policy: AccessPolicy | None = None,
     ) -> RegistryDiff:
         """Populate the registry with tools from an upstream server.
 

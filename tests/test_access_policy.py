@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -105,9 +106,22 @@ class TestNormalizeUpstreams:
         assert urls == {"crm": "http://crm:8080/mcp", "analytics": "http://analytics:8080/mcp"}
         assert policy is None
 
-    def test_object_form_without_filters(self) -> None:
-        urls, policy = normalize_upstreams({"crm": {"url": "http://crm:8080/mcp"}})
-        assert urls == {"crm": "http://crm:8080/mcp"}
+    def test_transport_dict_passes_through_unchanged(self) -> None:
+        """Dicts with 'url' but no filter keys are transport configs — pass through unchanged.
+
+        Handing `{"url": "..."}` to fastmcp.Client should not be hijacked by the
+        gateway policy parser, since fastmcp.Client accepts transport dicts of
+        the form `{"url": "...", "transport": "...", "headers": {...}}`.
+        """
+        spec = {"url": "http://crm:8080/mcp"}
+        urls, policy = normalize_upstreams({"crm": spec})
+        assert urls == {"crm": spec}
+        assert policy is None
+
+    def test_transport_dict_with_extra_keys_passes_through(self) -> None:
+        spec = {"url": "http://crm:8080/mcp", "transport": "streamable-http", "headers": {"X-API-Key": "x"}}
+        urls, policy = normalize_upstreams({"crm": spec})
+        assert urls == {"crm": spec}
         assert policy is None
 
     def test_object_form_with_allowed_tools(self) -> None:
@@ -235,8 +249,49 @@ class TestRegistryFiltering:
 
 
 class TestGatewayIntegration:
-    def test_object_shaped_upstreams_build_policy(self) -> None:
-        with patch("fastmcp_gateway.client_manager.Client"):
+    """Public-API tests for policy wiring.
+
+    Uses the :attr:`GatewayServer.access_policy` property to observe the
+    effective policy, and runs the gateway's real registry-population path
+    (via :meth:`GatewayServer.populate`) with a mocked upstream client to
+    verify filtering end-to-end.
+    """
+
+    @staticmethod
+    def _patch_client_with_tools(raw_tools: list[dict[str, Any]]) -> Any:
+        """Return a context manager that patches fastmcp.Client to yield *raw_tools*.
+
+        Mocks the ``list_tools`` iteration that :class:`UpstreamManager`
+        performs during :meth:`populate`, without requiring a real upstream.
+        """
+
+        class _StubTool:
+            def __init__(self, name: str, input_schema: dict[str, Any]) -> None:
+                self.name = name
+                self.description = ""
+                self.inputSchema = input_schema
+
+        class _StubClient:
+            def __init__(self, *_args: Any, **_kwargs: Any) -> None: ...
+            async def __aenter__(self) -> _StubClient:
+                return self
+
+            async def __aexit__(self, *_exc: Any) -> None: ...
+            async def list_tools(self) -> list[_StubTool]:
+                return [_StubTool(t["name"], t.get("inputSchema", {})) for t in raw_tools]
+
+            @property
+            def transport(self) -> Any:  # pragma: no cover - header pathway is untested here
+                return None
+
+        return patch("fastmcp_gateway.client_manager.Client", _StubClient)
+
+    async def test_object_shaped_upstreams_filter_through_registry(self) -> None:
+        tools = [
+            {"name": "crm_search_people", "inputSchema": {}},
+            {"name": "crm_delete", "inputSchema": {}},
+        ]
+        with self._patch_client_with_tools(tools):
             gw = GatewayServer(
                 {
                     "crm": {
@@ -245,13 +300,19 @@ class TestGatewayIntegration:
                     },
                 }
             )
-        assert gw._access_policy is not None
-        assert gw._access_policy.allow == {"crm": ["crm_search_*"]}
+            assert gw.access_policy is not None
+            assert gw.access_policy.allow == {"crm": ["crm_search_*"]}
+            await gw.populate()
+        assert set(gw.registry.get_all_tool_names()) == {"crm_search_people"}
         assert gw.upstreams == {"crm": "http://crm:8080/mcp"}
 
-    def test_explicit_access_policy_wins_over_inline(self) -> None:
+    async def test_explicit_access_policy_wins_over_inline(self) -> None:
         explicit = AccessPolicy(allow={"crm": ["crm_read_*"]})
-        with patch("fastmcp_gateway.client_manager.Client"):
+        tools = [
+            {"name": "crm_read_item", "inputSchema": {}},
+            {"name": "crm_search_item", "inputSchema": {}},
+        ]
+        with self._patch_client_with_tools(tools):
             gw = GatewayServer(
                 {
                     "crm": {
@@ -261,34 +322,35 @@ class TestGatewayIntegration:
                 },
                 access_policy=explicit,
             )
-        # Explicit policy overrides the inline one
-        assert gw._access_policy is explicit
+            assert gw.access_policy is explicit
+            await gw.populate()
+        # Explicit policy wins: only crm_read_* survives.
+        assert set(gw.registry.get_all_tool_names()) == {"crm_read_item"}
 
-    def test_plain_upstreams_no_policy(self) -> None:
-        with patch("fastmcp_gateway.client_manager.Client"):
+    async def test_plain_upstreams_have_no_policy_filter(self) -> None:
+        tools = [
+            {"name": "crm_search", "inputSchema": {}},
+            {"name": "crm_delete", "inputSchema": {}},
+        ]
+        with self._patch_client_with_tools(tools):
             gw = GatewayServer({"crm": "http://crm:8080/mcp"})
-        assert gw._access_policy is None
+            assert gw.access_policy is None
+            await gw.populate()
+        assert set(gw.registry.get_all_tool_names()) == {"crm_search", "crm_delete"}
 
-    def test_policy_propagates_to_registry(self) -> None:
+    async def test_policy_propagates_to_registry(self) -> None:
         policy = AccessPolicy(allow={"crm": ["crm_search_*"]})
-        with patch("fastmcp_gateway.client_manager.Client"):
+        tools = [
+            {"name": "crm_search_people", "inputSchema": {}},
+            {"name": "crm_delete", "inputSchema": {}},
+        ]
+        with self._patch_client_with_tools(tools):
             gw = GatewayServer(
                 {"crm": "http://crm:8080/mcp"},
                 access_policy=policy,
             )
-
-        # Simulate a populate call
-        gw.registry.populate_domain(
-            "crm",
-            "http://crm:8080/mcp",
-            [
-                {"name": "crm_search_people", "inputSchema": {}},
-                {"name": "crm_delete", "inputSchema": {}},
-            ],
-            policy=gw._access_policy,
-        )
-        assert gw.registry.lookup("crm_search_people") is not None
-        assert gw.registry.lookup("crm_delete") is None
+            await gw.populate()
+        assert set(gw.registry.get_all_tool_names()) == {"crm_search_people"}
 
 
 # ---------------------------------------------------------------------------
