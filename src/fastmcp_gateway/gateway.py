@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import inspect
 import logging
 from contextlib import asynccontextmanager, suppress
 from typing import TYPE_CHECKING, Any
@@ -19,6 +20,17 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
 logger = logging.getLogger(__name__)
+
+
+class CodeModeAuthorizerRequiredError(ValueError):
+    """Raised when ``code_mode=True`` is set without an explicit authorizer.
+
+    Subclasses :class:`ValueError` so existing callers catching the broad
+    type keep working — but having a dedicated type lets callers (notably
+    ``__main__`` / the CLI wrapper) route this specific misconfiguration
+    to a user-friendly operator message without string-matching the error
+    text, which is brittle across translations and copy edits.
+    """
 
 
 class GatewayServer:
@@ -76,15 +88,16 @@ class GatewayServer:
         "fastmcp-gateway[code-mode]"``).  See
         :mod:`fastmcp_gateway.code_mode` for safety notes.
     code_mode_authorizer:
-        Optional async callback ``(user, context) -> bool`` that gates
-        *each* ``execute_code`` call at session level.  Returning
-        ``False`` raises ``ExecutionDenied``.  When ``None`` and
-        ``code_mode=True``, the gateway auto-discovers the callback by
-        scanning *hooks* for any object that exposes an
-        ``authorize_code_mode`` async method (mirroring the duck-typed
-        convention used by the rest of the hook protocol).  When no
-        match is found either, any authenticated caller may use code
-        mode.  Has no effect when ``code_mode=False``.
+        Async callback ``(user, context) -> bool`` that gates *each*
+        ``execute_code`` call at session level.  Returning ``False``
+        raises ``ExecutionDenied``.  **Required when** ``code_mode=True``
+        — constructing a gateway with ``code_mode=True`` and no
+        authorizer raises ``ValueError`` at init time.  This is
+        deliberately stricter than previous releases: auto-discovery of
+        an authorizer from the hook chain was removed because a hook
+        whose authorizer always returned ``True`` could silently bypass
+        the gate without any explicit opt-in.  Has no effect when
+        ``code_mode=False``.
     code_mode_limits:
         Optional :class:`~fastmcp_gateway.code_mode.CodeModeLimits`
         overriding the default duration / memory / allocation / recursion /
@@ -139,27 +152,57 @@ class GatewayServer:
         self._registration_token = registration_token
         self._access_policy = effective_policy
         self._code_mode = code_mode
-        # Auto-discover a code_mode_authorizer from the hook chain when the
-        # caller didn't pass one explicitly.  Any hook exposing a *callable*
-        # ``authorize_code_mode`` async method is picked up, matching the
-        # same duck-typed convention the hook protocol uses for
-        # ``on_authenticate`` / ``before_execute`` / etc.  We verify
-        # ``callable`` so a hook that accidentally stores a non-callable
-        # under that attribute doesn't blow up at invocation time.
-        if code_mode and code_mode_authorizer is None and hooks:
-            for hook in hooks:
-                discovered = getattr(hook, "authorize_code_mode", None)
-                if discovered is None:
-                    continue
-                if not callable(discovered):
-                    logger.warning(
-                        "Hook %s has a non-callable 'authorize_code_mode' attribute; ignoring",
-                        type(hook).__name__,
-                    )
-                    continue
-                code_mode_authorizer = discovered
-                break
-        self._code_mode_authorizer = code_mode_authorizer
+        # Require an explicit authorizer when code_mode is on.  Auto-discovery
+        # from the hook chain was removed because it made the gate depend on
+        # hook ordering / presence: a downstream hook that happened to expose
+        # ``authorize_code_mode`` -> True would silently open the gate
+        # without any explicit opt-in at the call site.  Callers that want
+        # the old duck-typed discovery must now pass the hook's method
+        # directly, e.g. ``code_mode_authorizer=my_hook.authorize_code_mode``.
+        if code_mode and code_mode_authorizer is None:
+            raise CodeModeAuthorizerRequiredError(
+                "code_mode=True requires an explicit code_mode_authorizer "
+                "callback. Pass one directly (e.g. "
+                "code_mode_authorizer=my_hook.authorize_code_mode) — "
+                "auto-discovery from the hook chain is no longer performed."
+            )
+        # Strict async check: a plain ``callable()`` test would accept a
+        # synchronous function (e.g. ``lambda u, c: True``), which would
+        # then blow up with ``TypeError: object bool can't be used in
+        # 'await' expression`` at the first ``execute_code`` invocation
+        # — a runtime-only landmine. ``inspect.iscoroutinefunction`` is
+        # True for ``async def`` functions and async bound methods; fall
+        # back to its ``__call__`` attribute so callable objects with an
+        # async ``__call__`` are also accepted. (Python 3.14 deprecates
+        # ``asyncio.iscoroutinefunction`` in favour of the ``inspect``
+        # variant; we use ``inspect`` directly for forward compatibility.)
+        #
+        # Only validate the shape when ``code_mode`` is actually enabled
+        # — the authorizer is dereferenced only inside the code-mode
+        # execution path, so a sync authorizer passed alongside
+        # ``code_mode=False`` is harmless (never invoked) and rejecting
+        # it would needlessly penalise callers that pass the same
+        # authorizer regardless of whether code mode is turned on for
+        # a given construction.
+        if (
+            code_mode
+            and code_mode_authorizer is not None
+            and not (
+                inspect.iscoroutinefunction(code_mode_authorizer)
+                or inspect.iscoroutinefunction(
+                    getattr(code_mode_authorizer, "__call__", None)  # noqa: B004
+                )
+            )
+        ):
+            raise TypeError(
+                "code_mode_authorizer must be an async function "
+                f"taking (user, context) -> bool; got {type(code_mode_authorizer).__name__}"
+            )
+        # Keep the stored type broad (Any | None) to match the declared
+        # parameter shape — the runtime check above guarantees shape;
+        # pyright's narrowing after ``iscoroutinefunction`` is too
+        # restrictive for the downstream ``AuthorizerFn`` protocol.
+        self._code_mode_authorizer: Any | None = code_mode_authorizer
         self._code_mode_limits = code_mode_limits
         self._code_mode_audit_verbatim = code_mode_audit_verbatim
         self._registry_lock = asyncio.Lock()

@@ -55,6 +55,23 @@ Configure via environment variables:
         instances.  Format: ``module.path:function_name``.
         Example: my_package.hooks:create_hooks
 
+        **Ignored unless GATEWAY_ALLOWED_HOOK_PREFIXES is also set** — see
+        that variable.  This is a security boundary: the previous
+        "set-and-import" behaviour let any process with write access to
+        the gateway's env turn GATEWAY_HOOK_MODULE into a code-injection
+        primitive.  Operators who need env-based hook loading must now
+        explicitly pin the set of module prefixes they trust.
+
+    GATEWAY_ALLOWED_HOOK_PREFIXES
+        Comma-separated allowlist of Python module prefixes that
+        GATEWAY_HOOK_MODULE may resolve to.  When unset, GATEWAY_HOOK_MODULE
+        is ignored entirely and hooks must be passed programmatically to
+        ``GatewayServer(..., hooks=[...])``.  A prefix matches when the
+        requested module path equals it exactly or begins with
+        ``<prefix>.`` — i.e. plain ``str.startswith`` with a dot-boundary
+        check.
+        Example: ``GATEWAY_ALLOWED_HOOK_PREFIXES=my_org.hooks,ops.hooks``
+
     GATEWAY_REGISTRATION_TOKEN
         Shared secret that protects the dynamic registration REST endpoints
         (POST/DELETE/GET /registry/servers).  When set, the gateway exposes
@@ -63,8 +80,17 @@ Configure via environment variables:
         not mounted (default — backwards-compatible).
 
     GATEWAY_CODE_MODE
-        Set to ``true`` to enable the experimental ``execute_code``
-        meta-tool.  Off by default.  Requires the optional ``code-mode``
+        Reserved — setting this to ``true`` is **not** a supported way to
+        enable the experimental ``execute_code`` meta-tool from the CLI.
+        Code mode now requires an explicit ``code_mode_authorizer``
+        callback which cannot be supplied through environment variables;
+        setting ``GATEWAY_CODE_MODE=true`` without constructing
+        ``GatewayServer`` programmatically causes the process to exit at
+        startup with a typed ``CodeModeAuthorizerRequiredError``.
+        To use code mode, construct ``GatewayServer`` programmatically
+        with ``code_mode=True`` and
+        ``code_mode_authorizer=<your async callback>``; leave this env
+        var unset for CLI usage. Requires the optional ``code-mode``
         extra (``pip install "fastmcp-gateway[code-mode]"``).
 
     GATEWAY_CODE_MODE_MAX_DURATION_SECS, GATEWAY_CODE_MODE_MAX_MEMORY,
@@ -86,7 +112,6 @@ Usage::
 from __future__ import annotations
 
 import asyncio
-import importlib
 import json
 import logging
 import math
@@ -94,8 +119,9 @@ import os
 import sys
 from typing import Any
 
+from fastmcp_gateway._hook_loading import _load_hooks
 from fastmcp_gateway.code_mode import CodeModeUnavailableError
-from fastmcp_gateway.gateway import GatewayServer
+from fastmcp_gateway.gateway import CodeModeAuthorizerRequiredError, GatewayServer
 
 logger = logging.getLogger("fastmcp_gateway")
 
@@ -217,47 +243,6 @@ def _load_code_mode_config() -> tuple[bool, Any | None, bool]:
     return True, limits, verbatim
 
 
-def _load_hooks() -> list[Any] | None:
-    """Load hooks from the GATEWAY_HOOK_MODULE environment variable.
-
-    Expected format: ``module.path:function_name`` where the function
-    takes no arguments and returns a list of hook instances.
-
-    Returns ``None`` if the env var is not set.
-    """
-    raw = os.environ.get("GATEWAY_HOOK_MODULE", "")
-    if not raw:
-        return None
-
-    if ":" not in raw:
-        logger.error("GATEWAY_HOOK_MODULE must be in 'module.path:function_name' format, got: %s", raw)
-        sys.exit(1)
-
-    module_path, func_name = raw.rsplit(":", 1)
-    try:
-        module = importlib.import_module(module_path)
-    except ImportError as exc:
-        logger.error("Failed to import hook module '%s': %s", module_path, exc)
-        sys.exit(1)
-
-    factory = getattr(module, func_name, None)
-    if factory is None:
-        logger.error("Hook module '%s' has no attribute '%s'", module_path, func_name)
-        sys.exit(1)
-
-    if not callable(factory):
-        logger.error("Hook factory '%s:%s' is not callable", module_path, func_name)
-        sys.exit(1)
-
-    hooks = factory()
-    if not isinstance(hooks, list):
-        logger.error("Hook factory '%s:%s' must return a list, got %s", module_path, func_name, type(hooks).__name__)
-        sys.exit(1)
-
-    logger.info("Loaded %d hook(s) from %s", len(hooks), raw)
-    return hooks
-
-
 async def _populate(gateway: GatewayServer) -> None:
     """Populate the gateway registry from upstream servers."""
     results = await gateway.populate()
@@ -348,6 +333,22 @@ def main() -> None:
         logger.error(
             "GATEWAY_CODE_MODE=true but the [code-mode] extra is not installed: %s",
             exc,
+        )
+        sys.exit(1)
+    except CodeModeAuthorizerRequiredError:
+        # code_mode=True requires an explicit code_mode_authorizer callback.
+        # The old auto-discovery path was removed because it let any hook
+        # silently open the gate. GATEWAY_CODE_MODE=true via env has no way
+        # to supply a callback without also supplying an authorizer, so
+        # CLI-driven code mode is no longer supported. Callers that need
+        # code mode must construct GatewayServer programmatically.
+        logger.error(
+            "GATEWAY_CODE_MODE=true is no longer supported via the CLI. "
+            "Code mode now requires an explicit code_mode_authorizer "
+            "callback which cannot be supplied through environment "
+            "variables. Construct GatewayServer programmatically with "
+            "code_mode=True and code_mode_authorizer=<your callback>, "
+            "or leave GATEWAY_CODE_MODE unset."
         )
         sys.exit(1)
 
