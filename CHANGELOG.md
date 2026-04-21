@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-04-21
+
+Security-hardening release. Closes two code-injection primitives in the env-driven configuration path. Both primary changes are **breaking** for configs that relied on the previous permissive defaults — see the upgrade notes below.
+
+### Changed (breaking)
+
+- **`GATEWAY_HOOK_MODULE` now requires an allowlist.** The previous set-and-import behaviour made this env var a code-injection primitive for any process with write access to the gateway's env. `GATEWAY_HOOK_MODULE=my.module:factory` now has no effect unless `GATEWAY_ALLOWED_HOOK_PREFIXES` is also set and the requested module path matches one of its comma-separated prefixes, with dot-boundary matching so `my_org` does not match `my_org_evil`. Deployments that relied on the old behaviour must opt in by adding `GATEWAY_ALLOWED_HOOK_PREFIXES=my_org.hooks,my_other_org.hooks` alongside the existing `GATEWAY_HOOK_MODULE` value. (#40)
+- **`code_mode=True` requires an explicit `code_mode_authorizer`.** Previously, `GatewayServer` scanned the hook chain for any `authorize_code_mode` attribute and silently opened the gate if one was found (the auto-discovery path). A downstream hook that happened to expose `authorize_code_mode` returning `True` could therefore bypass the code-mode gate with no explicit opt-in at the call site. Auto-discovery is removed; constructing a gateway with `code_mode=True` and no `code_mode_authorizer` now raises `CodeModeAuthorizerRequiredError` (a `ValueError` subclass) at init time. Callers that want the previous duck-typed behaviour must now pass the hook's method directly: `code_mode_authorizer=my_hook.authorize_code_mode`. (#40)
+- **`GATEWAY_CODE_MODE=true` is no longer supported via the CLI / environment.** Code mode now requires programmatic `GatewayServer` construction with an explicit async authorizer. Setting `GATEWAY_CODE_MODE=true` without also constructing `GatewayServer` programmatically causes the process to exit at startup with a typed `CodeModeAuthorizerRequiredError`, logged as an actionable operator message via `__main__`. (#40)
+
+### Added
+
+- **`CodeModeAuthorizerRequiredError`** (importable from `fastmcp_gateway.gateway`): dedicated `ValueError` subclass for the authorizer-missing case. Lets callers route this specific misconfiguration to a user-friendly operator message without string-matching the error text. Not re-exported at the package root — broad `except ValueError` catch-sites continue to work unchanged. (#40)
+- **`fastmcp_gateway._hook_loading` helpers**: the hook-loading logic (previously inline in `__main__.py`) is split into `_parse_allowed_hook_prefixes`, `_hook_module_allowed`, and `_load_hooks`. Private by underscore convention; exposed at the module path so tests can import them as ordinary symbols. (#40)
+
+### Security
+
+- **Strict authorizer shape-check**: when `code_mode=True`, the constructor now rejects a synchronous function / object passed as `code_mode_authorizer` using `inspect.iscoroutinefunction` instead of a plain `callable()` test. A sync authorizer would otherwise blow up with `TypeError: object bool can't be used in 'await' expression` at the first `execute_code` invocation — a runtime-only landmine that now fails fast at init. The check is gated on `code_mode=True` so sync authorizers passed alongside `code_mode=False` (where they would never be invoked) remain accepted. (#40)
+- **CI supply-chain hardening**: all third-party GitHub Actions now pinned to full commit SHAs (previously tag refs, which the action author could re-point after a PR was approved). Pinned at their current commit tips with human-readable version comments: `actions/checkout@v6.0.2`, `astral-sh/setup-uv@v8.0.0`, `actions/setup-python@v5.6.0`, `pypa/gh-action-pypi-publish@release/v1`. (#41)
+
+### Notes
+
+- **Upgrade path for deployments currently using `GATEWAY_HOOK_MODULE`**:
+  1. Identify the module paths you load (e.g. `my_org.hooks:build_hooks`).
+  2. Set `GATEWAY_ALLOWED_HOOK_PREFIXES` to their common prefix (comma-separated for multiple; e.g. `my_org.hooks`).
+  3. Deploy. Existing `GATEWAY_HOOK_MODULE` values resume loading.
+  Without the allowlist, the hook module is silently ignored (logged at INFO), which surfaces as "no hooks loaded" in startup logs rather than a crash.
+- **Upgrade path for deployments currently using `GATEWAY_CODE_MODE=true`**:
+  - Switch to programmatic construction: `GatewayServer(code_mode=True, code_mode_authorizer=<async fn>, ...).run(...)`. The env-var form is no longer supported and will exit at startup with a typed error.
+- **Catch-site compatibility**: `CodeModeAuthorizerRequiredError` is a `ValueError` subclass, so existing `except ValueError` handlers continue to match. Update the catch site only if you want to route the specific error separately.
+
 ## [0.8.0] - 2026-04-16
 
 ### Added (experimental)
