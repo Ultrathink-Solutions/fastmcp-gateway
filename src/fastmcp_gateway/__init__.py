@@ -6,6 +6,14 @@ from fastmcp_gateway.errors import GatewayError
 from fastmcp_gateway.gateway import GatewayServer
 from fastmcp_gateway.hooks import ExecutionContext, ExecutionDenied, Hook, HookRunner, ListToolsContext
 
+# Note: ``CodeModeAuthorizerRequiredError`` is deliberately not re-exported
+# at the package root. It's an internal routing signal between
+# ``gateway.py`` (which raises it when ``code_mode=True`` is supplied
+# without an authorizer) and ``__main__.py`` (which catches it to emit
+# a CLI-friendly operator message). External callers who want to catch
+# it can still ``from fastmcp_gateway.gateway import
+# CodeModeAuthorizerRequiredError``; it's also a ``ValueError`` subclass,
+# so broad ``except ValueError`` blocks continue to work.
 __all__ = [
     "AccessPolicy",
     "ExecutionContext",
