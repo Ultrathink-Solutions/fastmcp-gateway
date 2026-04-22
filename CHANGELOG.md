@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] - 2026-04-21
+
+### Added
+
+- **`middleware` kwarg on `GatewayServer`**: `GatewayServer(upstreams, middleware=[...])` accepts a list of ASGI middleware wrapped around the gateway's HTTP app. When set, `GatewayServer.run()` builds the ASGI app via `FastMCP.http_app(middleware=...)` and serves it with uvicorn directly; when unset, falls back to `FastMCP.run()` — same code path as before, zero behavior change for existing callers. HTTP-transport only (stdio/sse raise `ValueError` when `middleware` is set, rather than silently dropping it). Middleware list is shallow-copied at construction so post-construction mutations of the caller's list don't leak into the running server.
+
+### Notes
+
+- **Use cases**: host-allowlist filtering (DNS-rebinding defense), request-id injection, rate limiting, CSP headers, structured-logging middleware — anything that benefits from ASGI-level interception of requests to the gateway. Apply in declaration order (first entry outermost), matching the Starlette `Middleware` stack convention.
+- **Migration**: none required. `GatewayServer` constructions without `middleware=` behave identically to prior releases.
+
 ## [0.10.1] - 2026-04-21
 
 Release-hygiene patch. No functional or API changes from 0.10.0.
@@ -283,6 +294,7 @@ Security-hardening release. Closes two code-injection primitives in the env-driv
 
 - Migrated `ToolEntry` and `DomainInfo` from dataclasses to Pydantic models (#9)
 
+[0.11.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.10.1...v0.11.0
 [0.10.1]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.8.0...v0.9.0

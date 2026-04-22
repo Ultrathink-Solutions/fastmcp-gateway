@@ -216,3 +216,95 @@ class TestDynamicInstructions:
         assert "discover_tools()" in instructions
         assert "get_tool_schema()" in instructions
         assert "execute_tool()" in instructions
+
+
+# ---------------------------------------------------------------------------
+# Middleware kwarg
+# ---------------------------------------------------------------------------
+
+
+class TestMiddlewareKwarg:
+    """``GatewayServer.run`` routes through ``http_app(middleware=...)``
+    + uvicorn when the constructor receives a non-empty ``middleware``
+    list; delegates to ``FastMCP.run()`` unchanged otherwise.
+    """
+
+    def test_default_run_delegates_to_fastmcp_run(self) -> None:
+        # Backward-compat path: constructor called without a
+        # ``middleware`` kwarg, ``run()`` hands straight through to
+        # ``FastMCP.run(**kwargs)``. No uvicorn import, no http_app
+        # call — the pre-middleware behavior is preserved exactly.
+        with patch("fastmcp_gateway.client_manager.Client"):
+            gw = GatewayServer({"svc": "http://svc:8080/mcp"})
+
+        with (
+            patch.object(gw._mcp, "run") as mock_run,
+            patch.object(gw._mcp, "http_app") as mock_http_app,
+        ):
+            gw.run(transport="streamable-http", host="0.0.0.0", port=9000)
+
+            mock_run.assert_called_once_with(transport="streamable-http", host="0.0.0.0", port=9000)
+            mock_http_app.assert_not_called()
+
+    def test_empty_middleware_list_also_delegates(self) -> None:
+        # Explicitly empty list is the same as ``None`` — nothing to
+        # wrap, no reason to pay the ``http_app`` + uvicorn cost.
+        with patch("fastmcp_gateway.client_manager.Client"):
+            gw = GatewayServer({"svc": "http://svc:8080/mcp"}, middleware=[])
+
+        with (
+            patch.object(gw._mcp, "run") as mock_run,
+            patch.object(gw._mcp, "http_app") as mock_http_app,
+        ):
+            gw.run()
+            mock_run.assert_called_once()
+            mock_http_app.assert_not_called()
+
+    def test_middleware_list_routes_through_http_app(self) -> None:
+        # With middleware, ``run`` builds the ASGI app via
+        # ``http_app(middleware=...)`` and runs it with uvicorn.
+        # Assertion covers: (1) http_app is called with the caller's
+        # middleware list, (2) uvicorn.run receives the app, (3)
+        # FastMCP.run is NOT called (that path is bypassed).
+        fake_middleware = MagicMock(name="ASGIMiddleware")
+        fake_app = MagicMock(name="ASGIApp")
+
+        with patch("fastmcp_gateway.client_manager.Client"):
+            gw = GatewayServer({"svc": "http://svc:8080/mcp"}, middleware=[fake_middleware])
+
+        with (
+            patch.object(gw._mcp, "run") as mock_run,
+            patch.object(gw._mcp, "http_app", return_value=fake_app) as mock_http_app,
+            patch("uvicorn.run") as mock_uvicorn,
+        ):
+            gw.run(host="127.0.0.1", port=9999)
+
+            mock_http_app.assert_called_once_with(middleware=[fake_middleware], transport="streamable-http")
+            mock_uvicorn.assert_called_once_with(fake_app, host="127.0.0.1", port=9999)
+            mock_run.assert_not_called()
+
+    def test_middleware_rejected_on_stdio_transport(self) -> None:
+        # stdio has no ASGI stack — silently dropping middleware here
+        # would be worse than a loud refusal, because the caller set
+        # middleware expecting enforcement.
+        with patch("fastmcp_gateway.client_manager.Client"):
+            gw = GatewayServer(
+                {"svc": "http://svc:8080/mcp"},
+                middleware=[MagicMock(name="ASGIMiddleware")],
+            )
+
+        with pytest.raises(ValueError, match=r"HTTP transports"):
+            gw.run(transport="stdio")
+
+    def test_caller_list_mutation_does_not_leak_into_server(self) -> None:
+        # Defense-in-depth: the constructor shallow-copies the caller's
+        # list so a post-construction mutation doesn't silently change
+        # the middleware stack that runs on requests. Catches a class
+        # of bug where a caller builds a list, passes it, then appends
+        # more items expecting them to take effect.
+        caller_list = [MagicMock(name="mw1")]
+        with patch("fastmcp_gateway.client_manager.Client"):
+            gw = GatewayServer({"svc": "http://svc:8080/mcp"}, middleware=caller_list)
+        caller_list.append(MagicMock(name="mw2"))
+
+        assert len(gw._middleware) == 1
