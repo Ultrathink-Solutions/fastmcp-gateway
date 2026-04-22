@@ -77,9 +77,13 @@ class TestReadyz:
             response = await client.get("/readyz")
 
         assert response.status_code == 200
-        data = response.json()
-        assert data["status"] == "ready"
-        assert data["tools"] == 0
+        # Body is exactly ``{"status": "ready"}`` — the tool count is
+        # not exposed in the response. Exposing it would disclose the
+        # size of the routed-tool attack surface to any unauthenticated
+        # caller. Kubernetes readiness probes only consume the status
+        # code; tool-count visibility stays with operators via the
+        # OTel ``registry.tool_count`` span attribute.
+        assert response.json() == {"status": "ready"}
 
     @pytest.mark.asyncio
     async def test_returns_200_when_populated(self, populated_gateway: GatewayServer) -> None:
@@ -88,6 +92,8 @@ class TestReadyz:
             response = await client.get("/readyz")
 
         assert response.status_code == 200
-        data = response.json()
-        assert data["status"] == "ready"
-        assert data["tools"] == 1
+        # Populated gateway body is identical to empty gateway body
+        # — no subsystem-state disclosure regardless of tool count.
+        body = response.json()
+        assert body == {"status": "ready"}
+        assert "tools" not in body
