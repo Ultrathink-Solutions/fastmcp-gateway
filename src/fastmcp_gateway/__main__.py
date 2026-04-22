@@ -72,6 +72,31 @@ Configure via environment variables:
         check.
         Example: ``GATEWAY_ALLOWED_HOOK_PREFIXES=my_org.hooks,ops.hooks``
 
+    GATEWAY_MIDDLEWARE_MODULE
+        Python dotted path to a factory function that returns a list of
+        ASGI middleware descriptors (typically
+        ``starlette.middleware.Middleware`` instances).  Format:
+        ``module.path:function_name``.  The returned list is passed
+        straight to ``GatewayServer(middleware=...)``; the gateway
+        wraps its HTTP app with these middleware (outermost first)
+        before handing to uvicorn.  Useful for injecting host-allowlist
+        filtering, request-id middleware, rate limiting, CSP headers,
+        or structured-logging middleware without modifying the gateway
+        entry point.
+        Example: my_package.middleware:build_middleware
+
+        **Ignored unless GATEWAY_ALLOWED_MIDDLEWARE_PREFIXES is also
+        set** — same security boundary as ``GATEWAY_HOOK_MODULE``.
+
+    GATEWAY_ALLOWED_MIDDLEWARE_PREFIXES
+        Comma-separated allowlist of Python module prefixes that
+        GATEWAY_MIDDLEWARE_MODULE may resolve to.  When unset,
+        GATEWAY_MIDDLEWARE_MODULE is ignored entirely and middleware
+        must be passed programmatically to ``GatewayServer(...,
+        middleware=[...])``.  Dot-boundary match, same rule as
+        ``GATEWAY_ALLOWED_HOOK_PREFIXES``.
+        Example: ``GATEWAY_ALLOWED_MIDDLEWARE_PREFIXES=my_org.middleware,ops.middleware``
+
     GATEWAY_REGISTRATION_TOKEN
         Shared secret that protects the dynamic registration REST endpoints
         (POST/DELETE/GET /registry/servers).  When set, the gateway exposes
@@ -120,6 +145,7 @@ import sys
 from typing import Any
 
 from fastmcp_gateway._hook_loading import _load_hooks
+from fastmcp_gateway._middleware_loading import _load_middleware
 from fastmcp_gateway.code_mode import CodeModeUnavailableError
 from fastmcp_gateway.gateway import CodeModeAuthorizerRequiredError, GatewayServer
 
@@ -303,6 +329,14 @@ def main() -> None:
     # Execution hooks.
     hooks = _load_hooks()
 
+    # ASGI middleware (optional). Loaded from the
+    # ``GATEWAY_MIDDLEWARE_MODULE`` env var under the same allowlist
+    # guard that gates hook loading — any deployment that wants to
+    # wrap the gateway's HTTP app with host-allowlist filtering,
+    # rate limiting, CSP headers, etc. sets both the module path
+    # and ``GATEWAY_ALLOWED_MIDDLEWARE_PREFIXES``.
+    middleware = _load_middleware()
+
     # Dynamic registration token (optional).
     registration_token = os.environ.get("GATEWAY_REGISTRATION_TOKEN") or None
 
@@ -323,6 +357,7 @@ def main() -> None:
             code_mode=code_mode,
             code_mode_limits=code_mode_limits,
             code_mode_audit_verbatim=code_mode_audit_verbatim,
+            middleware=middleware,
         )
     except CodeModeUnavailableError as exc:
         # Friendly handling for the one construction-time error with a

@@ -73,7 +73,12 @@ def _load_hooks() -> list[Any] | None:
     anyone who can write env vars on the gateway pod — we refuse to do
     the import at all.
     """
-    raw = os.environ.get("GATEWAY_HOOK_MODULE", "")
+    # Strip so whitespace-only values (e.g. from a malformed .env file
+    # or YAML escaping) are treated as disabled rather than falling
+    # through to the format check and emitting a confusing "must be in
+    # 'module.path:function_name' format" error. Matches the strip
+    # posture already used by ``_parse_allowed_hook_prefixes``.
+    raw = os.environ.get("GATEWAY_HOOK_MODULE", "").strip()
     if not raw:
         return None
 
@@ -108,8 +113,15 @@ def _load_hooks() -> list[Any] | None:
 
     try:
         module = importlib.import_module(module_path)
-    except ImportError as exc:
-        logger.error("Failed to import hook module '%s': %s", module_path, exc)
+    except Exception as exc:
+        # Broad ``Exception`` (not ``BaseException``) so
+        # ``SystemExit`` / ``KeyboardInterrupt`` still propagate,
+        # but module-top-level ``RuntimeError`` / ``SyntaxError`` /
+        # validation failures convert to a clean operator-facing
+        # message and exit rather than a raw traceback that's harder
+        # to correlate under structured logging. ``logger.exception``
+        # preserves the stack trace for diagnostics.
+        logger.exception("Failed to import hook module '%s': %s", module_path, exc)
         sys.exit(1)
 
     factory = getattr(module, func_name, None)

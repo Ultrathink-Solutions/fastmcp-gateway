@@ -79,6 +79,37 @@ def test_load_hooks_unset_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
     assert _load_hooks() is None
 
 
+def test_load_hooks_whitespace_only_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Whitespace-only is treated as disabled, not as a format error.
+    # Parity with ``_middleware_loading._load_middleware``.
+    monkeypatch.setenv("GATEWAY_HOOK_MODULE", "   ")
+    monkeypatch.setenv("GATEWAY_ALLOWED_HOOK_PREFIXES", "my_org.hooks")
+    assert _load_hooks() is None
+
+
+def test_load_hooks_import_time_runtime_error_exits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Parity regression test for the broadened ``except Exception``:
+    # an import-time ``RuntimeError`` in the factory module's
+    # top-level code must convert to ``SystemExit`` with a logged
+    # error, not a raw traceback. Same contract as
+    # ``test_load_middleware_import_time_runtime_error_exits``.
+    def _raising_finder(name: str, _package: str | None = None) -> None:
+        if name == "hook_raises_at_import":
+            raise RuntimeError("simulated import-time config failure")
+        return None
+
+    monkeypatch.setattr("importlib.import_module", _raising_finder)
+    monkeypatch.setenv("GATEWAY_HOOK_MODULE", "hook_raises_at_import:build")
+    monkeypatch.setenv("GATEWAY_ALLOWED_HOOK_PREFIXES", "hook_raises_at_import")
+
+    with pytest.raises(SystemExit):
+        _load_hooks()
+
+
 def test_load_hooks_set_without_allowlist_is_ignored(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

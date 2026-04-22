@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.0] - 2026-04-21
+
+### Added
+
+- **`GATEWAY_MIDDLEWARE_MODULE` env var**: loads ASGI middleware from a dotted Python path (``module.path:function_name``) and passes the returned list to ``GatewayServer(middleware=...)``. Mirrors the existing ``GATEWAY_HOOK_MODULE`` shape exactly — same format, same failure modes, same security posture. Lets deployment shims inject host-allowlist filtering, request-id middleware, rate limiting, CSP headers, etc. without modifying the gateway entry point or constructing ``GatewayServer`` programmatically.
+- **`GATEWAY_ALLOWED_MIDDLEWARE_PREFIXES` env var**: comma-separated allowlist of module prefixes that ``GATEWAY_MIDDLEWARE_MODULE`` may resolve to. **Required** — without it, ``GATEWAY_MIDDLEWARE_MODULE`` is silently ignored with a startup warning log. Same security rationale as ``GATEWAY_ALLOWED_HOOK_PREFIXES``: without the allowlist, the env var would be a code-injection primitive for any process with write access to the gateway's env. Dot-boundary match (``my_org`` does not match ``my_org_evil``).
+- **`fastmcp_gateway._middleware_loading` module**: internal helpers `_load_middleware`, `_middleware_module_allowed`, `_parse_allowed_middleware_prefixes`. Private by underscore convention; exposed at the module path so tests can import them.
+
+### Changed
+
+- **`GATEWAY_HOOK_MODULE` loader hardening**: the sibling hook loader gets the same two hardening fixes applied to the new middleware loader, to preserve the "mirror" contract between the two: (1) whitespace-only values (e.g. ``GATEWAY_HOOK_MODULE="   "`` from a malformed ``.env`` file) are now treated as disabled instead of falling through to a confusing "must be in ``module.path:function_name`` format" error; (2) the import try/except now catches any ``Exception`` raised during module top-level execution (``RuntimeError``, ``SyntaxError``, ``ValueError`` in config validation, etc.) rather than only ``ImportError`` — these convert to a clean ``SystemExit`` with a full traceback via ``logger.exception`` rather than propagating as a raw traceback. ``BaseException`` subclasses like ``KeyboardInterrupt`` and ``SystemExit`` still propagate unchanged.
+
+### Notes
+
+- **Zero behavior change for existing deployments**: ``GatewayServer`` constructions that don't set the new env vars behave identically to v0.11.0. The kwarg path introduced in v0.11.0 (``GatewayServer(middleware=[...])``) is unchanged. The ``GATEWAY_HOOK_MODULE`` hardening is strictly a fail-closed improvement — operators who were previously seeing a raw traceback on a broken factory module now see a clean ``SystemExit`` with the full stack in logs.
+- **Allowlist is mandatory**: deployments that want env-driven middleware loading MUST set both ``GATEWAY_MIDDLEWARE_MODULE`` and ``GATEWAY_ALLOWED_MIDDLEWARE_PREFIXES``. Setting only the module var emits a ``WARNING``-level startup log and refuses to load — same fail-closed posture the hooks loader uses.
+
 ## [0.11.0] - 2026-04-21
 
 ### Added
@@ -294,6 +311,7 @@ Security-hardening release. Closes two code-injection primitives in the env-driv
 
 - Migrated `ToolEntry` and `DomainInfo` from dataclasses to Pydantic models (#9)
 
+[0.12.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.10.1...v0.11.0
 [0.10.1]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.9.0...v0.10.0
