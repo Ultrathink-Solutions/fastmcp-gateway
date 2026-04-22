@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] - 2026-04-21
+
+Security-hardening release. Closes a tool-impersonation / sandbox-escape primitive in the `ToolRegistry.register_tool` ingress.
+
+### Changed (breaking for non-conformant upstreams)
+
+- **`ToolRegistry.register_tool` now validates the upstream tool name** and silently drops unsafe entries with a structured audit log. An unsafe name (dunder, Python keyword / soft-keyword, or Python builtin that would shadow the binding inside the `execute_code` sandbox namespace) is rejected before the entry reaches the registry. The rejection is silent (log at `WARNING`, no exception) so a single bad upstream name in a populate batch does not abort siblings — same convention as the existing "skip tool with empty name" branch in `populate_domain`. (#44)
+
+### Added
+
+- **`fastmcp_gateway.tool_name` module** (internal): new `validate_tool_name(name: str) -> str | None` helper — returns `None` for a safe name or a short diagnostic string for an unsafe one. Consumed by `ToolRegistry.register_tool`; not exported as public API. Compiles the shape regex and denylist from `builtins` + `keyword.kwlist` + `keyword.softkwlist` at import time so the set tracks Python version changes.
+
+### Security
+
+- **Validation rules** applied at `register_tool` ingress:
+  - Shape: `^[a-z][a-zA-Z0-9_]{0,63}$` — lowercase first character, alphanumerics and underscores thereafter, length 1 to 64. First-char lowercase rule rejects dunders (`__class__`, `__import__`) and all-uppercase forms (`CLASS`) in a single check. Mixed case is accepted in subsequent characters so camelCase names real upstreams advertise (e.g. `executeQuery`) continue to validate — a strict snake-case rule would reject valid production tools without adding security.
+  - No Python keywords, soft-keywords, or builtins that would otherwise pass the shape check (covers `eval`, `exec`, `compile`, `class`, `type`, `match`, `case`, etc.).
+
+### Notes
+
+- **Upgrade path**: legitimate upstreams following any reasonable naming convention see no change. If a tool you depend on fails validation, the `WARNING`-level log line at startup names it explicitly (`Rejected tool registration: domain=X name=Y reason=Z`) — coordinate with the upstream owner to rename to a conformant identifier.
+- **Catch-site compatibility**: validation does not raise; existing `try/except` sites around `register_tool` remain unchanged.
+
 ## [0.9.0] - 2026-04-21
 
 Security-hardening release. Closes two code-injection primitives in the env-driven configuration path. Both primary changes are **breaking** for configs that relied on the previous permissive defaults — see the upgrade notes below.
@@ -247,6 +270,8 @@ Security-hardening release. Closes two code-injection primitives in the env-driv
 
 - Migrated `ToolEntry` and `DomainInfo` from dataclasses to Pydantic models (#9)
 
+[0.10.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.9.0...v0.10.0
+[0.9.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.6.4...v0.7.0

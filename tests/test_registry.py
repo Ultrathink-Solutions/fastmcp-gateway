@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
+import logging
+from typing import TYPE_CHECKING
+
 from fastmcp_gateway.registry import ToolEntry, ToolRegistry, infer_group
+
+if TYPE_CHECKING:
+    import pytest
 
 # ---------------------------------------------------------------------------
 # infer_group
@@ -418,3 +424,165 @@ class TestGetAllToolNames:
 
     def test_empty_registry(self, empty_registry: ToolRegistry) -> None:
         assert empty_registry.get_all_tool_names() == []
+
+
+# ---------------------------------------------------------------------------
+# ToolRegistry.register_tool — name-validation integration
+# ---------------------------------------------------------------------------
+#
+# Pure-function tests for ``validate_tool_name`` live in
+# ``tests/test_tool_name.py``. The tests below exercise the
+# ``ToolRegistry.register_tool`` path — i.e. that the registry gate
+# consumes the validator correctly and that rejection is structured +
+# silent (log, no exception), consistent with the existing
+# "skip tool with empty name" convention in ``populate_domain``.
+
+
+def _tool(name: str, domain: str = "sales") -> ToolEntry:
+    return ToolEntry(
+        name=name,
+        domain=domain,
+        group="general",
+        description="test tool",
+        input_schema={},
+        upstream_url="http://example.invalid/mcp",
+    )
+
+
+class TestRegisterToolRejectsUnsafeNames:
+    """Invalid names never enter the registry; structured warning is emitted.
+
+    Log-record assertions check ``record.name`` (logger name),
+    ``record.levelno`` (WARNING), and ``record.args`` (the positional
+    args passed to ``logger.warning(fmt, domain, name, reason)``)
+    rather than substring-matching the rendered message. The message
+    template is a cosmetic detail that may be refined over time; the
+    logger name, level, and rejected tool name carried in ``args``
+    are the load-bearing facts a regression could break.
+    """
+
+    @staticmethod
+    def _rejection_records(caplog: pytest.LogCaptureFixture, rejected_name: str) -> list[logging.LogRecord]:
+        return [
+            r
+            for r in caplog.records
+            if r.name == "fastmcp_gateway.registry"
+            and r.levelno == logging.WARNING
+            and isinstance(r.args, tuple)
+            and rejected_name in r.args
+        ]
+
+    def test_dunder_name_is_rejected(self, caplog: pytest.LogCaptureFixture) -> None:
+        registry = ToolRegistry()
+        caplog.set_level(logging.WARNING, logger="fastmcp_gateway.registry")
+        registry.register_tool(_tool("__class__"))
+
+        assert registry.tool_count == 0
+        assert registry.lookup("__class__") is None
+        assert len(self._rejection_records(caplog, "__class__")) == 1
+
+    def test_builtin_name_is_rejected(self, caplog: pytest.LogCaptureFixture) -> None:
+        registry = ToolRegistry()
+        caplog.set_level(logging.WARNING, logger="fastmcp_gateway.registry")
+        registry.register_tool(_tool("eval"))
+
+        assert registry.tool_count == 0
+        assert len(self._rejection_records(caplog, "eval")) == 1
+
+    def test_non_conformant_name_is_rejected(self, caplog: pytest.LogCaptureFixture) -> None:
+        registry = ToolRegistry()
+        caplog.set_level(logging.WARNING, logger="fastmcp_gateway.registry")
+        registry.register_tool(_tool("Bad-Name"))
+
+        assert registry.tool_count == 0
+        assert len(self._rejection_records(caplog, "Bad-Name")) == 1
+
+    def test_synthesized_collision_name_is_validated_atomically(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Collision handling with an invalid synthesized name is atomic.
+
+        The primary ``register_tool`` gate validates raw upstream
+        names. The collision paths then synthesize new names by
+        joining domain + original name, so a hyphenated-domain
+        (``sec-edgar``) or hostile-domain string can produce a
+        synthesized name that fails the identifier regex.
+
+        Before the pre-flight validation step, the collision path
+        would:
+
+        1. Add to ``_collided_names``.
+        2. ``_unregister`` the existing tool.
+        3. Re-register the existing tool under its prefixed name.
+        4. Register the new tool under its prefixed name — which is
+           where the validation gate fired too late.
+
+        If step 4's name was invalid, the existing tool had already
+        been renamed (or lost) and ``_collided_names`` carried a
+        stray entry. The pre-flight now validates **both** candidate
+        names up front and bails out before any mutation.
+
+        This test sets up a hyphen-bearing second domain
+        (``Bad-Domain``). The synthesized ``Bad-Domain_search``
+        fails the shape check; the existing tool must remain under
+        its pre-collision name and ``_collided_names`` must stay
+        empty — provable post-conditions for atomicity.
+        """
+        registry = ToolRegistry()
+        caplog.set_level(logging.WARNING, logger="fastmcp_gateway.registry")
+
+        registry.register_tool(_tool("search", domain="good_domain"))
+        assert registry.tool_count == 1
+        assert registry.lookup("search") is not None  # under raw name
+
+        # Hostile second registration — same bare name, bad domain.
+        registry.register_tool(_tool("search", domain="Bad-Domain"))
+
+        # ATOMICITY: existing tool stays under its ORIGINAL name;
+        # no prefix-rename happened because the pre-flight bailed.
+        assert registry.tool_count == 1
+        assert registry.lookup("search") is not None
+        assert registry.lookup("good_domain_search") is None
+        assert registry.lookup("Bad-Domain_search") is None
+        # ``_collided_names`` must not have been mutated either.
+        assert "search" not in registry._collided_names
+
+        # Log carries the structured abort record naming the bad candidate.
+        assert any(
+            r.name == "fastmcp_gateway.registry"
+            and r.levelno == logging.WARNING
+            and isinstance(r.args, tuple)
+            and "Bad-Domain_search" in r.args
+            for r in caplog.records
+        )
+
+    def test_rejection_does_not_raise(self) -> None:
+        """Batch-register safety: a bad name must not abort siblings.
+
+        ``populate_domain`` routes every upstream tool through
+        ``register_tool``; a single malicious entry should be dropped,
+        not propagate an exception that would abort the rest of the
+        batch.
+        """
+        registry = ToolRegistry()
+        # Interleave one bad entry between two legitimate ones.
+        registry.register_tool(_tool("good_first"))
+        registry.register_tool(_tool("eval"))
+        registry.register_tool(_tool("good_last"))
+
+        assert registry.tool_count == 2
+        assert registry.lookup("good_first") is not None
+        assert registry.lookup("good_last") is not None
+        assert registry.lookup("eval") is None
+
+
+class TestRegisterToolAcceptsLegitimateNames:
+    """Legitimate names register normally — regression shield on existing behavior."""
+
+    def test_simple_name_registers(self) -> None:
+        registry = ToolRegistry()
+        registry.register_tool(_tool("search"))
+        assert registry.lookup("search") is not None
+
+    def test_prefixed_name_registers(self) -> None:
+        registry = ToolRegistry()
+        registry.register_tool(_tool("apollo_people_search", domain="apollo"))
+        assert registry.lookup("apollo_people_search") is not None
