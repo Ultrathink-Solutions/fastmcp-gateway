@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING, Any
 from opentelemetry import trace
 from pydantic import BaseModel, ConfigDict
 
+from fastmcp_gateway.tool_name import validate_tool_name
+
 if TYPE_CHECKING:
     from fastmcp_gateway.access_policy import AccessPolicy
 
@@ -92,7 +94,25 @@ class ToolRegistry:
         When two domains register tools with the same name, both are
         auto-prefixed with their domain name (``{domain}_{name}``) and
         the original name is preserved in :attr:`ToolEntry.original_name`.
+
+        Upstream names are validated before registration. An unsafe
+        name (one that would shadow a Python keyword or builtin inside
+        the ``execute_code`` sandbox namespace, contains disallowed
+        characters, or exceeds 64 chars) is rejected with a structured
+        audit log; the registry is not mutated. Rejection is silent
+        (no exception) so a single bad name in a populate batch does
+        not abort the other tools from the same upstream.
         """
+        reason = validate_tool_name(tool.name)
+        if reason is not None:
+            logger.warning(
+                "Rejected tool registration: domain=%s name=%r reason=%s",
+                tool.domain,
+                tool.name,
+                reason,
+            )
+            return
+
         existing = self._tools.get(tool.name)
 
         # Same-domain re-registration: always allow (simple update).
@@ -108,13 +128,50 @@ class ToolRegistry:
             existing_prefixed = f"{existing.domain}_{existing.name}"
             new_prefixed = f"{tool.domain}_{tool.name}"
 
+            # Pre-flight: the two candidate prefixed names must both
+            # pass ``validate_tool_name`` before any state mutation.
+            # Without this check, a hyphenated domain (``sec-edgar``)
+            # or a hostile domain (``Bad-Domain``) can push an invalid
+            # synthesized name into the pipeline AFTER we've already
+            # unregistered the existing tool and added to
+            # ``_collided_names`` — the existing tool is then silently
+            # lost and ``_collided_names`` carries a stray entry.
+            # Validating up front lets us bail out atomically: either
+            # the collision handling fully succeeds, or the registry
+            # is untouched.
+            check_blocker = self._tools.get(existing_prefixed)
+            is_blocker_path = check_blocker is not None and check_blocker.domain != existing.domain
+            candidates = [new_prefixed]
+            if not is_blocker_path:
+                # The blocker path never synthesizes existing_prefixed
+                # (it keeps the existing tool under its current name),
+                # so we only need to validate new_prefixed there.
+                candidates = [new_prefixed, existing_prefixed]
+            for candidate in candidates:
+                reason = validate_tool_name(candidate)
+                if reason is not None:
+                    logger.warning(
+                        "Tool name collision: aborting collision handling for "
+                        "'%s' (domains '%s' vs '%s') — synthesized name %r "
+                        "fails validation (%s); registry state unchanged",
+                        tool.name,
+                        existing.domain,
+                        tool.domain,
+                        candidate,
+                        reason,
+                    )
+                    return
+
             # Check if the existing tool's prefixed name would collide with
             # a tool from yet another domain.  If so, we cannot safely
             # unregister the existing tool (it would be lost).  Instead,
             # keep the existing tool under its current name and only prefix
             # the new registrant.
-            existing_blocker = self._tools.get(existing_prefixed)
-            if existing_blocker is not None and existing_blocker.domain != existing.domain:
+            if is_blocker_path:
+                # ``check_blocker`` is guaranteed non-None on this path
+                # (``is_blocker_path`` requires it), so its ``domain``
+                # is safe to dereference for the log line.
+                blocker_domain = check_blocker.domain if check_blocker is not None else "?"
                 logger.warning(
                     "Tool name collision: '%s' registered by both '%s' and '%s' "
                     "— cannot rename '%s' to '%s' (owned by domain '%s'), keeping original",
@@ -123,7 +180,7 @@ class ToolRegistry:
                     tool.domain,
                     existing.name,
                     existing_prefixed,
-                    existing_blocker.domain,
+                    blocker_domain,
                 )
                 self._collided_names.add(tool.name)
                 self._register_internal(
@@ -182,7 +239,28 @@ class ToolRegistry:
         self._register_internal(tool)
 
     def _register_internal(self, tool: ToolEntry) -> None:
-        """Register a tool without collision detection (internal use)."""
+        """Register a tool without collision detection (internal use).
+
+        Validates ``tool.name`` one more time before the insertion into
+        ``_tools``. ``register_tool`` already validates raw upstream
+        names, but its collision paths synthesize new names
+        (``f"{tool.domain}_{tool.name}"``) and hand them back to this
+        method. A hostile or misconfigured domain string could push
+        a synthesized name that fails the identifier gate through to
+        the registry; this second check closes that bypass and
+        preserves the invariant "every name in ``_tools`` is a safe
+        Python identifier."
+        """
+        reason = validate_tool_name(tool.name)
+        if reason is not None:
+            logger.warning(
+                "Rejected synthesized tool name: domain=%s name=%r reason=%s",
+                tool.domain,
+                tool.name,
+                reason,
+            )
+            return
+
         old = self._tools.get(tool.name)
         if old is not None and old.domain != tool.domain:
             # Guard: refuse to silently overwrite a tool from another domain.
