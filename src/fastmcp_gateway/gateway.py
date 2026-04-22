@@ -391,9 +391,16 @@ class GatewayServer:
             with tracer.start_as_current_span("gateway.readyz") as span:
                 span.set_attribute("http.method", "GET")
                 span.set_attribute("http.route", "/readyz")
-                tool_count = registry.tool_count
-                span.set_attribute("registry.tool_count", tool_count)
-                return JSONResponse({"status": "ready", "tools": tool_count})
+                # Tool count remains observable via the OTel span for
+                # operator telemetry, but is intentionally NOT emitted
+                # in the response body. Kubernetes readiness probes
+                # only consume the status code; any caller parsing
+                # ``/readyz`` for subsystem state is a reconnaissance
+                # signal we don't need to volunteer (how many tools a
+                # gateway has routed tells an attacker the size of
+                # the attack surface).
+                span.set_attribute("registry.tool_count", registry.tool_count)
+                return JSONResponse({"status": "ready"})
 
     def _register_registry_routes(self) -> None:
         """Register /registry/servers REST endpoints for dynamic upstream management.
