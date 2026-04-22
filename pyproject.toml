@@ -4,7 +4,12 @@ build-backend = "hatchling.build"
 
 [project]
 name = "fastmcp-gateway"
-version = "0.10.0"
+# ``__version__`` in ``src/fastmcp_gateway/__init__.py`` is the single
+# source of truth. Hatchling reads it at build time via the
+# ``[tool.hatch.version]`` block below, so a release bumps exactly
+# one line — no possibility of the PyPI metadata and the installed
+# ``__version__`` drifting out of sync.
+dynamic = ["version"]
 description = "Progressive tool discovery gateway for MCP, built on FastMCP"
 readme = "README.md"
 license = "Apache-2.0"
@@ -48,6 +53,12 @@ fastmcp-gateway = "fastmcp_gateway.__main__:main"
 Homepage = "https://github.com/Ultrathink-Solutions/fastmcp-gateway"
 Repository = "https://github.com/Ultrathink-Solutions/fastmcp-gateway"
 Issues = "https://github.com/Ultrathink-Solutions/fastmcp-gateway/issues"
+
+[tool.hatch.version]
+# Hatchling parses ``__version__ = "..."`` from this file and uses
+# it as the distribution version (the ``dynamic = ["version"]``
+# entry under ``[project]`` opts into this).
+path = "src/fastmcp_gateway/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/fastmcp_gateway"]

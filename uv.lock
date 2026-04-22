@@ -729,7 +729,6 @@ wheels = [
 
 [[package]]
 name = "fastmcp-gateway"
-version = "0.10.0"
 source = { editable = "." }
 dependencies = [
     { name = "fastmcp" },
@@ -765,7 +764,7 @@ requires-dist = [
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.9" },
 ]
-provides-extras = ["dev", "code-mode"]
+provides-extras = ["code-mode", "dev"]
 
 [[package]]
 name = "filelock"
