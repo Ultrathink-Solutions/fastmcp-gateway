@@ -107,6 +107,19 @@ class GatewayServer:
         in addition to the default hash+metadata INFO audit record.
         High-PII-risk; do not enable in production without review.
         Has no effect when ``code_mode=False``.
+    middleware:
+        Optional list of ASGI middleware to wrap the gateway's HTTP app
+        with. Injected via ``FastMCP.http_app(middleware=...)``. When
+        set, :meth:`GatewayServer.run` builds the ASGI app and runs it
+        with uvicorn directly instead of delegating to
+        ``FastMCP.run()``. HTTP-transport only; the behavior is
+        backward-compat when left ``None``.
+
+        Use this to wrap the gateway with ASGI middleware such as host-
+        allowlist filtering, request-id injection, rate limiting, CSP
+        headers, or structured-logging middleware. The middleware list
+        is applied in declaration order (first entry outermost) — same
+        convention as Starlette's ``Middleware`` stack.
 
     Usage::
 
@@ -135,6 +148,7 @@ class GatewayServer:
         code_mode_authorizer: Any | None = None,
         code_mode_limits: Any | None = None,
         code_mode_audit_verbatim: bool = False,
+        middleware: list[Any] | None = None,
     ) -> None:
         # Accept either a plain URL mapping or an object-shaped mapping with
         # per-entry allowed_tools / denied_tools.  The explicit access_policy
@@ -205,6 +219,11 @@ class GatewayServer:
         self._code_mode_authorizer: Any | None = code_mode_authorizer
         self._code_mode_limits = code_mode_limits
         self._code_mode_audit_verbatim = code_mode_audit_verbatim
+        # ``middleware`` is routed through ``FastMCP.http_app`` at run
+        # time, so store the caller's list verbatim. Shallow-copy to
+        # prevent a post-construction mutation of the caller's list
+        # from silently changing what runs on the server.
+        self._middleware: list[Any] = list(middleware) if middleware else []
         self._registry_lock = asyncio.Lock()
         if registration_token and len(registration_token) < 16:
             logger.warning("GATEWAY_REGISTRATION_TOKEN is shorter than 16 characters — consider using a stronger token")
@@ -287,8 +306,45 @@ class GatewayServer:
                 )
 
     def run(self, **kwargs: Any) -> None:
-        """Run the gateway server."""
-        self._mcp.run(**kwargs)
+        """Run the gateway server.
+
+        When the constructor received a non-empty ``middleware`` list,
+        the ASGI app is built via ``FastMCP.http_app(middleware=...)``
+        and served with uvicorn directly — the only path that lets
+        caller-supplied middleware intercept requests before they
+        reach the underlying FastMCP transport.
+
+        When no middleware is configured, delegates to
+        ``FastMCP.run()`` unchanged (backward-compat: this was the
+        sole code path before the ``middleware`` kwarg existed).
+        """
+        if not self._middleware:
+            self._mcp.run(**kwargs)
+            return
+
+        # Middleware wrapping is HTTP-transport-only. ``stdio`` and
+        # ``sse`` don't build a Starlette stack, so there's nothing
+        # to wrap; refuse loudly rather than silently drop the
+        # middleware list.
+        transport = kwargs.pop("transport", "streamable-http")
+        if transport not in ("http", "streamable-http"):
+            raise ValueError(
+                f"middleware is only supported on HTTP transports "
+                f"(http, streamable-http); got transport={transport!r}. "
+                "Omit the middleware kwarg or switch to an HTTP transport."
+            )
+
+        host = kwargs.pop("host", "0.0.0.0")
+        port = kwargs.pop("port", 8080)
+        app = self._mcp.http_app(
+            middleware=self._middleware,
+            transport=transport,
+        )
+        # Defer the uvicorn import so consumers that never enable
+        # middleware don't pay its import cost on stdio startup.
+        import uvicorn
+
+        uvicorn.run(app, host=host, port=port, **kwargs)
 
     # ------------------------------------------------------------------
     # Background refresh
