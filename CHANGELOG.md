@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.1] - 2026-04-21
+
+Release-hygiene patch. No functional or API changes from 0.10.0.
+
+### Changed
+
+- **Single source of truth for `__version__`**: `pyproject.toml` now declares `dynamic = ["version"]` and hatchling reads the version string from `src/fastmcp_gateway/__init__.py` at build time. Previous releases required a manual dual-bump in both files; a missed bump in one of them caused the PyPI publish during v0.9.0 to reject with "file already exists", requiring recovery PR #43. Every release from 0.10.1 onward updates exactly one line (`__version__` in `__init__.py`); `pyproject.toml` no longer carries a redundant `version` field. (#45)
+
+### Notes
+
+- **For consumers**: no change. `fastmcp_gateway.__version__` still resolves to the current version at runtime; `importlib.metadata.version("fastmcp-gateway")` returns the same string.
+- **For contributors**: when cutting a release, bump only `__version__` in `src/fastmcp_gateway/__init__.py`. The wheel's `METADATA.Version` is generated from it automatically.
+
 ## [0.10.0] - 2026-04-21
 
 Security-hardening release. Closes a tool-impersonation / sandbox-escape primitive in the `ToolRegistry.register_tool` ingress.
@@ -270,6 +283,7 @@ Security-hardening release. Closes two code-injection primitives in the env-driv
 
 - Migrated `ToolEntry` and `DomainInfo` from dataclasses to Pydantic models (#9)
 
+[0.10.1]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.7.1...v0.8.0
