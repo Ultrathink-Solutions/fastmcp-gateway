@@ -8,6 +8,17 @@ from typing import Any
 from pydantic import BaseModel
 
 
+class OutputGuardError(ValueError):
+    """Raised by the output guard in ``reject`` mode when prompt-injection
+    markup is detected in a tool's result text.
+
+    Subclasses :class:`ValueError` so existing callers catching the broad
+    type keep working, while a dedicated type lets the hook pipeline
+    surface the event as a structured ``ExecutionDenied`` without
+    brittle string matching on error messages.
+    """
+
+
 class GatewayError(BaseModel):
     """Machine-parseable error returned by gateway meta-tools.
 

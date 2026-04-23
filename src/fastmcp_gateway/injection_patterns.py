@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import re
 
-PATTERN_VERSION = "2026-04-22.1"
+PATTERN_VERSION = "2026-04-24.2"
 
 INJECTION_PATTERNS: list[str] = [
     r"<\s*system\s*[^>]*>",
@@ -34,12 +34,22 @@ INJECTION_PATTERNS: list[str] = [
     r"<</SYS>>",
     r"<\s*tool_use\s*[^>]*>",
     r"<\s*tool_result\s*[^>]*>",
+    # Heading-style role prefixes (``system:`` / ``assistant:``)
+    # used by some chat formats as line-leading role markers.
+    # Anchored to line-start via ``^`` with optional leading
+    # whitespace — a ``\b``-only form matched benign inline
+    # mentions (e.g. ``"The system: config at ..."``). The
+    # ``re.MULTILINE`` flag in ``INJECTION_FLAGS`` below makes
+    # ``^`` match after every ``\n``, so a role-prefix on any
+    # line of a multi-line tool response is caught.
+    r"^\s*system\s*:",
+    r"^\s*assistant\s*:",
     r"ignore\s+(?:all\s+)?previous\s+instructions?",
     r"disregard\s+(?:all\s+)?(?:prior|previous)\s+(?:context|instructions?)",
     r"you\s+are\s+now",
     r"act\s+as\s+(?:a|an)\s+",
 ]
 
-INJECTION_FLAGS: int = re.IGNORECASE | re.UNICODE | re.DOTALL
+INJECTION_FLAGS: int = re.IGNORECASE | re.UNICODE | re.DOTALL | re.MULTILINE
 
 __all__ = ["INJECTION_FLAGS", "INJECTION_PATTERNS", "PATTERN_VERSION"]

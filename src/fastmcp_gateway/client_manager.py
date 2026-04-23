@@ -95,6 +95,16 @@ class UpstreamManager:
         intentionally contain denylist tokens. Passed as an explicit
         Python-code kwarg (no env-var form) so a deployment mistake
         can't silently weaken sanitation.
+    trusted_output_tools:
+        Optional iterable of ``fnmatch`` glob patterns naming tools
+        whose result text the gateway-level output guard will skip
+        scrubbing. Patterns are applied during
+        :meth:`ToolRegistry.populate_domain` — any registered tool
+        whose name matches is flagged
+        :attr:`ToolEntry.raw_output_trusted` so the output guard (if
+        enabled) bypasses it on each invocation. Complementary to the
+        upstream-declared ``annotations: {"x-raw-output-trusted":
+        true}`` custom extension.
     """
 
     def __init__(
@@ -106,6 +116,7 @@ class UpstreamManager:
         upstream_headers: dict[str, dict[str, str]] | None = None,
         policy: AccessPolicy | None = None,
         sanitizer_trusted_domains: set[str] | None = None,
+        trusted_output_tools: set[str] | None = None,
     ) -> None:
         self._upstreams = upstreams
         self._registry = registry
@@ -117,6 +128,10 @@ class UpstreamManager:
         self._sanitizer_trusted_domains: set[str] = (
             set(sanitizer_trusted_domains) if sanitizer_trusted_domains else set()
         )
+        # Stored as a sorted list (not a set) so iteration order is
+        # deterministic — matters when a future extension logs which
+        # pattern triggered trust.
+        self._trusted_output_tool_patterns: list[str] = sorted(trusted_output_tools) if trusted_output_tools else []
 
         # Persistent clients for registry operations (no user context).
         self._registry_clients: dict[str, Client] = {}
@@ -179,14 +194,27 @@ class UpstreamManager:
             async with client:
                 mcp_tools = await client.list_tools()
 
-            raw_tools: list[dict[str, Any]] = [
-                {
+            raw_tools: list[dict[str, Any]] = []
+            for t in mcp_tools:
+                entry: dict[str, Any] = {
                     "name": t.name,
                     "description": t.description or "",
                     "inputSchema": t.inputSchema,
                 }
-                for t in mcp_tools
-            ]
+                # MCP tool ``annotations`` (optional) carries custom
+                # extensions like ``x-raw-output-trusted``. Prefer
+                # the attribute — the MCP Python SDK exposes annotations
+                # as a Pydantic model whose ``model_dump`` we want,
+                # but we fall back to whatever shape the SDK hands us
+                # so a newer SDK version that returns a plain dict
+                # still works.
+                annotations = getattr(t, "annotations", None)
+                if annotations is not None:
+                    if hasattr(annotations, "model_dump"):
+                        entry["annotations"] = annotations.model_dump(exclude_none=True)
+                    elif isinstance(annotations, dict):
+                        entry["annotations"] = annotations
+                raw_tools.append(entry)
 
             diff = self._registry.populate_domain(
                 domain=domain,
@@ -195,6 +223,7 @@ class UpstreamManager:
                 policy=self._policy,
                 expected_digest=expected_digest,
                 trusted_domains=self._sanitizer_trusted_domains,
+                trusted_output_tool_patterns=self._trusted_output_tool_patterns,
             )
             span.set_attribute("gateway.tool_count", diff.tool_count)
             if diff.refused:

@@ -340,9 +340,17 @@ class CodeModeRunner:
                     ctx.arguments,
                     extra_headers=ctx.extra_headers or None,
                 )
-                is_error = bool(getattr(result, "isError", False))
+                # ``call_tool`` returns ``fastmcp.client.client.CallToolResult``
+                # whose fields are snake_case (``is_error`` / ``structured_content``),
+                # not the MCP-spec camelCase. Reading the camelCase
+                # names here silently returned defaults on every real
+                # upstream response — errors were never surfaced, and
+                # structured content always fell through to the text-
+                # extraction branch. Match ``meta_tools.execute_tool``'s
+                # direct-attribute read pattern for consistency.
+                is_error = bool(getattr(result, "is_error", False))
                 # Prefer structured output — gives Python code dict access.
-                payload: Any = getattr(result, "structuredContent", None)
+                payload: Any = getattr(result, "structured_content", None)
                 if payload is None:
                     # Fall back to concatenated text content.
                     payload = _extract_text(result)

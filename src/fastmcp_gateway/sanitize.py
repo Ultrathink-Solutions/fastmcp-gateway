@@ -253,9 +253,19 @@ def _contains_ref(node: Any, depth: int = 0) -> bool:
     strictly more auditable.
     """
     if depth > _MAX_SCHEMA_DEPTH:
-        # Stop recursing at the depth cap — the caller already flags
-        # depth violation separately, so we just bail out here.
-        return False
+        # Fail closed: conservatively treat an unexplored subtree as
+        # potentially containing a ``$ref``. In the current caller
+        # ordering inside :func:`validate_input_schema`, the depth
+        # check fires first and rejects over-deep schemas before this
+        # function is invoked on them — so this branch is
+        # unreachable in practice today. But returning ``False`` here
+        # would create an ordering dependency: a future refactor that
+        # reordered the checks (or reused ``_contains_ref`` from a
+        # different callsite that did not gate on depth) could let a
+        # pathologically-deep schema with a hidden ``$ref`` pass the
+        # ref check silently. Returning ``True`` closes that class of
+        # bug regardless of caller ordering.
+        return True
     if isinstance(node, dict):
         if "$ref" in node:
             return True

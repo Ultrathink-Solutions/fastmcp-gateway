@@ -399,14 +399,41 @@ def register_meta_tools(
                 )
                 # Run after_execute even on upstream errors
                 if ctx is not None and hook_runner.has_hooks:
-                    result_text = await hook_runner.run_after_execute(ctx, result_text, True)
+                    try:
+                        result_text = await hook_runner.run_after_execute(ctx, result_text, True)
+                    except ExecutionDenied as denied:
+                        # An after_execute hook (output guard in
+                        # reject mode, or any operator hook) may opt
+                        # to surface a policy rejection. Route it
+                        # through the same structured error envelope
+                        # used by before_execute denials.
+                        span.set_attribute("gateway.error_code", denied.code)
+                        return error_response(
+                            denied.code,
+                            denied.message,
+                            tool=tool_name,
+                            domain=entry.domain,
+                        )
                 return result_text
 
             result_text = json.dumps({"tool": tool_name, "result": result_text})
 
-            # After execute — pipeline transforms
+            # After execute — pipeline transforms. An
+            # ``after_execute`` hook may raise ``ExecutionDenied``
+            # (e.g., the output guard's reject mode catches prompt-
+            # injection markup in the tool result). Surface that as
+            # a structured error, not an uncaught exception.
             if ctx is not None and hook_runner.has_hooks:
-                result_text = await hook_runner.run_after_execute(ctx, result_text, False)
+                try:
+                    result_text = await hook_runner.run_after_execute(ctx, result_text, False)
+                except ExecutionDenied as denied:
+                    span.set_attribute("gateway.error_code", denied.code)
+                    return error_response(
+                        denied.code,
+                        denied.message,
+                        tool=tool_name,
+                        domain=entry.domain,
+                    )
 
             return result_text
 

@@ -2,9 +2,10 @@
 
 from fastmcp_gateway.access_policy import AccessPolicy
 from fastmcp_gateway.client_manager import get_user_headers
-from fastmcp_gateway.errors import GatewayError
+from fastmcp_gateway.errors import GatewayError, OutputGuardError
 from fastmcp_gateway.gateway import GatewayServer
 from fastmcp_gateway.hooks import ExecutionContext, ExecutionDenied, Hook, HookRunner, ListToolsContext
+from fastmcp_gateway.output_guard import OutputGuardConfig, OutputGuardHook
 
 # Note: ``CodeModeAuthorizerRequiredError`` is deliberately not re-exported
 # at the package root. It's an internal routing signal between
@@ -23,6 +24,9 @@ __all__ = [
     "Hook",
     "HookRunner",
     "ListToolsContext",
+    "OutputGuardConfig",
+    "OutputGuardError",
+    "OutputGuardHook",
     "get_user_headers",
 ]
 __version__ = "0.17.0"
