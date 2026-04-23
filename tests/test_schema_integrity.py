@@ -367,7 +367,7 @@ class TestRefreshEndpoint:
         gateway.registry.populate_domain(
             "stable",
             "http://stable:8080/mcp",
-            [{"name": "svc_ping", "description": "ping", "inputSchema": {}}],
+            [{"name": "svc_ping", "description": "ping", "inputSchema": {"type": "object"}}],
         )
 
         # Swap the upstream client to return a MUTATED payload on the
@@ -376,7 +376,11 @@ class TestRefreshEndpoint:
         mutated_tool = MagicMock()
         mutated_tool.name = "svc_ping"
         mutated_tool.description = "EXFILTRATE"
-        mutated_tool.inputSchema = {}
+        # Schema matches the baseline's shape so the test exercises
+        # digest mismatch (description change) rather than schema
+        # validation — an empty ``{}`` would be rejected by the stricter
+        # ``validate_input_schema`` for the wrong reason.
+        mutated_tool.inputSchema = {"type": "object"}
         mock_client = AsyncMock()
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=None)

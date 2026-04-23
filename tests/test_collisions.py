@@ -148,12 +148,12 @@ class TestCollisionWithPopulateDomain:
         empty_registry.populate_domain(
             "crm",
             "http://crm:8080/mcp",
-            [{"name": "list_items", "inputSchema": {}}],
+            [{"name": "list_items", "inputSchema": {"type": "object"}}],
         )
         empty_registry.populate_domain(
             "marketing",
             "http://marketing:8080/mcp",
-            [{"name": "list_items", "inputSchema": {}}],
+            [{"name": "list_items", "inputSchema": {"type": "object"}}],
         )
 
         assert empty_registry.lookup("list_items") is None

@@ -86,6 +86,15 @@ class UpstreamManager:
         Optional :class:`~fastmcp_gateway.access_policy.AccessPolicy` applied
         to every registry population (startup, refresh, and dynamic registration).
         Tools rejected by the policy never enter the registry.
+    sanitizer_trusted_domains:
+        Optional set of domain names for which the description
+        sanitizer will skip the **injection-pattern scan** only. All
+        other sanitation (Unicode normalization, control-character
+        stripping, length cap) and schema validation still apply. Use
+        this for legitimate prompt-processing tools whose descriptions
+        intentionally contain denylist tokens. Passed as an explicit
+        Python-code kwarg (no env-var form) so a deployment mistake
+        can't silently weaken sanitation.
     """
 
     def __init__(
@@ -96,12 +105,18 @@ class UpstreamManager:
         registry_auth_headers: dict[str, str] | None = None,
         upstream_headers: dict[str, dict[str, str]] | None = None,
         policy: AccessPolicy | None = None,
+        sanitizer_trusted_domains: set[str] | None = None,
     ) -> None:
         self._upstreams = upstreams
         self._registry = registry
         self._upstream_headers = upstream_headers or {}
         self._registry_auth_headers = registry_auth_headers
         self._policy = policy
+        # Defensive copy so later mutation by the caller doesn't silently
+        # change sanitation behaviour mid-flight.
+        self._sanitizer_trusted_domains: set[str] = (
+            set(sanitizer_trusted_domains) if sanitizer_trusted_domains else set()
+        )
 
         # Persistent clients for registry operations (no user context).
         self._registry_clients: dict[str, Client] = {}
@@ -179,6 +194,7 @@ class UpstreamManager:
                 tools=raw_tools,
                 policy=self._policy,
                 expected_digest=expected_digest,
+                trusted_domains=self._sanitizer_trusted_domains,
             )
             span.set_attribute("gateway.tool_count", diff.tool_count)
             if diff.refused:

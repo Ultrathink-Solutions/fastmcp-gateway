@@ -32,7 +32,7 @@ def _digest_expectation(names: list[str]) -> str:
             domain="svc",
             group="",
             description="",
-            input_schema={},
+            input_schema={"type": "object"},
             upstream_url="http://svc:8080/mcp",
         )
         for name in names
@@ -83,7 +83,10 @@ class TestPopulateDomainDiff:
         diff = registry.populate_domain(
             "svc",
             "http://svc:8080/mcp",
-            [{"name": "svc_foo", "inputSchema": {}}, {"name": "svc_bar", "inputSchema": {}}],
+            [
+                {"name": "svc_foo", "inputSchema": {"type": "object"}},
+                {"name": "svc_bar", "inputSchema": {"type": "object"}},
+            ],
         )
         assert diff.domain == "svc"
         assert sorted(diff.added) == ["svc_bar", "svc_foo"]
@@ -96,14 +99,20 @@ class TestPopulateDomainDiff:
         registry.populate_domain(
             "svc",
             "http://svc:8080/mcp",
-            [{"name": "svc_old", "inputSchema": {}}, {"name": "svc_kept", "inputSchema": {}}],
+            [
+                {"name": "svc_old", "inputSchema": {"type": "object"}},
+                {"name": "svc_kept", "inputSchema": {"type": "object"}},
+            ],
         )
         # Schema changed (svc_old dropped, svc_new added) — explicit digest required.
         new_expected = _digest_expectation(["svc_new", "svc_kept"])
         diff = registry.populate_domain(
             "svc",
             "http://svc:8080/mcp",
-            [{"name": "svc_new", "inputSchema": {}}, {"name": "svc_kept", "inputSchema": {}}],
+            [
+                {"name": "svc_new", "inputSchema": {"type": "object"}},
+                {"name": "svc_kept", "inputSchema": {"type": "object"}},
+            ],
             expected_digest=new_expected,
         )
         assert diff.added == ["svc_new"]
@@ -113,8 +122,12 @@ class TestPopulateDomainDiff:
     def test_no_change_produces_empty_diff(self) -> None:
         """Identical re-populate produces empty added/removed lists."""
         registry = ToolRegistry()
-        registry.populate_domain("svc", "http://svc:8080/mcp", [{"name": "svc_tool", "inputSchema": {}}])
-        diff = registry.populate_domain("svc", "http://svc:8080/mcp", [{"name": "svc_tool", "inputSchema": {}}])
+        registry.populate_domain(
+            "svc", "http://svc:8080/mcp", [{"name": "svc_tool", "inputSchema": {"type": "object"}}]
+        )
+        diff = registry.populate_domain(
+            "svc", "http://svc:8080/mcp", [{"name": "svc_tool", "inputSchema": {"type": "object"}}]
+        )
         assert diff.added == []
         assert diff.removed == []
         assert diff.tool_count == 1
@@ -122,7 +135,11 @@ class TestPopulateDomainDiff:
     def test_all_removed(self) -> None:
         """Re-populating with empty list (with operator-acknowledged digest) reports all tools as removed."""
         registry = ToolRegistry()
-        registry.populate_domain("svc", "http://svc:8080/mcp", [{"name": "svc_gone", "inputSchema": {}}])
+        registry.populate_domain(
+            "svc",
+            "http://svc:8080/mcp",
+            [{"name": "svc_gone", "inputSchema": {"type": "object"}}],
+        )
         empty_expected = _digest_expectation([])
         diff = registry.populate_domain(
             "svc",
@@ -155,7 +172,7 @@ def _make_fake_tool(name: str) -> MagicMock:
     tool = MagicMock()
     tool.name = name
     tool.description = f"Tool {name}"
-    tool.inputSchema = {}
+    tool.inputSchema = {"type": "object"}
     return tool
 
 
@@ -233,7 +250,7 @@ class TestRefreshRegistryMetaTool:
         registry.populate_domain(
             "apollo",
             "http://apollo:8080/mcp",
-            [{"name": "apollo_search", "description": "Search", "inputSchema": {}}],
+            [{"name": "apollo_search", "description": "Search", "inputSchema": {"type": "object"}}],
         )
 
         with patch("fastmcp_gateway.client_manager.Client"):

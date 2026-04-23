@@ -121,11 +121,19 @@ class GatewayServer:
         ``FastMCP.run()``. HTTP-transport only; the behavior is
         backward-compat when left ``None``.
 
-        Use this to wrap the gateway with ASGI middleware such as host-
-        allowlist filtering, request-id injection, rate limiting, CSP
-        headers, or structured-logging middleware. The middleware list
-        is applied in declaration order (first entry outermost) — same
-        convention as Starlette's ``Middleware`` stack.
+        Typical uses: host-allowlist filtering, request-id injection,
+        rate limiting, CSP headers, structured-logging middleware. The
+        middleware list is applied in declaration order (first entry
+        outermost) — same convention as Starlette's ``Middleware`` stack.
+    sanitizer_trusted_domains:
+        Optional set of domain names whose tool descriptions will skip
+        the registry-ingest **injection-pattern scan** only. Unicode
+        normalization, control-character stripping, length cap, and
+        inputSchema validation remain always-on. Use this for
+        legitimate prompt-processing tools whose descriptions
+        intentionally contain denylist tokens. Accepted as an explicit
+        Python-code kwarg (no env-var form) so a deployment mistake
+        can't silently weaken sanitation.
 
     Usage::
 
@@ -155,6 +163,7 @@ class GatewayServer:
         code_mode_limits: Any | None = None,
         code_mode_audit_verbatim: bool = False,
         middleware: list[Any] | None = None,
+        sanitizer_trusted_domains: set[str] | None = None,
     ) -> None:
         # Accept either a plain URL mapping or an object-shaped mapping with
         # per-entry allowed_tools / denied_tools.  The explicit access_policy
@@ -239,6 +248,7 @@ class GatewayServer:
             registry_auth_headers=registry_auth_headers,
             upstream_headers=upstream_headers,
             policy=effective_policy,
+            sanitizer_trusted_domains=sanitizer_trusted_domains,
         )
         self._mcp = FastMCP(
             name,
