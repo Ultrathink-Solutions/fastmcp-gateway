@@ -6,6 +6,7 @@ import asyncio
 import hmac
 import inspect
 import logging
+import warnings
 from contextlib import asynccontextmanager, suppress
 from typing import TYPE_CHECKING, Any
 
@@ -14,6 +15,10 @@ from fastmcp import FastMCP
 from fastmcp_gateway.access_policy import AccessPolicy, normalize_upstreams
 from fastmcp_gateway.client_manager import UpstreamManager
 from fastmcp_gateway.hooks import HookRunner
+from fastmcp_gateway.registration_auth import (
+    RegistrationAuthError,
+    RegistrationTokenValidator,
+)
 from fastmcp_gateway.registry import ToolRegistry
 from fastmcp_gateway.url_guard import (
     RegistrationGuardError,
@@ -79,6 +84,27 @@ class GatewayServer:
         routes for dynamic upstream registration.  Callers must send
         ``Authorization: Bearer <token>``.  When ``None`` (default),
         the registration endpoints are **not** mounted.
+
+        .. deprecated::
+            The static-bearer path is retained for one release to
+            give deployments a migration window; new deployments
+            should use *registration_validator* with a short-lived
+            signed JWT instead.  Constructing with
+            *registration_token* emits a :class:`DeprecationWarning`.
+        Mutually exclusive with *registration_validator*; setting
+        both raises :class:`ValueError` at construction.
+    registration_validator:
+        Optional :class:`~fastmcp_gateway.registration_auth.RegistrationTokenValidator`
+        that authenticates callers of ``/registry/servers``.  When
+        set, the gateway exposes the same POST / DELETE / GET routes
+        but delegates bearer validation to the validator — which
+        typically verifies a short-lived signed JWT with issuer /
+        audience / expiry claims, giving per-caller identity,
+        automatic rotation, and an audit-log trail that a shared
+        static bearer cannot provide.  When ``None`` (default) the
+        static-bearer path (if *registration_token* is set) or
+        no-registration behaviour applies.  Mutually exclusive with
+        *registration_token*.
     access_policy:
         Optional :class:`AccessPolicy` applied to every registry population
         (startup, refresh, dynamic registration).  Tools rejected by the
@@ -157,6 +183,7 @@ class GatewayServer:
         refresh_interval: float | None = None,
         hooks: list[Any] | None = None,
         registration_token: str | None = None,
+        registration_validator: RegistrationTokenValidator | None = None,
         access_policy: AccessPolicy | None = None,
         code_mode: bool = False,
         code_mode_authorizer: Any | None = None,
@@ -178,7 +205,31 @@ class GatewayServer:
         self._refresh_interval = refresh_interval
         self._refresh_task: asyncio.Task[None] | None = None
         self._hook_runner = HookRunner(hooks)
+        # Mutual exclusion between the deprecated static-bearer path
+        # and the new validator path is enforced at construction so
+        # that misconfigurations fail loudly at startup instead of
+        # silently falling through to one path or the other — which
+        # would be a footgun if an operator thought they had migrated
+        # to the validator but the static token was still honoured.
+        if registration_token is not None and registration_validator is not None:
+            raise ValueError(
+                "registration_token and registration_validator are mutually exclusive; "
+                "pass only one (registration_validator is preferred — registration_token "
+                "is deprecated and will be removed in a future release)."
+            )
+        if registration_token is not None:
+            # One-release deprecation window.  Stacklevel=2 attributes
+            # the warning to the caller constructing ``GatewayServer``
+            # rather than to this module itself.
+            warnings.warn(
+                "registration_token is deprecated; pass a registration_validator "
+                "(e.g. JWTRegistrationValidator) instead. The static-bearer path "
+                "will be removed in a future release.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         self._registration_token = registration_token
+        self._registration_validator = registration_validator
         self._access_policy = effective_policy
         self._code_mode = code_mode
         # Require an explicit authorizer when code_mode is on.  Auto-discovery
@@ -257,7 +308,10 @@ class GatewayServer:
         )
         self._register_meta_tools()
         self._register_health_routes()
-        if registration_token:
+        # Routes are mounted whenever *either* authentication mode is
+        # configured.  The ``_check_auth`` closure below picks the
+        # right validator at request time.
+        if registration_token or registration_validator is not None:
             self._register_registry_routes()
 
     @property
@@ -477,9 +531,11 @@ class GatewayServer:
     def _register_registry_routes(self) -> None:
         """Register /registry/servers REST endpoints for dynamic upstream management.
 
-        Only mounted when ``registration_token`` is provided at construction.
-        All endpoints require ``Authorization: Bearer <token>`` matching
-        the configured ``GATEWAY_REGISTRATION_TOKEN``.
+        Mounted whenever *either* ``registration_token`` (legacy,
+        deprecated) or ``registration_validator`` was provided at
+        construction.  The per-request ``_check_auth`` closure picks
+        the right validator: validator path first (preferred) then
+        static-bearer fallback, then 401.
         """
         import json as _json
 
@@ -487,26 +543,75 @@ class GatewayServer:
         from starlette.responses import JSONResponse
 
         token = self._registration_token
+        validator = self._registration_validator
         gateway = self  # Capture for closures.
 
-        expected_header = f"Bearer {token}"
+        # Only build the constant-time comparison header when the
+        # legacy path is active.  ``None`` here means "validator path
+        # only" — the fallback branch in ``_check_auth`` just returns
+        # 401.
+        expected_header = f"Bearer {token}" if token else None
 
-        def _check_auth(request: Request) -> JSONResponse | None:
+        def _check_auth(request: Request, *, route: str) -> JSONResponse | None:
             """Return an error response if the request is not authorized.
 
-            Uses ``hmac.compare_digest`` to prevent timing side-channel attacks.
+            Validator path is tried first when configured.  On success
+            emits a structured audit log so the gateway has a record
+            of the authenticated principal per registration event.
+            Static-bearer path uses ``hmac.compare_digest`` to keep
+            timing-side-channel resistance.
             """
             auth = request.headers.get("authorization", "")
-            if not hmac.compare_digest(auth, expected_header):
-                return JSONResponse(
-                    {"error": "Unauthorized", "code": "unauthorized"},
-                    status_code=401,
+            if validator is not None:
+                try:
+                    claims = validator.validate(auth)
+                except RegistrationAuthError:
+                    return JSONResponse(
+                        {"error": "Unauthorized", "code": "unauthorized"},
+                        status_code=401,
+                    )
+                # Audit fields are emitted both in the message body (so
+                # they show up under the default CLI formatter, which
+                # only renders ``%(message)s`` and ignores ``extra``
+                # attributes) and via ``extra=`` (so structured handlers
+                # — JSON/OTEL log shippers — still see them as separate
+                # record attributes).  ``jti`` is optional in the claims
+                # payload; render ``"-"`` in the text form when absent
+                # rather than the Python literal ``None``.
+                logger.info(
+                    "registry.auth.ok subject=%s jti=%s iat=%s route=%s",
+                    claims.subject,
+                    claims.jti or "-",
+                    claims.issued_at.isoformat(),
+                    route,
+                    extra={
+                        "subject": claims.subject,
+                        "jti": claims.jti,
+                        "iat": claims.issued_at.isoformat(),
+                        "route": route,
+                    },
                 )
-            return None
+                return None
+            if expected_header is not None:
+                if not hmac.compare_digest(auth, expected_header):
+                    return JSONResponse(
+                        {"error": "Unauthorized", "code": "unauthorized"},
+                        status_code=401,
+                    )
+                return None
+            # Neither path configured — refuse by default.  Routes
+            # shouldn't be mounted in this case, but belt-and-
+            # suspenders: a future refactor that mounts routes
+            # unconditionally should not silently permit unauth'd
+            # access.
+            return JSONResponse(
+                {"error": "No registration authentication configured", "code": "unauthorized"},
+                status_code=401,
+            )
 
         @self._mcp.custom_route("/registry/servers", methods=["POST"])
         async def _register_server(request: Request) -> JSONResponse:
-            auth_err = _check_auth(request)
+            auth_err = _check_auth(request, route="register")
             if auth_err:
                 return auth_err
 
@@ -583,7 +688,7 @@ class GatewayServer:
 
         @self._mcp.custom_route("/registry/servers/{domain}", methods=["DELETE"])
         async def _deregister_server(request: Request) -> JSONResponse:
-            auth_err = _check_auth(request)
+            auth_err = _check_auth(request, route="deregister")
             if auth_err:
                 return auth_err
 
@@ -613,7 +718,7 @@ class GatewayServer:
 
         @self._mcp.custom_route("/registry/servers", methods=["GET"])
         async def _list_servers(request: Request) -> JSONResponse:
-            auth_err = _check_auth(request)
+            auth_err = _check_auth(request, route="list")
             if auth_err:
                 return auth_err
 
@@ -650,7 +755,7 @@ class GatewayServer:
             per-call query-param shape forces every transition to be
             an intentional, audited operator action.
             """
-            auth_err = _check_auth(request)
+            auth_err = _check_auth(request, route="refresh")
             if auth_err:
                 return auth_err
 

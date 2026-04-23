@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.0] - 2026-04-23
+
+### Added
+
+- **`RegistrationTokenValidator` protocol + `JWTRegistrationValidator`** in `fastmcp_gateway.registration_auth`: abstract validator shape + concrete JWT-based implementation that verifies `iss`, `aud`, `exp`, and signature on each registration bearer. Gives per-caller identity, automatic rotation (short expiry), and an audit-log trail that a shared static bearer cannot provide.
+- **`registration_validator` kwarg on `GatewayServer`**: accepts any `RegistrationTokenValidator`. Mutually exclusive with the existing `registration_token` kwarg — setting both raises `ValueError` at construction. When set, `/registry/servers` routes delegate bearer validation to the validator and 401-reject any bearer the validator rejects.
+- **Audit log on successful validation**: each authenticated registration request emits a structured `registry.auth.ok` log line with `subject`, `jti`, `iat`, and `route` fields — the JWT-validator path is the only path that produces this record (the legacy static-bearer path has no principal to record).
+- **`GATEWAY_REGISTRATION_ISSUER` / `GATEWAY_REGISTRATION_AUDIENCE` / `GATEWAY_REGISTRATION_VERIFY_KEY` env vars**: when all three are set, the CLI entry point auto-constructs a `JWTRegistrationValidator`. Partial configuration (any subset) is a startup error. `GATEWAY_REGISTRATION_VERIFY_KEY` is a PEM public key and may be multi-line.
+- **`GATEWAY_REGISTRATION_ALGORITHMS` env var**: optional comma-separated override of accepted JWT signing algorithms (default `ES256`). The string `none` is explicitly rejected.
+- **New dependency `PyJWT[crypto]>=2.8`**: pulls in `cryptography` (~7MB wheel) required for signature verification. The `import jwt` call is deferred to `JWTRegistrationValidator.__init__` so deployments that stay on the static-bearer path — or disable registration — don't pay the import cost at module-load time.
+
+### Deprecated
+
+- **`registration_token` kwarg + `GATEWAY_REGISTRATION_TOKEN` env var**: the shared-static-bearer registration path is retained for one release to give deployments a migration window, but constructing `GatewayServer(registration_token=...)` now emits a `DeprecationWarning`. Migrate to `registration_validator` (programmatic) or the three JWT env vars (CLI). The static-bearer path will be removed in a future release.
+
+### Notes
+
+- **Mutual exclusion is enforced at two layers**: `GatewayServer.__init__` raises `ValueError` when both `registration_token` and `registration_validator` are passed, and the CLI entry point performs the same check across the static-token env and the JWT env vars so the error surfaces at startup rather than at first registration request.
+- **No `jti` replay cache in this release**: short expiry (recommended ≤ 5 minutes at the issuer) is the primary replay mitigation. A `jti` cache can be layered on top of a validator without changing the public surface; it's deferred to a future ticket.
+
 ## [0.16.0] - 2026-04-23
 
 Security-hardening release. Closes a prompt-injection surface on
@@ -508,6 +528,7 @@ Security-hardening release. Closes two code-injection primitives in the env-driv
 
 - Migrated `ToolEntry` and `DomainInfo` from dataclasses to Pydantic models (#9)
 
+[0.17.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.13.0...v0.14.0
