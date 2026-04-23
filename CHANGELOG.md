@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.0] - 2026-04-23
+
+Security-hardening release. Closes a scope-probing information-leak in the
+fuzzy-match suggestion surface of ``get_tool_schema`` and ``execute_tool``.
+
+### Changed
+
+- **"Did you mean" suggestions now respect visibility filters**: the
+  ``get_tool_schema`` and ``execute_tool`` meta-tools previously fed
+  ``registry.get_all_tool_names()`` into ``_suggest_tool_names``, which let a
+  caller with narrow scopes enumerate every registered tool by sending garbage
+  tool-name lookups and reading the suggestions back from the error response.
+  Both call sites now route candidates through the same hook-level filter that
+  ``tools/list`` uses (via a new ``_visible_tool_names`` closure), so the
+  suggestion surface is a strict subset of what the caller could already see
+  through ``discover_tools``.
+
+### Notes
+
+- **Zero behavior change for trusted callers**: a caller whose visibility
+  already covers the registry sees identical suggestions. Only callers who
+  were relying on the leak (i.e. probing the registry despite being filtered)
+  observe a difference — and that's the fix.
+- **Guard test included**: ``tests/test_suggest_visibility.py`` adds a
+  structural assertion that the suggestion surface stays a subset of
+  ``discover_tools`` output for the same caller, catching any future drift
+  where the suggestion path reconstructs its own parallel filter.
+
 ## [0.12.0] - 2026-04-21
 
 ### Added
@@ -311,6 +339,7 @@ Security-hardening release. Closes two code-injection primitives in the env-driv
 
 - Migrated `ToolEntry` and `DomainInfo` from dataclasses to Pydantic models (#9)
 
+[0.13.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.10.1...v0.11.0
 [0.10.1]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.10.0...v0.10.1

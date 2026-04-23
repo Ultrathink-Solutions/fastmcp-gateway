@@ -88,6 +88,22 @@ def register_meta_tools(
         ctx = ListToolsContext(domain=domain, headers=headers, user=user)
         return await hook_runner.run_after_list_tools(tools, ctx)
 
+    async def _visible_tool_names() -> list[str]:
+        """Return the sorted list of tool names visible to the caller.
+
+        Collects every registered tool, routes them through the same
+        ``_filter_tools`` closure that ``discover_tools`` uses for the
+        domain-summary mode, and returns just the names. This keeps the
+        fuzzy-match "did you mean" suggestion surface aligned with the
+        tools/list visibility filter so a caller with narrow scopes can
+        never probe the full registry via garbage tool-name lookups.
+        """
+        all_tools: list[ToolEntry] = []
+        for d in registry.get_domain_names():
+            all_tools.extend(registry.get_tools_by_domain(d))
+        visible = await _filter_tools(all_tools, None)
+        return sorted(t.name for t in visible)
+
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True))
     async def discover_tools(
         domain: str | None = None,
@@ -265,7 +281,7 @@ def register_meta_tools(
                 )
 
             # Unknown tool (or filtered out) — suggest similar names
-            suggestions = _suggest_tool_names(tool_name, registry.get_all_tool_names())
+            suggestions = _suggest_tool_names(tool_name, await _visible_tool_names())
             if suggestions:
                 hint = f"Did you mean {', '.join(repr(s) for s in suggestions)}?"
             else:
@@ -294,7 +310,7 @@ def register_meta_tools(
             # Validate tool exists
             entry = registry.lookup(tool_name)
             if entry is None:
-                suggestions = _suggest_tool_names(tool_name, registry.get_all_tool_names())
+                suggestions = _suggest_tool_names(tool_name, await _visible_tool_names())
                 if suggestions:
                     hint = f"Did you mean {', '.join(repr(s) for s in suggestions)}?"
                 else:
