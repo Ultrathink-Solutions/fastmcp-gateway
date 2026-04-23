@@ -144,8 +144,20 @@ class UpstreamManager:
         diff = await self._populate_domain(domain, client)
         return diff.tool_count
 
-    async def _populate_domain(self, domain: str, client: Client) -> RegistryDiff:
-        """Connect to *client*, list its tools, and register them."""
+    async def _populate_domain(
+        self,
+        domain: str,
+        client: Client,
+        *,
+        expected_digest: str | None = None,
+    ) -> RegistryDiff:
+        """Connect to *client*, list its tools, and register them.
+
+        *expected_digest*, when set, is threaded through to
+        :meth:`ToolRegistry.populate_domain` to explicitly acknowledge a
+        schema contract change.  See that method's docstring for the
+        full integrity-gate semantics.
+        """
         with _tracer.start_as_current_span("gateway.populate_domain") as span:
             span.set_attribute("gateway.domain", domain)
 
@@ -166,8 +178,11 @@ class UpstreamManager:
                 upstream_url=str(self._upstreams[domain]),
                 tools=raw_tools,
                 policy=self._policy,
+                expected_digest=expected_digest,
             )
             span.set_attribute("gateway.tool_count", diff.tool_count)
+            if diff.refused:
+                span.set_attribute("gateway.schema_refused", True)
             return diff
 
     # ------------------------------------------------------------------
@@ -191,13 +206,25 @@ class UpstreamManager:
             span.set_attribute("gateway.domain_count", len(diffs))
             return diffs
 
-    async def refresh_domain(self, domain: str) -> RegistryDiff:
+    async def refresh_domain(
+        self,
+        domain: str,
+        *,
+        expected_digest: str | None = None,
+    ) -> RegistryDiff:
         """Re-populate a single domain and return the diff.
+
+        When *expected_digest* is set, the refresh explicitly
+        acknowledges a schema contract change.  If the candidate digest
+        (computed from the upstream's current ``tools/list`` payload)
+        matches *expected_digest*, the transition commits; otherwise the
+        refresh is refused and the returned diff has ``refused=True``.
+        See :meth:`ToolRegistry.populate_domain` for the full semantics.
 
         Raises ``KeyError`` if *domain* is not a configured upstream.
         """
         client = self._registry_clients[domain]
-        return await self._populate_domain(domain, client)
+        return await self._populate_domain(domain, client, expected_digest=expected_digest)
 
     # ------------------------------------------------------------------
     # Tool execution (fresh client per request)

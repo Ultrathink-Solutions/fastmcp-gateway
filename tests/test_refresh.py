@@ -13,7 +13,32 @@ from pydantic import ValidationError
 from fastmcp_gateway.client_manager import UpstreamManager
 from fastmcp_gateway.gateway import GatewayServer
 from fastmcp_gateway.meta_tools import register_meta_tools
-from fastmcp_gateway.registry import RegistryDiff, ToolRegistry
+from fastmcp_gateway.registry import RegistryDiff, ToolEntry, ToolRegistry, compute_schema_digest
+
+
+def _digest_expectation(names: list[str]) -> str:
+    """Compute the expected digest via the public API for a set of tool names.
+
+    Wraps each name in a minimal :class:`ToolEntry` (empty description, empty
+    input schema, fixed upstream URL) and feeds the list through
+    :func:`compute_schema_digest`. This exercises the same public path the
+    gateway uses for digest computation, so tests catch any drift between
+    ``compute_schema_digest`` and the raw-dict digest path inside
+    ``populate_domain``.
+    """
+    entries = [
+        ToolEntry(
+            name=name,
+            domain="svc",
+            group="",
+            description="",
+            input_schema={},
+            upstream_url="http://svc:8080/mcp",
+        )
+        for name in names
+    ]
+    return compute_schema_digest(entries)
+
 
 # ---------------------------------------------------------------------------
 # RegistryDiff model
@@ -66,17 +91,20 @@ class TestPopulateDomainDiff:
         assert diff.tool_count == 2
 
     def test_repopulate_detects_changes(self) -> None:
-        """Re-populating detects added and removed tools."""
+        """Re-populating detects added and removed tools (with operator-acknowledged digest)."""
         registry = ToolRegistry()
         registry.populate_domain(
             "svc",
             "http://svc:8080/mcp",
             [{"name": "svc_old", "inputSchema": {}}, {"name": "svc_kept", "inputSchema": {}}],
         )
+        # Schema changed (svc_old dropped, svc_new added) — explicit digest required.
+        new_expected = _digest_expectation(["svc_new", "svc_kept"])
         diff = registry.populate_domain(
             "svc",
             "http://svc:8080/mcp",
             [{"name": "svc_new", "inputSchema": {}}, {"name": "svc_kept", "inputSchema": {}}],
+            expected_digest=new_expected,
         )
         assert diff.added == ["svc_new"]
         assert diff.removed == ["svc_old"]
@@ -92,10 +120,16 @@ class TestPopulateDomainDiff:
         assert diff.tool_count == 1
 
     def test_all_removed(self) -> None:
-        """Re-populating with empty list reports all tools as removed."""
+        """Re-populating with empty list (with operator-acknowledged digest) reports all tools as removed."""
         registry = ToolRegistry()
         registry.populate_domain("svc", "http://svc:8080/mcp", [{"name": "svc_gone", "inputSchema": {}}])
-        diff = registry.populate_domain("svc", "http://svc:8080/mcp", [])
+        empty_expected = _digest_expectation([])
+        diff = registry.populate_domain(
+            "svc",
+            "http://svc:8080/mcp",
+            [],
+            expected_digest=empty_expected,
+        )
         assert diff.added == []
         assert diff.removed == ["svc_gone"]
         assert diff.tool_count == 0

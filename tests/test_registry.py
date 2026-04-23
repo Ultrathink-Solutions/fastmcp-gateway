@@ -349,7 +349,9 @@ class TestPopulateDomain:
         assert tool_baz is not None and tool_baz.group == "foo"
 
     def test_populate_clears_previous(self, empty_registry: ToolRegistry) -> None:
-        """Re-populating a domain replaces its tools entirely."""
+        """Re-populating a domain (with operator-acknowledged digest) replaces its tools entirely."""
+        from fastmcp_gateway.registry import _digest_from_triples
+
         empty_registry.populate_domain(
             "dom",
             "http://x:8080/mcp",
@@ -357,10 +359,14 @@ class TestPopulateDomain:
         )
         assert empty_registry.lookup("dom_old_tool") is not None
 
+        # Schema change between the two populates requires the operator
+        # to explicitly acknowledge the new contract via expected_digest.
+        new_expected = _digest_from_triples([("dom_new_tool", "", {})])
         empty_registry.populate_domain(
             "dom",
             "http://x:8080/mcp",
             [{"name": "dom_new_tool", "inputSchema": {}}],
+            expected_digest=new_expected,
         )
 
         assert empty_registry.lookup("dom_old_tool") is None
