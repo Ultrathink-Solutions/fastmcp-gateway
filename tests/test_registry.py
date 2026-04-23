@@ -313,9 +313,9 @@ class TestPopulateDomain:
 
     def test_populate_infers_groups(self, empty_registry: ToolRegistry) -> None:
         raw_tools = [
-            {"name": "mydom_alpha_one", "inputSchema": {}},
-            {"name": "mydom_alpha_two", "inputSchema": {}},
-            {"name": "mydom_beta_three", "inputSchema": {}},
+            {"name": "mydom_alpha_one", "inputSchema": {"type": "object"}},
+            {"name": "mydom_alpha_two", "inputSchema": {"type": "object"}},
+            {"name": "mydom_beta_three", "inputSchema": {"type": "object"}},
         ]
         empty_registry.populate_domain("mydom", "http://x:8080/mcp", raw_tools)
 
@@ -324,8 +324,8 @@ class TestPopulateDomain:
     def test_populate_fallback_group(self, empty_registry: ToolRegistry) -> None:
         """Tools without the domain prefix get assigned to 'general'."""
         raw_tools = [
-            {"name": "standalone_tool", "inputSchema": {}},
-            {"name": "another_one", "inputSchema": {}},
+            {"name": "standalone_tool", "inputSchema": {"type": "object"}},
+            {"name": "another_one", "inputSchema": {"type": "object"}},
         ]
         empty_registry.populate_domain("mydom", "http://x:8080/mcp", raw_tools)
 
@@ -333,8 +333,8 @@ class TestPopulateDomain:
 
     def test_populate_with_group_overrides(self, empty_registry: ToolRegistry) -> None:
         raw_tools = [
-            {"name": "svc_foo_bar", "inputSchema": {}},
-            {"name": "svc_foo_baz", "inputSchema": {}},
+            {"name": "svc_foo_bar", "inputSchema": {"type": "object"}},
+            {"name": "svc_foo_baz", "inputSchema": {"type": "object"}},
         ]
         empty_registry.populate_domain(
             "svc",
@@ -355,17 +355,17 @@ class TestPopulateDomain:
         empty_registry.populate_domain(
             "dom",
             "http://x:8080/mcp",
-            [{"name": "dom_old_tool", "inputSchema": {}}],
+            [{"name": "dom_old_tool", "inputSchema": {"type": "object"}}],
         )
         assert empty_registry.lookup("dom_old_tool") is not None
 
         # Schema change between the two populates requires the operator
         # to explicitly acknowledge the new contract via expected_digest.
-        new_expected = _digest_from_triples([("dom_new_tool", "", {})])
+        new_expected = _digest_from_triples([("dom_new_tool", "", {"type": "object"})])
         empty_registry.populate_domain(
             "dom",
             "http://x:8080/mcp",
-            [{"name": "dom_new_tool", "inputSchema": {}}],
+            [{"name": "dom_new_tool", "inputSchema": {"type": "object"}}],
             expected_digest=new_expected,
         )
 
@@ -375,8 +375,8 @@ class TestPopulateDomain:
 
     def test_populate_skips_empty_names(self, empty_registry: ToolRegistry) -> None:
         raw_tools = [
-            {"name": "", "inputSchema": {}},
-            {"name": "valid_tool", "inputSchema": {}},
+            {"name": "", "inputSchema": {"type": "object"}},
+            {"name": "valid_tool", "inputSchema": {"type": "object"}},
         ]
         diff = empty_registry.populate_domain("dom", "http://x:8080/mcp", raw_tools)
         assert diff.tool_count == 1
@@ -384,15 +384,23 @@ class TestPopulateDomain:
         assert diff.removed == []
         assert empty_registry.tool_count == 1
 
-    def test_populate_missing_fields_use_defaults(self, empty_registry: ToolRegistry) -> None:
-        """Tools with missing description/inputSchema get sensible defaults."""
-        raw_tools = [{"name": "dom_minimal"}]
+    def test_populate_missing_description_uses_default(self, empty_registry: ToolRegistry) -> None:
+        """A tool with a valid but minimal inputSchema and no description
+        registers with an empty-string description."""
+        raw_tools = [{"name": "dom_minimal", "inputSchema": {"type": "object"}}]
         empty_registry.populate_domain("dom", "http://x:8080/mcp", raw_tools)
 
         tool = empty_registry.lookup("dom_minimal")
         assert tool is not None
         assert tool.description == ""
-        assert tool.input_schema == {}
+        assert tool.input_schema == {"type": "object"}
+
+    def test_populate_missing_input_schema_rejects_tool(self, empty_registry: ToolRegistry) -> None:
+        """A tool whose inputSchema is missing (defaults to {}) fails the
+        strict validator and is skipped, not registered."""
+        raw_tools = [{"name": "dom_no_schema"}]
+        empty_registry.populate_domain("dom", "http://x:8080/mcp", raw_tools)
+        assert empty_registry.lookup("dom_no_schema") is None
 
     def test_populate_empty_tool_list(self, empty_registry: ToolRegistry) -> None:
         diff = empty_registry.populate_domain(
@@ -409,7 +417,7 @@ class TestPopulateDomain:
         empty_registry.populate_domain(
             "dom",
             "http://x:8080/mcp",
-            [{"name": "dom_tool", "inputSchema": {}}],
+            [{"name": "dom_tool", "inputSchema": {"type": "object"}}],
             description="My domain description",
         )
         info = empty_registry.get_domain_info()

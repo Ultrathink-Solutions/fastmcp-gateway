@@ -73,7 +73,7 @@ class TestDomainDescriptions:
         gw.registry.populate_domain(
             "svc",
             "http://svc:8080/mcp",
-            [{"name": "svc_ping", "inputSchema": {}}],
+            [{"name": "svc_ping", "inputSchema": {"type": "object"}}],
         )
 
         # Mock populate_all to return the pre-populated result.
@@ -123,14 +123,14 @@ class TestDynamicInstructions:
         gw.registry.populate_domain(
             "apollo",
             "http://apollo:8080/mcp",
-            [{"name": "apollo_search", "inputSchema": {}}],
+            [{"name": "apollo_search", "inputSchema": {"type": "object"}}],
         )
         gw.registry.populate_domain(
             "hubspot",
             "http://hubspot:8080/mcp",
             [
-                {"name": "hubspot_contacts_list", "inputSchema": {}},
-                {"name": "hubspot_deals_list", "inputSchema": {}},
+                {"name": "hubspot_contacts_list", "inputSchema": {"type": "object"}},
+                {"name": "hubspot_deals_list", "inputSchema": {"type": "object"}},
             ],
         )
 
@@ -153,9 +153,9 @@ class TestDynamicInstructions:
             "svc",
             "http://svc:8080/mcp",
             [
-                {"name": "svc_a", "inputSchema": {}},
-                {"name": "svc_b", "inputSchema": {}},
-                {"name": "svc_c", "inputSchema": {}},
+                {"name": "svc_a", "inputSchema": {"type": "object"}},
+                {"name": "svc_b", "inputSchema": {"type": "object"}},
+                {"name": "svc_c", "inputSchema": {"type": "object"}},
             ],
         )
 
@@ -176,7 +176,7 @@ class TestDynamicInstructions:
         gw.registry.populate_domain(
             "svc",
             "http://svc:8080/mcp",
-            [{"name": "svc_ping", "inputSchema": {}}],
+            [{"name": "svc_ping", "inputSchema": {"type": "object"}}],
         )
 
         with patch.object(gw.upstream_manager, "populate_all", return_value={"svc": 1}):
@@ -206,7 +206,7 @@ class TestDynamicInstructions:
         gw.registry.populate_domain(
             "svc",
             "http://svc:8080/mcp",
-            [{"name": "svc_ping", "inputSchema": {}}],
+            [{"name": "svc_ping", "inputSchema": {"type": "object"}}],
         )
 
         with patch.object(gw.upstream_manager, "populate_all", return_value={"svc": 1}):

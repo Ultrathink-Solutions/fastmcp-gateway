@@ -200,10 +200,10 @@ class TestRegistryFiltering:
             "crm",
             "http://crm:8080/mcp",
             [
-                {"name": "crm_search_people", "inputSchema": {}},
-                {"name": "crm_search_accounts", "inputSchema": {}},
-                {"name": "crm_delete_record", "inputSchema": {}},
-                {"name": "crm_admin_impersonate", "inputSchema": {}},
+                {"name": "crm_search_people", "inputSchema": {"type": "object"}},
+                {"name": "crm_search_accounts", "inputSchema": {"type": "object"}},
+                {"name": "crm_delete_record", "inputSchema": {"type": "object"}},
+                {"name": "crm_admin_impersonate", "inputSchema": {"type": "object"}},
             ],
             policy=policy,
         )
@@ -220,8 +220,8 @@ class TestRegistryFiltering:
             "crm",
             "http://crm:8080/mcp",
             [
-                {"name": "crm_search_people", "inputSchema": {}},
-                {"name": "crm_delete_record", "inputSchema": {}},
+                {"name": "crm_search_people", "inputSchema": {"type": "object"}},
+                {"name": "crm_delete_record", "inputSchema": {"type": "object"}},
             ],
         )
         assert diff.tool_count == 2
@@ -234,8 +234,8 @@ class TestRegistryFiltering:
             "crm",
             "http://crm:8080/mcp",
             [
-                {"name": "crm_search", "inputSchema": {}},
-                {"name": "crm_delete", "inputSchema": {}},
+                {"name": "crm_search", "inputSchema": {"type": "object"}},
+                {"name": "crm_delete", "inputSchema": {"type": "object"}},
             ],
             policy=policy,
         )
@@ -259,8 +259,8 @@ class TestRegistryFiltering:
             "http://crm:8080/mcp",
             [
                 # Upstream advertises "get_server_info" (no domain prefix).
-                {"name": "get_server_info", "inputSchema": {}},
-                {"name": "delete_account", "inputSchema": {}},
+                {"name": "get_server_info", "inputSchema": {"type": "object"}},
+                {"name": "delete_account", "inputSchema": {"type": "object"}},
             ],
             policy=policy,
         )
@@ -279,8 +279,8 @@ class TestRegistryFiltering:
             "crm",
             "http://crm:8080/mcp",
             [
-                {"name": "get_server_info", "inputSchema": {}},
-                {"name": "delete_account", "inputSchema": {}},
+                {"name": "get_server_info", "inputSchema": {"type": "object"}},
+                {"name": "delete_account", "inputSchema": {"type": "object"}},
             ],
             policy=policy,
         )
@@ -323,7 +323,7 @@ class TestGatewayIntegration:
 
             async def __aexit__(self, *_exc: Any) -> None: ...
             async def list_tools(self) -> list[_StubTool]:
-                return [_StubTool(t["name"], t.get("inputSchema", {})) for t in raw_tools]
+                return [_StubTool(t["name"], t.get("inputSchema", {"type": "object"})) for t in raw_tools]
 
             @property
             def transport(self) -> Any:  # pragma: no cover - header pathway is untested here
@@ -334,8 +334,8 @@ class TestGatewayIntegration:
     @pytest.mark.asyncio
     async def test_object_shaped_upstreams_filter_through_registry(self) -> None:
         tools = [
-            {"name": "crm_search_people", "inputSchema": {}},
-            {"name": "crm_delete", "inputSchema": {}},
+            {"name": "crm_search_people", "inputSchema": {"type": "object"}},
+            {"name": "crm_delete", "inputSchema": {"type": "object"}},
         ]
         with self._patch_client_with_tools(tools):
             gw = GatewayServer(
@@ -356,8 +356,8 @@ class TestGatewayIntegration:
     async def test_explicit_access_policy_wins_over_inline(self) -> None:
         explicit = AccessPolicy(allow={"crm": ["crm_read_*"]})
         tools = [
-            {"name": "crm_read_item", "inputSchema": {}},
-            {"name": "crm_search_item", "inputSchema": {}},
+            {"name": "crm_read_item", "inputSchema": {"type": "object"}},
+            {"name": "crm_search_item", "inputSchema": {"type": "object"}},
         ]
         with self._patch_client_with_tools(tools):
             gw = GatewayServer(
@@ -377,8 +377,8 @@ class TestGatewayIntegration:
     @pytest.mark.asyncio
     async def test_plain_upstreams_have_no_policy_filter(self) -> None:
         tools = [
-            {"name": "crm_search", "inputSchema": {}},
-            {"name": "crm_delete", "inputSchema": {}},
+            {"name": "crm_search", "inputSchema": {"type": "object"}},
+            {"name": "crm_delete", "inputSchema": {"type": "object"}},
         ]
         with self._patch_client_with_tools(tools):
             gw = GatewayServer({"crm": "http://crm:8080/mcp"})
@@ -390,8 +390,8 @@ class TestGatewayIntegration:
     async def test_policy_propagates_to_registry(self) -> None:
         policy = AccessPolicy(allow={"crm": ["crm_search_*"]})
         tools = [
-            {"name": "crm_search_people", "inputSchema": {}},
-            {"name": "crm_delete", "inputSchema": {}},
+            {"name": "crm_search_people", "inputSchema": {"type": "object"}},
+            {"name": "crm_delete", "inputSchema": {"type": "object"}},
         ]
         with self._patch_client_with_tools(tools):
             gw = GatewayServer(
@@ -422,8 +422,8 @@ class TestMetaToolBehaviour:
             "crm",
             "http://crm:8080/mcp",
             [
-                {"name": "crm_search", "inputSchema": {}, "description": "Search"},
-                {"name": "crm_delete", "inputSchema": {}, "description": "Delete"},
+                {"name": "crm_search", "inputSchema": {"type": "object"}, "description": "Search"},
+                {"name": "crm_delete", "inputSchema": {"type": "object"}, "description": "Delete"},
             ],
             policy=policy,
         )
@@ -437,8 +437,8 @@ class TestMetaToolBehaviour:
             "crm",
             "http://crm:8080/mcp",
             [
-                {"name": "crm_search", "inputSchema": {}},
-                {"name": "crm_admin_impersonate", "inputSchema": {}},
+                {"name": "crm_search", "inputSchema": {"type": "object"}},
+                {"name": "crm_admin_impersonate", "inputSchema": {"type": "object"}},
             ],
             policy=policy,
         )

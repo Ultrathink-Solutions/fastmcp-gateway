@@ -5,6 +5,84 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.0] - 2026-04-23
+
+Security-hardening release. Closes a prompt-injection surface on
+``ToolRegistry.populate_domain`` where upstream tool descriptions (and
+``inputSchema`` documents) crossed the gateway boundary without
+normalization or denylist scanning, and adds input-schema validation
+at registry ingest.
+
+### Added
+
+- **`fastmcp_gateway.sanitize` module**: new description sanitizer and
+  inputSchema validator applied inside ``ToolRegistry.populate_domain``
+  (the registry ingest path). ``sanitize_description()`` runs a fixed pipeline —
+  type-guard for non-string descriptions, NFC normalization, C0 /
+  zero-width / bidi-format-control stripping, injection-pattern scrub
+  against the shared ``INJECTION_PATTERNS`` denylist, and a 2048-char
+  length cap with a ``" [truncated]"`` marker. ``validate_input_schema()``
+  rejects schemas with ``$ref`` (TOCTOU risk against the sandbox),
+  schemas nested beyond depth 5, non-object root types, and non-dict
+  ``properties`` values.
+- **`fastmcp_gateway.injection_patterns` module**: shared denylist of
+  regex patterns (``ignore all previous instructions``, ``<system>``
+  tags, etc.) compiled once at import time with ``IGNORECASE`` +
+  ``DOTALL`` so case-variant and newline-split attempts still match.
+  Exposed as a separate module so follow-on work that needs the same
+  pattern set (output guards, conversation-log scrubbers) can import
+  it without creating a circular dependency.
+- **Expanded invisible-character denylist**: zero-width stripping now
+  covers the bidi / directional format controls (U+202A..U+202E,
+  U+2066..U+2069) and U+2060 WORD JOINER in addition to the zero-width
+  spaces and separators already handled. These codepoints let an
+  attacker visually reorder text so the denylist scan sees one string
+  while a human reviewer sees another; stripping them before the
+  pattern pass forecloses the bypass.
+- **Trusted-domain override**: ``sanitize_description(raw,
+  skip_pattern_scan=True)`` skips *only* the injection-pattern scrub
+  for operator-configured trusted domains whose tool descriptions
+  legitimately contain denylist tokens (prompt-processing utilities,
+  etc.). Always-on hygiene (NFC, control / zero-width stripping,
+  length cap) still applies. Configured per-deployment via code
+  (``GatewayServer(sanitizer_trusted_domains=...)``) rather than an
+  env toggle so the trust boundary is auditable in-repo.
+
+### Changed
+
+- **Log lines in `sanitize_description` no longer emit attacker-controlled
+  content**: previous audit lines included ``value=%r`` and ``match=%r``
+  which could leak attacker-supplied text (including credential strings
+  or oversized payloads) into ops log aggregators. The log format is
+  now metadata-only — type name for the non-string branch; offset +
+  length for the pattern-strip branch. Incident triage remains possible;
+  attacker amplification of audit logs does not.
+- **``ToolRegistry.populate_domain`` runs descriptions through the
+  sanitizer and validates ``inputSchema``** before the registry
+  accepts the tool. A failing ``inputSchema`` raises
+  ``SchemaValidationError`` (subclass of ``ValueError``) so callers
+  that already catch the broad type keep working. A poisoned
+  description is rewritten to its scrubbed form; a non-string
+  description is replaced with the empty string. Neither case aborts
+  the surrounding populate batch — one malicious tool can't DoS
+  siblings.
+
+### Notes
+
+- **35 existing tests updated**: the stricter ``inputSchema`` validator
+  rejects ``{}`` (missing root ``type``) that prior tests used as a
+  placeholder. Updated to the minimal valid form ``{"type": "object"}``.
+  This is the only consumer-visible contract change; third-party
+  consumers that pass truly empty schemas need to migrate to a minimal
+  valid schema.
+- **Why ``$ref`` is rejected rather than resolved**: resolving a ``$ref``
+  at ingest requires either following an external URL (SSRF surface,
+  now closed by the registration URL guard in v0.15.0) or walking
+  back to the root schema (introduces a TOCTOU window between
+  validation and the time the sandbox type renderer reads the schema).
+  Static inline schemas are strictly more auditable and the
+  rejection is cheap to work around upstream.
+
 ## [0.15.0] - 2026-04-23
 
 Security-hardening release. Closes an SSRF surface and a header-smuggling
@@ -430,6 +508,7 @@ Security-hardening release. Closes two code-injection primitives in the env-driv
 
 - Migrated `ToolEntry` and `DomainInfo` from dataclasses to Pydantic models (#9)
 
+[0.16.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.12.0...v0.13.0

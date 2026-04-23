@@ -10,6 +10,11 @@ from typing import TYPE_CHECKING, Any
 from opentelemetry import trace
 from pydantic import BaseModel, ConfigDict
 
+from fastmcp_gateway.sanitize import (
+    SchemaValidationError,
+    sanitize_description,
+    validate_input_schema,
+)
 from fastmcp_gateway.tool_name import validate_tool_name
 
 if TYPE_CHECKING:
@@ -386,6 +391,7 @@ class ToolRegistry:
         group_overrides: dict[str, str] | None = None,
         policy: AccessPolicy | None = None,
         expected_digest: str | None = None,
+        trusted_domains: set[str] | None = None,
     ) -> RegistryDiff:
         """Populate the registry with tools from an upstream server.
 
@@ -400,6 +406,20 @@ class ToolRegistry:
         :meth:`AccessPolicy.is_allowed` are skipped and never enter the
         registry -- callers of :meth:`lookup`, :meth:`search`, etc. will
         behave as if those tools don't exist.
+
+        Each tool's ``description`` is passed through
+        :func:`~fastmcp_gateway.sanitize.sanitize_description` (Unicode
+        normalization, control-char + zero-width strip, injection-pattern
+        scrub, length cap). Each tool's ``inputSchema`` is passed through
+        :func:`~fastmcp_gateway.sanitize.validate_input_schema`; a
+        malformed schema skips that tool (only) with a WARNING log, so
+        one poisoned tool can't DoS its siblings.
+
+        When a domain appears in *trusted_domains*, the injection-pattern
+        scan on descriptions is skipped for that domain. Unicode
+        normalization, control-character stripping, length capping, and
+        schema validation still apply — trust is scoped to the pattern
+        scan only.
 
         Schema-integrity check
         ----------------------
@@ -434,24 +454,47 @@ class ToolRegistry:
         with _tracer.start_as_current_span("gateway.registry.populate_domain") as span:
             span.set_attribute("gateway.domain", domain)
 
-            # Compute the candidate digest up front, BEFORE any state
-            # mutation.  The canonical form uses the upstream-advertised
-            # name so collision renames inside the gateway registry don't
-            # alter the digest — the digest is a fingerprint of the
-            # upstream contract, not of the internal registered form.
-            candidate_triples: list[tuple[str, str, dict[str, Any]]] = []
+            # Validate up front and carry forward only the tools that pass
+            # schema validation.  The canonical digest is computed over this
+            # accepted set rather than over the raw upstream list.  Two
+            # reasons:
+            #   1. Operators who compute the expected_digest out-of-band
+            #      naturally work with the accepted (valid) tool set; if
+            #      the gateway digests a superset that includes rejected
+            #      tools, ``expected_digest == candidate_digest`` can never
+            #      be made to match and legitimate refreshes are blocked.
+            #   2. A first-populate where every tool is rejected would
+            #      otherwise store a baseline digest for a registry with
+            #      zero registered tools — a latent gate that silently
+            #      blocks every future refresh attempt.  The accepted-set
+            #      approach degenerates to "no baseline stored" in that
+            #      case (see below), so operators aren't trapped.
+            #
+            # The canonical name still uses the upstream-advertised form
+            # (collision renames inside the gateway registry don't alter
+            # the digest — the digest fingerprints the upstream contract,
+            # not the gateway-side display name).
+            accepted: list[tuple[str, str, dict[str, Any]]] = []
+            schema_rejected_count = 0
             for raw in tools:
                 raw_name = raw.get("name", "")
                 if not raw_name:
                     continue
-                candidate_triples.append(
-                    (
+                schema_raw = raw.get("inputSchema", {}) or {}
+                try:
+                    clean_schema = validate_input_schema(schema_raw)
+                except SchemaValidationError as exc:
+                    logger.warning(
+                        "Rejected tool: domain=%s name=%r reason=invalid_schema detail=%s",
+                        domain,
                         raw_name,
-                        raw.get("description", "") or "",
-                        raw.get("inputSchema", {}) or {},
+                        str(exc),
                     )
-                )
-            candidate_digest = _digest_from_triples(candidate_triples)
+                    schema_rejected_count += 1
+                    continue
+                raw_description = raw.get("description", "") or ""
+                accepted.append((raw_name, raw_description, clean_schema))
+            candidate_digest = _digest_from_triples(accepted)
 
             prior_digest = self._domain_digests.get(domain)
 
@@ -515,12 +558,8 @@ class ToolRegistry:
             overrides = group_overrides or {}
             filtered_count = 0
             prefix = f"{domain}_"
-            for raw in tools:
-                name: str = raw.get("name", "")
-                if not name:
-                    logger.warning("Skipping tool with empty name in domain %s", domain)
-                    continue
-
+            domain_is_trusted = trusted_domains is not None and domain in trusted_domains
+            for name, raw_description, clean_schema in accepted:
                 # Collision renaming (see register_tool) may rewrite this tool's
                 # registered name to ``{domain}_{name}``.  Evaluate policy
                 # against both forms so rules written in either shape apply to
@@ -534,6 +573,11 @@ class ToolRegistry:
                         logger.debug("Tool '%s' in domain '%s' filtered by access policy", name, domain)
                         continue
 
+                clean_description = sanitize_description(
+                    raw_description,
+                    skip_pattern_scan=domain_is_trusted,
+                )
+
                 group = overrides.get(name, infer_group(domain, name))
 
                 self.register_tool(
@@ -541,18 +585,28 @@ class ToolRegistry:
                         name=name,
                         domain=domain,
                         group=group,
-                        description=raw.get("description", ""),
-                        input_schema=raw.get("inputSchema", {}),
+                        description=clean_description,
+                        input_schema=clean_schema,
                         upstream_url=upstream_url,
                     )
                 )
             if filtered_count > 0:
                 span.set_attribute("gateway.policy_filtered_count", filtered_count)
+            if schema_rejected_count > 0:
+                span.set_attribute("gateway.schema_rejected_count", schema_rejected_count)
 
-            # Commit the new baseline.  Done only after the populate
-            # loop completes so a failure mid-populate doesn't leave a
-            # stale digest pointing at partial state.
-            self._domain_digests[domain] = candidate_digest
+            # Commit the new baseline only when at least one tool was
+            # accepted.  A populate where every tool was rejected by
+            # schema validation leaves ``accepted`` empty and the stored
+            # registry with zero tools for this domain; storing a
+            # baseline in that state would latently block future
+            # refreshes (``prior_digest != None`` and no way for an
+            # operator to supply a matching ``expected_digest``), so
+            # we explicitly skip the write.  Ordering: after the
+            # populate loop completes, so a failure mid-populate doesn't
+            # leave a stale digest pointing at partial state.
+            if accepted:
+                self._domain_digests[domain] = candidate_digest
 
             new_names = {t.name for t in self.get_tools_by_domain(domain)}
             diff = RegistryDiff(

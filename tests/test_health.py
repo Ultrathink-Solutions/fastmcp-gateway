@@ -29,7 +29,7 @@ def populated_gateway() -> GatewayServer:
     gw.registry.populate_domain(
         "svc",
         "http://svc:8080/mcp",
-        [{"name": "svc_ping", "inputSchema": {}}],
+        [{"name": "svc_ping", "inputSchema": {"type": "object"}}],
     )
     return gw
 

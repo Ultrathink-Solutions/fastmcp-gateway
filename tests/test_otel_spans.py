@@ -65,8 +65,8 @@ def populated_registry() -> ToolRegistry:
         "apollo",
         "http://apollo:8080/mcp",
         [
-            {"name": "apollo_people_search", "description": "Search people", "inputSchema": {}},
-            {"name": "apollo_org_search", "description": "Search orgs", "inputSchema": {}},
+            {"name": "apollo_people_search", "description": "Search people", "inputSchema": {"type": "object"}},
+            {"name": "apollo_org_search", "description": "Search orgs", "inputSchema": {"type": "object"}},
         ],
     )
     return registry
@@ -213,7 +213,9 @@ class TestRegistrySpans:
     def test_populate_domain_creates_span(self, exporter: InMemorySpanExporter) -> None:
         """populate_domain emits a span with domain and tool_count."""
         registry = ToolRegistry()
-        registry.populate_domain("test", "http://test:8080/mcp", [{"name": "test_tool", "inputSchema": {}}])
+        registry.populate_domain(
+            "test", "http://test:8080/mcp", [{"name": "test_tool", "inputSchema": {"type": "object"}}]
+        )
 
         spans = _get_spans(exporter, "gateway.registry.populate_domain")
         assert len(spans) >= 1

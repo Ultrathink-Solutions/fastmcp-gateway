@@ -184,7 +184,7 @@ class TestExecuteTool:
         registry.populate_domain(
             "svc",
             "http://svc:8080/mcp",
-            [{"name": "svc_users_list", "inputSchema": {}}],
+            [{"name": "svc_users_list", "inputSchema": {"type": "object"}}],
         )
 
         result = await manager.execute_tool("svc_users_list", {"limit": 10})
@@ -228,12 +228,12 @@ class TestExecuteTool:
         registry.populate_domain(
             "snowflake",
             "http://snowflake:8080/mcp",
-            [{"name": "get_server_info", "inputSchema": {}}],
+            [{"name": "get_server_info", "inputSchema": {"type": "object"}}],
         )
         registry.populate_domain(
             "axon",
             "http://axon:8080/mcp",
-            [{"name": "get_server_info", "inputSchema": {}}],
+            [{"name": "get_server_info", "inputSchema": {"type": "object"}}],
         )
 
         # Registry should have prefixed names
@@ -275,7 +275,9 @@ class TestExecuteTool:
         with patch("fastmcp_gateway.client_manager.Client", side_effect=make_client):
             manager = UpstreamManager({"svc": "http://svc:8080/mcp"}, registry)
 
-        registry.populate_domain("svc", "http://svc:8080/mcp", [{"name": "svc_ping", "inputSchema": {}}])
+        registry.populate_domain(
+            "svc", "http://svc:8080/mcp", [{"name": "svc_ping", "inputSchema": {"type": "object"}}]
+        )
 
         await manager.execute_tool("svc_ping")
 
@@ -374,7 +376,9 @@ class TestUpstreamHeaders:
                 upstream_headers={"svc": {"Authorization": "Bearer domain-key"}},
             )
 
-        registry.populate_domain("svc", "http://svc:8080/mcp", [{"name": "svc_ping", "inputSchema": {}}])
+        registry.populate_domain(
+            "svc", "http://svc:8080/mcp", [{"name": "svc_ping", "inputSchema": {"type": "object"}}]
+        )
 
         result = await manager.execute_tool("svc_ping")
 
@@ -402,7 +406,9 @@ class TestUpstreamHeaders:
                 upstream_headers={"other_domain": {"Authorization": "Bearer other"}},
             )
 
-        registry.populate_domain("svc", "http://svc:8080/mcp", [{"name": "svc_ping", "inputSchema": {}}])
+        registry.populate_domain(
+            "svc", "http://svc:8080/mcp", [{"name": "svc_ping", "inputSchema": {"type": "object"}}]
+        )
 
         await manager.execute_tool("svc_ping")
 
