@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.0] - 2026-04-23
+
+Security-hardening release. Closes the tool-schema rug-pull pattern where a
+compromised upstream could mutate tool ``(name, description, inputSchema)``
+between background refresh cycles without operator visibility.
+
+### Added
+
+- **Schema-digest integrity check on the tool registry**: every `ToolRegistry.populate_domain` call now computes a SHA-256 digest over the canonical `(name, description, inputSchema)` form of the incoming tool set. The first populate for a domain records this digest as the baseline; subsequent populates whose digest diverges from the baseline are refused — the registry state is preserved verbatim, an ERROR-level audit line is emitted (`"Schema integrity violation: domain=... prior_digest=... candidate_digest=... -- refresh refused; registry state unchanged"`), and the returned `RegistryDiff` has `refused=True`. This blocks the rug-pull pattern where a compromised upstream quietly mutates tool schemas between background refresh cycles to smuggle new behaviour past the audit trail.
+- **`POST /registry/servers/refresh?expected_digest=<hex>`**: new bearer-authenticated endpoint (mounted when `registration_token` is set) that lets operators acknowledge a legitimate schema evolution. The operator independently verifies the new upstream contract, computes the expected post-transition digest, and presents it as a 64-char lowercase hex query parameter. On match, the transition commits; on mismatch, 409 Conflict with truncated digest pair for diagnostics. There is deliberately no env-flag bypass — env toggles on integrity paths create a permanent latent "off" state that an attacker with process-env write access can flip, whereas a per-call query-param shape forces every transition to be an intentional, audited operator action.
+- **`RegistryDiff` fields**: `schema_digest: str | None`, `schema_digest_changed: bool`, `refused: bool`. Backward-compatible defaults (`None` / `False` / `False`) so existing callers that inspect only `added` / `removed` / `tool_count` are unaffected.
+- **`ToolRegistry.get_schema_digest(domain)`** and **module-level `compute_schema_digest(tools)`**: public accessors that expose the canonical digest so operators can compute the expected value out-of-band (e.g., from a signed upstream schema manifest).
+- **`populate_domain(..., expected_digest=...)`** / **`UpstreamManager.refresh_domain(..., expected_digest=...)`**: kwargs thread the explicit acknowledgement through to the registry gate.
+
+### Notes
+
+- **Migration — no operator action required**: the first `populate_domain` after upgrading records whatever the upstream currently serves as the baseline and emits an INFO-level log line (`"Schema digest baseline established: domain=<name> digest=<hex8>"`). Operators see the audit trail in their log aggregator without any manual baselining step.
+- **Background refresh semantics**: the periodic `refresh_interval` loop no longer accepts schema mutations. A compromised upstream's mutation now lands as a refused diff plus an ERROR-level audit line, not as a silent contract swap. Operators who hit this refusal should: (1) verify the new upstream payload is intentional, (2) compute its expected digest via `compute_schema_digest` or the logged candidate fingerprint, and (3) issue a `POST /registry/servers/refresh?expected_digest=<hex>` with that value.
+- **Digest stability**: the canonical form uses the upstream-advertised tool name (not the gateway's collision-prefixed name), sorts entries for order-independence, and uses `sort_keys=True` inside each entry — so benign JSON reformatting upstream does not trip the gate. Any actual contract change (new tool, dropped tool, renamed tool, description edit, schema edit) does.
+
 ## [0.13.0] - 2026-04-23
 
 Security-hardening release. Closes a scope-probing information-leak in the
@@ -339,6 +359,7 @@ Security-hardening release. Closes two code-injection primitives in the env-driv
 
 - Migrated `ToolEntry` and `DomainInfo` from dataclasses to Pydantic models (#9)
 
+[0.14.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.10.1...v0.11.0

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -15,6 +17,59 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 _tracer = trace.get_tracer("fastmcp_gateway.registry")
+
+
+def compute_schema_digest(tools: list[ToolEntry]) -> str:
+    """Compute a SHA-256 digest over the canonical form of a tool set.
+
+    The digest covers the (upstream-visible name, description, inputSchema)
+    tuple for every tool in *tools*. It is stable across:
+
+    - Ordering differences (entries are sorted in canonical form).
+    - Dictionary-key ordering inside the input schema (``sort_keys=True``).
+    - JSON whitespace variations (compact separators).
+
+    The digest is NOT stable across changes to description text or to any
+    structural element of the input schema — that is the whole point. Any
+    upstream mutation of a tool's contract produces a new digest.
+
+    The canonical tool name uses ``original_name`` when present (the name
+    advertised by the upstream) so that a collision-prefix rename in the
+    gateway registry does not change the digest. The digest tracks the
+    **upstream** contract, not the gateway-side display name.
+    """
+    triples = [(t.original_name or t.name, t.description, t.input_schema) for t in tools]
+    return _digest_from_triples(triples)
+
+
+def _digest_from_triples(
+    triples: list[tuple[str, str, dict[str, Any]]],
+) -> str:
+    """Internal helper: digest from a list of ``(name, description, schema)`` tuples.
+
+    Shared by :func:`compute_schema_digest` (which takes :class:`ToolEntry`
+    instances) and :meth:`ToolRegistry.populate_domain` (which needs to
+    compute a candidate digest from raw upstream dicts *before* any state
+    mutation). Keeping the canonical serialization in one place ensures
+    the two call sites can never drift apart.
+    """
+    # Serialize each entry to its canonical JSON string first, then sort
+    # the resulting strings. Sorting raw dicts raises TypeError on Python
+    # 3.x (dicts are not orderable) and sorting by a key function would
+    # need a tie-breaker — sorting the JSON strings directly is simpler,
+    # deterministic, and Unicode-correct.
+    canonical_entries = [
+        json.dumps(
+            {"n": name, "d": description, "s": schema},
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        for name, description, schema in triples
+    ]
+    canonical_entries.sort()
+    payload = "\n".join(canonical_entries)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def infer_group(domain: str, tool_name: str) -> str:
@@ -61,7 +116,14 @@ class DomainInfo(BaseModel):
 
 
 class RegistryDiff(BaseModel):
-    """Result of a populate/refresh operation, describing what changed."""
+    """Result of a populate/refresh operation, describing what changed.
+
+    The ``schema_digest`` / ``schema_digest_changed`` / ``refused`` fields
+    report on per-domain schema-integrity state.  Older callers that
+    inspect only ``added`` / ``removed`` / ``tool_count`` are unaffected —
+    the new fields default such that the previous behaviour is observable
+    unchanged.
+    """
 
     model_config = ConfigDict(frozen=True)
 
@@ -69,6 +131,9 @@ class RegistryDiff(BaseModel):
     added: list[str]
     removed: list[str]
     tool_count: int
+    schema_digest: str | None = None
+    schema_digest_changed: bool = False
+    refused: bool = False
 
 
 class ToolRegistry:
@@ -83,6 +148,12 @@ class ToolRegistry:
         self._domains: dict[str, dict[str, list[str]]] = {}  # domain -> group -> [tool_names]
         self._domain_descriptions: dict[str, str] = {}
         self._collided_names: set[str] = set()  # original names that had cross-domain collisions
+        # Per-domain SHA-256 digest of the last accepted populate payload.
+        # Keyed by domain; absent keys indicate "not yet populated" (no
+        # baseline established).  ``populate_domain`` compares an incoming
+        # payload's candidate digest against this baseline to detect
+        # upstream contract mutation between refreshes.
+        self._domain_digests: dict[str, str] = {}
 
     @property
     def tool_count(self) -> int:
@@ -314,6 +385,7 @@ class ToolRegistry:
         description: str = "",
         group_overrides: dict[str, str] | None = None,
         policy: AccessPolicy | None = None,
+        expected_digest: str | None = None,
     ) -> RegistryDiff:
         """Populate the registry with tools from an upstream server.
 
@@ -329,10 +401,108 @@ class ToolRegistry:
         registry -- callers of :meth:`lookup`, :meth:`search`, etc. will
         behave as if those tools don't exist.
 
-        Returns a :class:`RegistryDiff` describing what changed.
+        Schema-integrity check
+        ----------------------
+        A SHA-256 digest is computed over the (name, description,
+        inputSchema) tuples of the incoming payload **before** any
+        existing state is cleared.  The first populate for a domain
+        records this digest as the baseline; subsequent calls compare
+        the candidate digest against the stored baseline:
+
+        - ``prior == candidate`` → proceed as a no-op refresh.
+        - ``prior != candidate`` and *expected_digest* is ``None`` →
+          refuse.  ``clear_domain`` is NOT called; the previous registry
+          state is preserved verbatim and the returned diff has
+          ``refused=True`` with empty ``added`` / ``removed`` lists.
+        - ``prior != candidate`` and ``expected_digest == candidate`` →
+          operator has explicitly acknowledged the new schema; the
+          transition commits and the stored baseline is updated.
+        - ``prior != candidate`` and ``expected_digest != candidate`` →
+          refuse.  This guards against replay of a stale expected digest
+          against a newly-mutated upstream.
+
+        The rationale: the background refresh loop cannot distinguish
+        a benign upstream schema evolution from a compromised upstream
+        silently re-shaping tool contracts to smuggle new behaviour past
+        the audit trail.  Requiring explicit, out-of-band confirmation
+        for every contract change turns that silent mutation path into
+        an operator-visible event.
+
+        Returns a :class:`RegistryDiff` describing what changed (or a
+        ``refused=True`` diff when the digest check fails).
         """
         with _tracer.start_as_current_span("gateway.registry.populate_domain") as span:
             span.set_attribute("gateway.domain", domain)
+
+            # Compute the candidate digest up front, BEFORE any state
+            # mutation.  The canonical form uses the upstream-advertised
+            # name so collision renames inside the gateway registry don't
+            # alter the digest — the digest is a fingerprint of the
+            # upstream contract, not of the internal registered form.
+            candidate_triples: list[tuple[str, str, dict[str, Any]]] = []
+            for raw in tools:
+                raw_name = raw.get("name", "")
+                if not raw_name:
+                    continue
+                candidate_triples.append(
+                    (
+                        raw_name,
+                        raw.get("description", "") or "",
+                        raw.get("inputSchema", {}) or {},
+                    )
+                )
+            candidate_digest = _digest_from_triples(candidate_triples)
+
+            prior_digest = self._domain_digests.get(domain)
+
+            # Schema integrity gate.  Three refuse cases fall through to
+            # a single early return; all other cases proceed to the
+            # normal populate path (with an optional baseline/advance
+            # of the stored digest afterwards).
+            schema_digest_changed = False
+            if prior_digest is None:
+                # First populate — auto-baseline.  INFO-level so the
+                # initial fingerprint lands in operator logs.
+                logger.info(
+                    "Schema digest baseline established: domain=%s digest=%s..8",
+                    domain,
+                    candidate_digest[:8],
+                )
+                schema_digest_changed = True
+            elif prior_digest == candidate_digest:
+                # No-op refresh: upstream contract unchanged.
+                schema_digest_changed = False
+            else:
+                # Contract has changed.  Require an explicit acknowledgement
+                # matching the new digest.  Anything else (missing ack,
+                # stale ack from a prior transition, etc.) refuses and
+                # preserves existing state.
+                if expected_digest is None or expected_digest != candidate_digest:
+                    logger.error(
+                        "Schema integrity violation: domain=%s prior_digest=%s..8 "
+                        "candidate_digest=%s..8 -- refresh refused; registry state unchanged",
+                        domain,
+                        prior_digest[:8],
+                        candidate_digest[:8],
+                    )
+                    span.set_attribute("gateway.schema_refused", True)
+                    # Return a refusal diff.  ``clear_domain`` is never
+                    # called, so lookup()/search()/etc. continue to see
+                    # the pre-refresh state.  ``added``/``removed`` are
+                    # deliberately empty — no registry mutation means no
+                    # observable delta to report.
+                    return RegistryDiff(
+                        domain=domain,
+                        added=[],
+                        removed=[],
+                        tool_count=len(self.get_tools_by_domain(domain)),
+                        schema_digest=candidate_digest,
+                        schema_digest_changed=False,
+                        refused=True,
+                    )
+                # expected_digest == candidate_digest → operator signed
+                # off on this specific transition.  Proceed.
+                schema_digest_changed = True
 
             # Snapshot current tool names for diff calculation.
             old_names = {t.name for t in self.get_tools_by_domain(domain)}
@@ -379,12 +549,20 @@ class ToolRegistry:
             if filtered_count > 0:
                 span.set_attribute("gateway.policy_filtered_count", filtered_count)
 
+            # Commit the new baseline.  Done only after the populate
+            # loop completes so a failure mid-populate doesn't leave a
+            # stale digest pointing at partial state.
+            self._domain_digests[domain] = candidate_digest
+
             new_names = {t.name for t in self.get_tools_by_domain(domain)}
             diff = RegistryDiff(
                 domain=domain,
                 added=sorted(new_names - old_names),
                 removed=sorted(old_names - new_names),
                 tool_count=len(new_names),
+                schema_digest=candidate_digest,
+                schema_digest_changed=schema_digest_changed,
+                refused=False,
             )
             span.set_attribute("gateway.tool_count", diff.tool_count)
             return diff
@@ -397,14 +575,34 @@ class ToolRegistry:
         """Return the description for a domain, or empty string if unset."""
         return self._domain_descriptions.get(domain, "")
 
+    def get_schema_digest(self, domain: str) -> str | None:
+        """Return the stored schema digest for a domain, or ``None`` if unset.
+
+        The digest is set on the first successful populate for a domain
+        (the baseline) and advanced on each subsequent populate that
+        passes the integrity check.  A return value of ``None`` means the
+        domain has never been populated or was fully cleared.
+        """
+        return self._domain_digests.get(domain)
+
     def clear_domain(self, domain: str) -> None:
-        """Remove all tools for a domain (used during refresh)."""
+        """Remove all tools for a domain (used during refresh).
+
+        Also clears any stored schema digest for the domain.
+        :meth:`populate_domain` snapshots ``prior_digest`` before calling
+        this method and rewrites the digest after a successful populate,
+        so the internal refresh path is unaffected.  External callers
+        (e.g. :meth:`UpstreamManager.remove_upstream`) use this as a
+        full-teardown — the digest must go with the tools so a later
+        re-registration starts from a clean baseline.
+        """
         if domain in self._domains:
             for group_tools in self._domains[domain].values():
                 for tool_name in group_tools:
                     self._tools.pop(tool_name, None)
             del self._domains[domain]
         self._domain_descriptions.pop(domain, None)
+        self._domain_digests.pop(domain, None)
 
     def lookup(self, tool_name: str) -> ToolEntry | None:
         """Look up a tool by exact name."""

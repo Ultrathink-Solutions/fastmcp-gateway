@@ -603,6 +603,106 @@ class GatewayServer:
                     )
             return JSONResponse({"servers": servers, "total": len(servers)})
 
+        @self._mcp.custom_route("/registry/servers/refresh", methods=["POST"])
+        async def _refresh_server(request: Request) -> JSONResponse:
+            """Operator-triggered, digest-acknowledged domain refresh.
+
+            Background refreshes refuse any populate that diverges from
+            the stored per-domain digest.  This endpoint is the
+            explicit escape path: the operator independently verifies
+            the new upstream schema, computes the expected post-
+            transition digest, and presents it as a query parameter.
+            On match the transition commits; on mismatch 409 Conflict
+            is returned and registry state is preserved.
+
+            There is deliberately no env-flag bypass.  Env toggles on
+            integrity paths create a permanent latent "off" state that
+            an attacker with process-env write access can flip; the
+            per-call query-param shape forces every transition to be
+            an intentional, audited operator action.
+            """
+            auth_err = _check_auth(request)
+            if auth_err:
+                return auth_err
+
+            try:
+                body = await request.json()
+            except _json.JSONDecodeError:
+                return JSONResponse(
+                    {"error": "Invalid JSON body", "code": "bad_request"},
+                    status_code=400,
+                )
+
+            domain = body.get("domain")
+            if not domain or not isinstance(domain, str):
+                return JSONResponse(
+                    {"error": "'domain' (string) is required in body", "code": "bad_request"},
+                    status_code=400,
+                )
+
+            # Validate expected_digest query param: must be present and
+            # must be a 64-char lowercase hex string (the shape of a
+            # SHA-256 hexdigest).  Reject anything else up-front — a
+            # malformed digest can never match a real stored digest, so
+            # forwarding it to the registry would just surface as a
+            # generic 409; a 400 here is the correct, specific error.
+            expected_digest = request.query_params.get("expected_digest")
+            if expected_digest is None:
+                return JSONResponse(
+                    {
+                        "error": "'expected_digest' query parameter is required",
+                        "code": "bad_request",
+                    },
+                    status_code=400,
+                )
+            if len(expected_digest) != 64 or any(c not in "0123456789abcdef" for c in expected_digest):
+                return JSONResponse(
+                    {
+                        "error": "'expected_digest' must be a 64-char lowercase hex string",
+                        "code": "bad_request",
+                    },
+                    status_code=400,
+                )
+
+            async with gateway._registry_lock:
+                try:
+                    diff = await gateway.upstream_manager.refresh_domain(
+                        domain,
+                        expected_digest=expected_digest,
+                    )
+                except KeyError:
+                    return JSONResponse(
+                        {"error": f"Domain '{domain}' is not registered", "code": "not_found"},
+                        status_code=404,
+                    )
+
+                if diff.refused:
+                    computed = diff.schema_digest or ""
+                    return JSONResponse(
+                        {
+                            "error": "digest_mismatch",
+                            "code": "conflict",
+                            "expected": expected_digest[:8] + "...",
+                            "computed": (computed[:8] + "...") if computed else "",
+                            "domain": domain,
+                        },
+                        status_code=409,
+                    )
+
+                gateway._apply_domain_descriptions()
+                gateway._update_instructions()
+
+            return JSONResponse(
+                {
+                    "refreshed": domain,
+                    "tool_count": diff.tool_count,
+                    "added": diff.added,
+                    "removed": diff.removed,
+                    "schema_digest": diff.schema_digest,
+                    "schema_digest_changed": diff.schema_digest_changed,
+                }
+            )
+
     def _update_instructions(self) -> None:
         """Rebuild MCP instructions from the current registry state.
 
