@@ -15,6 +15,12 @@ from fastmcp_gateway.access_policy import AccessPolicy, normalize_upstreams
 from fastmcp_gateway.client_manager import UpstreamManager
 from fastmcp_gateway.hooks import HookRunner
 from fastmcp_gateway.registry import ToolRegistry
+from fastmcp_gateway.url_guard import (
+    RegistrationGuardError,
+    _url_guard_allow_private,
+    validate_registration_headers,
+    validate_registration_url,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -514,11 +520,6 @@ class GatewayServer:
                     {"error": "'domain' and 'url' must be strings", "code": "bad_request"},
                     status_code=400,
                 )
-            if not url.startswith(("http://", "https://")):
-                return JSONResponse(
-                    {"error": "'url' must use http:// or https:// scheme", "code": "bad_request"},
-                    status_code=400,
-                )
 
             description = body.get("description")
             headers = body.get("headers")
@@ -528,6 +529,24 @@ class GatewayServer:
             ):
                 return JSONResponse(
                     {"error": "'headers' must be an object of string:string pairs", "code": "bad_request"},
+                    status_code=400,
+                )
+
+            # SSRF + header-injection guards.  These run after the basic
+            # type checks so the failure modes stay in a predictable
+            # order for callers.  Both raise ``RegistrationGuardError``
+            # with an explicit ``code`` attribute that we surface as the
+            # structured ``code`` field in the 400 response.
+            try:
+                await validate_registration_url(
+                    url,
+                    allow_private=_url_guard_allow_private(),
+                )
+                if headers is not None:
+                    validate_registration_headers(headers)
+            except RegistrationGuardError as exc:
+                return JSONResponse(
+                    {"error": str(exc), "code": exc.code},
                     status_code=400,
                 )
 

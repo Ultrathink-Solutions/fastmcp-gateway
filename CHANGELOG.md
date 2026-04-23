@@ -5,6 +5,77 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.0] - 2026-04-23
+
+Security-hardening release. Closes an SSRF surface and a header-smuggling
+surface on the ``POST /registry/servers`` endpoint, and adds a structured
+400 for malformed-port URLs that previously surfaced as unhandled 500s.
+
+### Added
+
+- **`fastmcp_gateway.url_guard` module**: new SSRF and header-injection
+  guards applied before any registration call reaches the upstream
+  client. ``validate_registration_url()`` rejects non-``http(s)``
+  schemes, empty / ``localhost`` hostnames, ``..`` path-traversal
+  segments, and any hostname whose DNS resolution lands inside a denied
+  CIDR range (RFC 1918 private, loopback, IPv4 / IPv6 link-local
+  including cloud-metadata ``169.254.169.254``, CGNAT, carrier-grade
+  NAT).  IPv4-mapped IPv6 addresses (``::ffff:a.b.c.d``) are unwrapped
+  before the CIDR check so the mapped form can't bypass an IPv4-only
+  denylist.  ``validate_registration_headers()`` rejects any header key
+  outside the (empty-by-default) allowlist or inside the routing /
+  auth / hop-by-hop denylist (``Host``, ``Authorization``, ``Cookie``,
+  ``X-Forwarded-*``, ``Connection``, ``Transfer-Encoding``, etc.).
+- **`GATEWAY_URL_GUARD_DNS_TIMEOUT_SECONDS` env var** (default: 5.0
+  seconds): caps the per-registration DNS resolution wait to prevent
+  a slow / poisoned resolver from stalling the registration path.
+  Timeout failures map to the same structured 400 as DNS-failure, not
+  a 504.  Non-numeric, zero, or negative values fall back to the
+  default rather than producing an immediate DNS-failure.
+- **`GATEWAY_URL_GUARD_ALLOW_PRIVATE_RANGES` env var** (default:
+  ``false``): opt-in override for on-prem deployments that need to
+  register upstreams inside private / internal ranges.  The override
+  waives the CIDR denial — it does *not* unconditionally waive the
+  plaintext-``http`` ban.  ``http://`` is permitted only when every
+  resolved address for the target hostname is inside a denied range;
+  a single public-range address in the resolution set keeps the
+  plaintext ban in force.  Deployments relying on this flag need
+  independent network-layer egress controls.
+
+### Changed
+
+- **``POST /registry/servers`` registration flow** now calls
+  ``validate_registration_url()`` and ``validate_registration_headers()``
+  before constructing the upstream client.  Rejections surface as
+  structured 400 responses with ``{"code": "ssrf_rejected" |
+  "header_injection_rejected", "message": "..."}`` rather than
+  bubbling out as 500s or silently forwarding attacker-controlled
+  headers.
+- **Malformed-port URLs** (``https://host:99999/mcp``,
+  ``https://host:abc/mcp``) now surface the ``ValueError`` from
+  ``urllib.parse.urlparse().port`` as a structured 400
+  (``ssrf_rejected``) rather than propagating as an unhandled 500.
+
+### Notes
+
+- **Allowlist is empty by default**: third-party adopters who need
+  to forward specific upstream headers must extend
+  ``_ALLOWED_HEADER_KEYS`` via a code change, not an env toggle —
+  header-forwarding policy is a deployment contract, not a runtime
+  config.
+- **IPv6 scope IDs stripped**: ``getaddrinfo`` can return
+  ``fe80::1%eth0`` for link-local IPv6; the guard strips the ``%...``
+  suffix before ``ipaddress.ip_address()`` parsing so the underlying
+  address (which *is* in the denied ``fe80::/10`` range) is still
+  recognized.
+- **Why no env flag on the plaintext-``http`` ban to public hosts**:
+  a fail-open env toggle on that specific check is a permanent latent
+  bypass that an attacker with process-env write access can flip.
+  Deployments that need plaintext transport to a specific public
+  upstream should either front it with TLS termination on their own
+  network edge or land a code-level allowlist addition — both leave
+  an audit trail that an env-var flip would not.
+
 ## [0.14.0] - 2026-04-23
 
 Security-hardening release. Closes the tool-schema rug-pull pattern where a
@@ -359,6 +430,7 @@ Security-hardening release. Closes two code-injection primitives in the env-driv
 
 - Migrated `ToolEntry` and `DomainInfo` from dataclasses to Pydantic models (#9)
 
+[0.15.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.11.0...v0.12.0
