@@ -361,7 +361,9 @@ class TestRegistrationValidation:
             )
         assert resp.status_code == 400
         body = resp.json()
-        assert body["code"] == "bad_request"
+        # Scheme allowlist now lives in the url_guard — surfaced as the
+        # SSRF rejection code rather than the generic bad_request.
+        assert body["code"] == "ssrf_rejected"
         assert isinstance(body.get("error"), str)
 
     @pytest.mark.asyncio
@@ -390,6 +392,84 @@ class TestRegistrationValidation:
                 headers={**_auth_headers(), "content-type": "application/json"},
             )
         assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_ssrf_rfc1918_rejected(
+        self,
+        gateway_with_registration: GatewayServer,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """POST with an RFC 1918 URL returns 400 + ``code='ssrf_rejected'``."""
+
+        # Force the hostname to resolve to an RFC 1918 address so the
+        # guard fires regardless of the CI machine's actual DNS.
+        def _stub(host, port, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            import socket as _socket
+
+            return [
+                (
+                    _socket.AF_INET,
+                    _socket.SOCK_STREAM,
+                    _socket.IPPROTO_TCP,
+                    "",
+                    ("10.0.0.42", port or 443),
+                )
+            ]
+
+        monkeypatch.setattr(
+            "fastmcp_gateway.url_guard.socket.getaddrinfo",
+            _stub,
+        )
+        async with await _http_client(gateway_with_registration) as client:
+            resp = await client.post(
+                "/registry/servers",
+                json={"domain": "evil", "url": "https://internal.example/mcp"},
+                headers=_auth_headers(),
+            )
+        assert resp.status_code == 400
+        body = resp.json()
+        assert body["code"] == "ssrf_rejected"
+
+    @pytest.mark.asyncio
+    async def test_header_injection_rejected(
+        self,
+        gateway_with_registration: GatewayServer,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """POST with a denylisted header key returns 400 + header_injection_rejected."""
+
+        # Give the URL check a resolvable public-looking address so
+        # the failure is unambiguously the header guard.
+        def _stub(host, port, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            import socket as _socket
+
+            return [
+                (
+                    _socket.AF_INET,
+                    _socket.SOCK_STREAM,
+                    _socket.IPPROTO_TCP,
+                    "",
+                    ("203.0.113.5", port or 443),
+                )
+            ]
+
+        monkeypatch.setattr(
+            "fastmcp_gateway.url_guard.socket.getaddrinfo",
+            _stub,
+        )
+        async with await _http_client(gateway_with_registration) as client:
+            resp = await client.post(
+                "/registry/servers",
+                json={
+                    "domain": "evil",
+                    "url": "https://public.example/mcp",
+                    "headers": {"Host": "evil.internal"},
+                },
+                headers=_auth_headers(),
+            )
+        assert resp.status_code == 400
+        body = resp.json()
+        assert body["code"] == "header_injection_rejected"
 
 
 # ---------------------------------------------------------------------------
