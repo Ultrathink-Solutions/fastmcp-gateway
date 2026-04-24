@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import UTC
 
 import pytest
 from fastmcp import FastMCP
@@ -11,7 +12,16 @@ from httpx import ASGITransport, AsyncClient
 
 from fastmcp_gateway.client_manager import UpstreamManager
 from fastmcp_gateway.gateway import GatewayServer
+from fastmcp_gateway.registration_auth import RegistrationClaims
 from fastmcp_gateway.registry import ToolRegistry
+
+# These tests deliberately exercise the deprecated static-bearer
+# registration path, which emits a ``DeprecationWarning`` on each
+# GatewayServer construction (the migration notice introduced alongside
+# the JWT validator).  Silencing the warning at the module level keeps
+# the test output focused on actual failures; the mutual-exclusion
+# and JWT tests in test_registration_auth.py cover the new path.
+pytestmark = pytest.mark.filterwarnings("ignore:registration_token is deprecated:DeprecationWarning")
 
 # ---------------------------------------------------------------------------
 # Mock upstream MCP servers
@@ -552,3 +562,58 @@ class TestRegistrationAuthHeaders:
         assert gateway.registry.tool_count == 3
         # Verify headers are stored for execution
         assert gateway.upstream_manager._upstream_headers.get("support") == upstream_auth
+
+
+# ---------------------------------------------------------------------------
+# Mutual exclusion: token + validator cannot both be passed
+# ---------------------------------------------------------------------------
+
+
+class _StubValidator:
+    """Minimal validator stub — good enough to satisfy the protocol check."""
+
+    def validate(self, bearer: str) -> RegistrationClaims:  # pragma: no cover - not invoked
+        from datetime import datetime
+
+        return RegistrationClaims(
+            subject="stub",
+            jti=None,
+            issued_at=datetime.now(tz=UTC),
+            raw={},
+        )
+
+
+class TestRegistrationAuthMutualExclusion:
+    def test_mutual_exclusion(self, sales_server: FastMCP) -> None:
+        """Passing both ``registration_token`` and ``registration_validator`` raises.
+
+        The two paths are mutually exclusive to prevent a
+        misconfiguration where an operator thought they had migrated
+        to the JWT validator but the legacy static bearer was still
+        honoured.  Failing loudly at construction means the mistake
+        surfaces at startup rather than silently at runtime.
+        """
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            GatewayServer(
+                {"sales": sales_server},  # type: ignore[dict-item]
+                registration_token="some-static-token-long-enough",
+                registration_validator=_StubValidator(),
+            )
+
+    def test_static_token_emits_deprecation_warning(self, sales_server: FastMCP) -> None:
+        """Constructing with ``registration_token`` emits a ``DeprecationWarning``.
+
+        The static-bearer path is retained for backward compatibility
+        for one release; the warning gives deployments a clear
+        migration signal.
+        """
+        # Match only the kwarg name rather than the full deprecation
+        # phrase — we want to confirm the warning is about
+        # ``registration_token`` (and not some unrelated
+        # ``DeprecationWarning`` from a transitive dep) without pinning
+        # the exact message wording the migration guidance uses.
+        with pytest.warns(DeprecationWarning, match="registration_token"):
+            GatewayServer(
+                {"sales": sales_server},  # type: ignore[dict-item]
+                registration_token="some-static-token-long-enough",
+            )

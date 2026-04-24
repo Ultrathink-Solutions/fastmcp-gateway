@@ -98,11 +98,46 @@ Configure via environment variables:
         Example: ``GATEWAY_ALLOWED_MIDDLEWARE_PREFIXES=my_org.middleware,ops.middleware``
 
     GATEWAY_REGISTRATION_TOKEN
-        Shared secret that protects the dynamic registration REST endpoints
-        (POST/DELETE/GET /registry/servers).  When set, the gateway exposes
-        these endpoints and requires callers to send
-        ``Authorization: Bearer <token>``.  When not set, the endpoints are
-        not mounted (default — backwards-compatible).
+        **Deprecated.**  Shared secret that protects the dynamic
+        registration REST endpoints (POST/DELETE/GET
+        /registry/servers).  When set, the gateway exposes these
+        endpoints and requires callers to send
+        ``Authorization: Bearer <token>``.  When not set, the
+        endpoints are not mounted (default — backwards-compatible).
+
+        This path will be removed in a future release; prefer the
+        JWT-validator env vars below.  Setting this var emits a
+        :class:`DeprecationWarning` at startup.  Mutually exclusive
+        with the JWT-validator env vars — if both are configured,
+        ``GatewayServer`` raises :class:`ValueError` at startup.
+
+    GATEWAY_REGISTRATION_ISSUER, GATEWAY_REGISTRATION_AUDIENCE, GATEWAY_REGISTRATION_VERIFY_KEY
+        JWT-validator configuration for the registration endpoints.
+        When *all three* are set, the gateway builds a
+        :class:`~fastmcp_gateway.registration_auth.JWTRegistrationValidator`
+        and uses it to authenticate callers of ``/registry/servers``.
+        Each registration request must carry a short-lived signed
+        JWT whose ``iss`` matches ``GATEWAY_REGISTRATION_ISSUER``,
+        whose ``aud`` matches ``GATEWAY_REGISTRATION_AUDIENCE``, and
+        whose signature validates against the PEM in
+        ``GATEWAY_REGISTRATION_VERIFY_KEY``.  Short token expiry
+        (recommended ≤ 5 minutes at the issuer) is the primary
+        replay mitigation — no server-side ``jti`` cache is used.
+
+        ``GATEWAY_REGISTRATION_VERIFY_KEY`` is a PEM-encoded public
+        key and *may be multi-line* (env drivers must preserve
+        newlines; most container orchestrators support this via
+        secret mounts or ``\n`` escapes).
+
+        Partial configuration (some but not all three) is a
+        startup-time error: the gateway refuses to start rather than
+        silently mounting unauthenticated routes.
+
+    GATEWAY_REGISTRATION_ALGORITHMS
+        Comma-separated list of JWT signing algorithms accepted by
+        the validator (e.g. ``ES256,ES384``).  Defaults to ``ES256``
+        when unset.  The string ``none`` is explicitly rejected —
+        allowing unsigned tokens would bypass the entire validator.
 
     GATEWAY_CODE_MODE
         Reserved — setting this to ``true`` is **not** a supported way to
@@ -148,6 +183,10 @@ from fastmcp_gateway._hook_loading import _load_hooks
 from fastmcp_gateway._middleware_loading import _load_middleware
 from fastmcp_gateway.code_mode import CodeModeUnavailableError
 from fastmcp_gateway.gateway import CodeModeAuthorizerRequiredError, GatewayServer
+from fastmcp_gateway.registration_auth import (
+    JWTRegistrationValidator,
+    RegistrationTokenValidator,
+)
 
 logger = logging.getLogger("fastmcp_gateway")
 
@@ -269,6 +308,75 @@ def _load_code_mode_config() -> tuple[bool, Any | None, bool]:
     return True, limits, verbatim
 
 
+def _load_registration_validator() -> RegistrationTokenValidator | None:
+    """Build a ``JWTRegistrationValidator`` from env if fully configured.
+
+    Returns ``None`` when none of the three required env vars are set —
+    i.e. the deployment is using the deprecated static-bearer path or
+    has registration disabled entirely.  Raises :class:`SystemExit`
+    when the configuration is *partial* (some but not all three vars
+    set): that state is almost certainly a deployment mistake, and
+    silently skipping validator construction in that case would either
+    fall back to the static-bearer path (surprising) or leave the
+    endpoints unauthenticated (dangerous).
+
+    The ``GATEWAY_REGISTRATION_ALGORITHMS`` override is optional.
+    ``none`` is rejected up front because allowing it would bypass
+    signature verification.
+    """
+    issuer = os.environ.get("GATEWAY_REGISTRATION_ISSUER", "").strip()
+    audience = os.environ.get("GATEWAY_REGISTRATION_AUDIENCE", "").strip()
+    # Verify key is PEM; do NOT ``.strip()`` the whole value because
+    # that would trim newlines inside a multi-line PEM on some
+    # env-loader implementations.  Only trim outer whitespace.
+    verify_key_raw = os.environ.get("GATEWAY_REGISTRATION_VERIFY_KEY", "")
+    verify_key = verify_key_raw.strip() if verify_key_raw.strip() else ""
+
+    configured = [bool(issuer), bool(audience), bool(verify_key)]
+    if not any(configured):
+        return None
+    if not all(configured):
+        missing = [
+            name
+            for name, present in zip(
+                (
+                    "GATEWAY_REGISTRATION_ISSUER",
+                    "GATEWAY_REGISTRATION_AUDIENCE",
+                    "GATEWAY_REGISTRATION_VERIFY_KEY",
+                ),
+                configured,
+                strict=True,
+            )
+            if not present
+        ]
+        logger.error(
+            "Partial JWT registration config: missing %s. Set all three (issuer, audience, verify key) or none.",
+            ", ".join(missing),
+        )
+        sys.exit(1)
+
+    algorithms: list[str] | None = None
+    algs_raw = os.environ.get("GATEWAY_REGISTRATION_ALGORITHMS", "").strip()
+    if algs_raw:
+        algorithms = [a.strip() for a in algs_raw.split(",") if a.strip()]
+        if not algorithms:
+            logger.error("GATEWAY_REGISTRATION_ALGORITHMS is set but parses to an empty list")
+            sys.exit(1)
+        if any(a.lower() == "none" for a in algorithms):
+            logger.error(
+                "GATEWAY_REGISTRATION_ALGORITHMS cannot contain 'none' — "
+                "unsigned JWTs would bypass signature verification"
+            )
+            sys.exit(1)
+
+    return JWTRegistrationValidator(
+        public_key=verify_key_raw,  # pass raw to preserve internal PEM newlines
+        issuer=issuer,
+        audience=audience,
+        algorithms=algorithms,
+    )
+
+
 async def _populate(gateway: GatewayServer) -> None:
     """Populate the gateway registry from upstream servers."""
     results = await gateway.populate()
@@ -337,8 +445,23 @@ def main() -> None:
     # and ``GATEWAY_ALLOWED_MIDDLEWARE_PREFIXES``.
     middleware = _load_middleware()
 
-    # Dynamic registration token (optional).
+    # Dynamic registration authentication (optional).  The JWT
+    # validator is preferred; the shared-static-bearer path is
+    # retained for one release to give deployments a migration window.
+    # GatewayServer enforces mutual exclusion at construction, so we
+    # only forward whichever is configured; when both envs are set
+    # we fail loudly up front instead of letting the ambiguity reach
+    # the constructor.
+    registration_validator = _load_registration_validator()
     registration_token = os.environ.get("GATEWAY_REGISTRATION_TOKEN") or None
+    if registration_token and registration_validator is not None:
+        logger.error(
+            "GATEWAY_REGISTRATION_TOKEN and the JWT registration env vars "
+            "(GATEWAY_REGISTRATION_ISSUER / GATEWAY_REGISTRATION_AUDIENCE / "
+            "GATEWAY_REGISTRATION_VERIFY_KEY) are mutually exclusive. "
+            "Unset one."
+        )
+        sys.exit(1)
 
     # Code mode (experimental, off by default).
     code_mode, code_mode_limits, code_mode_audit_verbatim = _load_code_mode_config()
@@ -354,6 +477,7 @@ def main() -> None:
             refresh_interval=refresh_interval,
             hooks=hooks,
             registration_token=registration_token,
+            registration_validator=registration_validator,
             code_mode=code_mode,
             code_mode_limits=code_mode_limits,
             code_mode_audit_verbatim=code_mode_audit_verbatim,

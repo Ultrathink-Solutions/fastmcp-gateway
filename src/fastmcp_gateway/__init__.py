@@ -25,4 +25,4 @@ __all__ = [
     "ListToolsContext",
     "get_user_headers",
 ]
-__version__ = "0.16.0"
+__version__ = "0.17.0"

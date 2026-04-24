@@ -30,6 +30,15 @@ dependencies = [
     "fastmcp>=2.0",
     "opentelemetry-api>=1.20",
     "pydantic>=2.0",
+    # PyJWT with the [crypto] extra powers ``JWTRegistrationValidator``
+    # in ``fastmcp_gateway.registration_auth``. The extra pulls in
+    # ``cryptography`` (~7MB wheel), which is why the ``import jwt``
+    # inside the validator is deferred to runtime — deployments that
+    # only use the legacy static-bearer registration path (or no
+    # registration at all) never touch the JWT code path, but still
+    # need the library installed so importing the module doesn't
+    # fail on a missing dependency if a caller chooses to opt in.
+    "PyJWT[crypto]>=2.8",
 ]
 
 [project.optional-dependencies]
