@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 import logging
@@ -107,6 +108,14 @@ class ToolEntry(BaseModel):
     input_schema: dict[str, Any]
     upstream_url: str
     original_name: str | None = None  # Set when renamed due to collision
+    # Opt-in flag for tools that legitimately return prompt-like content
+    # (e.g., a prompt-rewriting or instruction-generation service). When
+    # ``True``, the gateway-level output guard skips scrubbing this tool's
+    # result text. Upstreams declare this via an ``annotations`` custom
+    # extension key ``x-raw-output-trusted: true`` at list_tools time;
+    # operators may additionally override per-tool via
+    # ``GatewayServer(trusted_output_tools={...})``.
+    raw_output_trusted: bool = False
 
 
 class DomainInfo(BaseModel):
@@ -392,6 +401,7 @@ class ToolRegistry:
         policy: AccessPolicy | None = None,
         expected_digest: str | None = None,
         trusted_domains: set[str] | None = None,
+        trusted_output_tool_patterns: list[str] | None = None,
     ) -> RegistryDiff:
         """Populate the registry with tools from an upstream server.
 
@@ -448,6 +458,20 @@ class ToolRegistry:
         for every contract change turns that silent mutation path into
         an operator-visible event.
 
+        Output-guard trust flag
+        -----------------------
+        When *trusted_output_tool_patterns* is non-empty, any registered
+        tool whose name (or ``original_name``) matches one of the
+        ``fnmatch`` patterns has :attr:`ToolEntry.raw_output_trusted`
+        flipped to ``True``, so the gateway-level output guard will skip
+        scrubbing its result text. This is an operator override
+        complementary to the upstream-declared ``annotations:
+        {"x-raw-output-trusted": true}`` custom extension read from each
+        tool dict during population; whichever source signals trust
+        wins. Trust is not transitive: the scrubbing bypass applies
+        only to output sanitation, never to description sanitation or
+        schema validation.
+
         Returns a :class:`RegistryDiff` describing what changed (or a
         ``refused=True`` diff when the digest check fails).
         """
@@ -474,7 +498,18 @@ class ToolRegistry:
             # (collision renames inside the gateway registry don't alter
             # the digest — the digest fingerprints the upstream contract,
             # not the gateway-side display name).
-            accepted: list[tuple[str, str, dict[str, Any]]] = []
+            # The 4th tuple element carries the raw upstream ``annotations``
+            # dict (or an empty dict when absent or malformed) so the
+            # second loop below can read the ``x-raw-output-trusted``
+            # custom extension without re-indexing ``tools``.  Keeping
+            # annotations out of the digest call preserves PR #52's
+            # digest contract: the fingerprint tracks (name, description,
+            # inputSchema) only — the same three fields
+            # ``compute_schema_digest`` serializes for
+            # :class:`ToolEntry` instances.  Digest stability across
+            # populate boundaries is a load-bearing invariant of the
+            # schema-integrity gate.
+            accepted: list[tuple[str, str, dict[str, Any], dict[str, Any]]] = []
             schema_rejected_count = 0
             for raw in tools:
                 raw_name = raw.get("name", "")
@@ -493,8 +528,18 @@ class ToolRegistry:
                     schema_rejected_count += 1
                     continue
                 raw_description = raw.get("description", "") or ""
-                accepted.append((raw_name, raw_description, clean_schema))
-            candidate_digest = _digest_from_triples(accepted)
+                # Normalize ``annotations`` to a dict here so the
+                # second loop's ``x-raw-output-trusted`` lookup is a
+                # plain ``.get()`` and a malformed upstream payload
+                # (e.g., ``annotations: "string"`` or missing key)
+                # cannot crash registration for an otherwise-valid
+                # tool.  The sibling fail-safe — one poisoned tool
+                # must never DoS its siblings — is inherited from the
+                # description-sanitizer discipline.
+                annotations_raw = raw.get("annotations")
+                annotations = annotations_raw if isinstance(annotations_raw, dict) else {}
+                accepted.append((raw_name, raw_description, clean_schema, annotations))
+            candidate_digest = _digest_from_triples([(n, d, s) for n, d, s, _ in accepted])
 
             prior_digest = self._domain_digests.get(domain)
 
@@ -559,7 +604,8 @@ class ToolRegistry:
             filtered_count = 0
             prefix = f"{domain}_"
             domain_is_trusted = trusted_domains is not None and domain in trusted_domains
-            for name, raw_description, clean_schema in accepted:
+            output_patterns = trusted_output_tool_patterns or []
+            for name, raw_description, clean_schema, annotations in accepted:
                 # Collision renaming (see register_tool) may rewrite this tool's
                 # registered name to ``{domain}_{name}``.  Evaluate policy
                 # against both forms so rules written in either shape apply to
@@ -580,6 +626,36 @@ class ToolRegistry:
 
                 group = overrides.get(name, infer_group(domain, name))
 
+                # Determine raw_output_trusted from two independent
+                # sources — whichever signals trust wins:
+                #   1. Upstream-declared ``annotations`` custom
+                #      extension ``x-raw-output-trusted: true``.
+                #      ``annotations`` is already normalized to a dict
+                #      in the first-pass validator loop above, so a
+                #      non-dict upstream value has been collapsed to
+                #      ``{}`` and ``.get()`` returns ``None`` — the
+                #      identity comparison with ``True`` ensures a
+                #      non-bool truthy value (e.g., ``"yes"``) does
+                #      not accidentally grant trust.
+                #   2. Operator-supplied glob patterns applied here so
+                #      a deployment can opt specific tools out of
+                #      output scrubbing without coordinating with the
+                #      upstream vendor. Globs are tested against both
+                #      the upstream-advertised ``name`` and the
+                #      gateway-visible collision-prefixed name (same
+                #      dual-form discipline as the access-policy check
+                #      above) so operators can write
+                #      ``trusted_output_tools={"crm_*"}`` without
+                #      caring whether a given upstream happens to
+                #      self-prefix its tool names.
+                raw_output_trusted = annotations.get("x-raw-output-trusted") is True
+                if not raw_output_trusted and output_patterns:
+                    prefixed_name = name if name.startswith(prefix) else prefix + name
+                    for pattern in output_patterns:
+                        if fnmatch.fnmatchcase(name, pattern) or fnmatch.fnmatchcase(prefixed_name, pattern):
+                            raw_output_trusted = True
+                            break
+
                 self.register_tool(
                     ToolEntry(
                         name=name,
@@ -588,6 +664,7 @@ class ToolRegistry:
                         description=clean_description,
                         input_schema=clean_schema,
                         upstream_url=upstream_url,
+                        raw_output_trusted=raw_output_trusted,
                     )
                 )
             if filtered_count > 0:

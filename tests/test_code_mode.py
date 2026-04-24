@@ -31,9 +31,14 @@ class _FakeCallResult:
         is_error: bool = False,
     ) -> None:
         self.content = [_FakeTextBlock(text)] if text else []
-        # Attribute names mirror MCP camelCase field shape exactly.
-        self.structuredContent = structured
-        self.isError = is_error
+        # Attribute names mirror fastmcp's ``CallToolResult`` wrapper
+        # (snake_case throughout), which is what ``Client.call_tool``
+        # hands back to ``code_mode._invoke``. The raw MCP over-wire
+        # shape is camelCase, but the wrapper translates to snake_case
+        # for Python ergonomics — tests must match the wrapper's
+        # attribute names, not the wire protocol's.
+        self.structured_content = structured
+        self.is_error = is_error
 
 
 async def _allow_all_code_mode(_user: Any, _ctx: dict[str, Any]) -> bool:

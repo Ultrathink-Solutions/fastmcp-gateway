@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`fastmcp_gateway.output_guard` module**: new `OutputGuardConfig`, `OutputGuardHook`, and `sanitize_output()` primitives that scan tool-invocation result text for prompt-injection markup using the shared `injection_patterns.py` denylist. Three modes are available: `strip` (default — replace matches with a single space, preserving surrounding content), `reject` (raise `OutputGuardError`, which the meta-tool layer surfaces as a structured error envelope), and `marker` (replace matches with `[OUTPUT SCRUBBED BY GATEWAY]`). The hook is prepended to the gateway's hook chain at construction time so operator-supplied `after_execute` hooks always see already-scrubbed output.
+- **`output_guard` + `trusted_output_tools` kwargs on `GatewayServer`**: operators enable the guard by passing an `OutputGuardConfig(enabled=True)` instance (no env flag — explicit code config only). Per-tool bypass is available via two independent channels, either of which grants trust: an upstream-declared custom extension `annotations: {"x-raw-output-trusted": true}` read at registry-populate time, or an operator-supplied `trusted_output_tools={...}` set of `fnmatch` glob patterns. Trust is scoped to the output-scan bypass only — description sanitation and schema validation still apply.
+- **`OutputGuardError` exception** in `fastmcp_gateway.errors`: raised by `OutputGuardHook` under `reject` mode. The hook lifts it to `ExecutionDenied(code="output_guard_reject")`, which the `execute_tool` meta-tool catches and surfaces as a structured `{"error": "...", "code": "output_guard_reject"}` envelope rather than propagating an uncaught exception.
+- **`raw_output_trusted: bool` field on `ToolEntry`**: records the per-tool trust decision made at populate time so the output-guard hook can look up the flag by name in O(1) during every `after_execute` invocation.
+- **New injection patterns**: `^\s*system\s*:`, `^\s*assistant\s*:` (heading-style role prefixes — line-anchored via the `re.MULTILINE` flag now in `INJECTION_FLAGS`, so `^` matches after every `\n`). Line-anchoring prevents false matches on benign inline mentions like `"The system: config"`. The denylist also picks up `<|im_start|>` / `<|im_end|>` (ChatML), `<<SYS>>` / `<</SYS>>` (Llama-family), and a few paraphrases of "ignore previous instructions". `PATTERN_VERSION` bumped to `2026-04-24.2`.
+
+### Changed
+
+- **`execute_tool` meta-tool now converts `ExecutionDenied` raised from `after_execute` hooks into a structured error response**: previously an `after_execute` hook that denied (e.g., the new output-guard in `reject` mode, or any operator hook that chooses to block) would propagate an uncaught exception. The error envelope uses the same shape as `before_execute` denials so caller tooling does not need a second code path.
+
+### Notes
+
+- **Default posture: off**. A library consumer who does not pass `output_guard=` gets no scrubbing behaviour; the code path is dormant. This preserves zero-behaviour-change for existing `pip install` upgrades. Production deployments should explicitly pass `OutputGuardConfig(enabled=True, mode="strip")`; see the production-configuration guide (forthcoming) for the full zero-trust recipe.
+- **Code-mode is deliberately not intercepted**. When `code_mode=True`, raw upstream tool results flow into the Monty sandbox namespace un-scrubbed — operator-authored sandbox code is the decision point for what reaches the LLM. A pinned regression test locks this invariant. Follow-up work on defense-in-depth at the sandbox boundary is tracked separately.
+- **25 new tests** in `tests/test_output_guard.py` cover all three modes, per-tool bypass via both annotation and operator glob, case-insensitive pattern match, byte-cap scan truncation, mixed-content preservation under `strip`, the error-envelope pass-through, end-to-end integration through `GatewayServer`, and the code-mode exemption invariant.
+
 ## [0.17.0] - 2026-04-24
 
 ### Added

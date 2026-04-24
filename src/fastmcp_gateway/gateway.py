@@ -15,6 +15,7 @@ from fastmcp import FastMCP
 from fastmcp_gateway.access_policy import AccessPolicy, normalize_upstreams
 from fastmcp_gateway.client_manager import UpstreamManager
 from fastmcp_gateway.hooks import HookRunner
+from fastmcp_gateway.output_guard import OutputGuardConfig, OutputGuardHook
 from fastmcp_gateway.registration_auth import (
     RegistrationAuthError,
     RegistrationTokenValidator,
@@ -160,6 +161,27 @@ class GatewayServer:
         intentionally contain denylist tokens. Accepted as an explicit
         Python-code kwarg (no env-var form) so a deployment mistake
         can't silently weaken sanitation.
+    output_guard:
+        Optional :class:`~fastmcp_gateway.output_guard.OutputGuardConfig`
+        enabling the gateway-level output guard. When ``enabled=True``,
+        an :class:`~fastmcp_gateway.output_guard.OutputGuardHook` is
+        **prepended** to the hook chain so it runs before any operator-
+        supplied ``after_execute`` hooks — this guarantees downstream
+        hooks see already-scrubbed output and an operator can't
+        accidentally disable the guard by placing a non-compliant hook
+        earlier in the list. Passed as a Python object (no env flag)
+        so enabling / disabling requires a deliberate deployment
+        change; default ``None`` means the guard is not installed.
+    trusted_output_tools:
+        Optional iterable of ``fnmatch`` glob patterns naming tools
+        that are allowed to return prompt-like content — the output
+        guard skips scrubbing for any registered tool whose name
+        matches. Complementary to the upstream-declared
+        ``annotations: {"x-raw-output-trusted": true}`` custom
+        extension, which is the preferred signal; this operator-side
+        override exists so a deployment can bypass scrubbing without
+        coordinating with the upstream vendor. Patterns are applied
+        at registry-populate time and re-applied on every refresh.
 
     Usage::
 
@@ -191,6 +213,8 @@ class GatewayServer:
         code_mode_audit_verbatim: bool = False,
         middleware: list[Any] | None = None,
         sanitizer_trusted_domains: set[str] | None = None,
+        output_guard: OutputGuardConfig | None = None,
+        trusted_output_tools: set[str] | None = None,
     ) -> None:
         # Accept either a plain URL mapping or an object-shaped mapping with
         # per-entry allowed_tools / denied_tools.  The explicit access_policy
@@ -204,7 +228,26 @@ class GatewayServer:
         self._custom_instructions = instructions  # None → auto-build from registry
         self._refresh_interval = refresh_interval
         self._refresh_task: asyncio.Task[None] | None = None
-        self._hook_runner = HookRunner(hooks)
+        # Build the hook list so the output guard (when enabled) is
+        # **always first**. Prepending (vs appending) is deliberate:
+        # operator-supplied ``after_execute`` hooks then see scrubbed
+        # output, which is the right default. If we appended, a hook
+        # that bailed early (returned without calling the next) could
+        # silently skip sanitation — that contract inversion is the
+        # kind of latent misconfig we explicitly refuse to allow.
+        seeded_hooks: list[Any] = []
+        self._output_guard_config = output_guard
+        if output_guard is not None and output_guard.enabled:
+            seeded_hooks.append(
+                OutputGuardHook(
+                    registry=self.registry,
+                    mode=output_guard.mode,
+                    max_scan_bytes=output_guard.max_scan_bytes,
+                )
+            )
+        if hooks:
+            seeded_hooks.extend(hooks)
+        self._hook_runner = HookRunner(seeded_hooks)
         # Mutual exclusion between the deprecated static-bearer path
         # and the new validator path is enforced at construction so
         # that misconfigurations fail loudly at startup instead of
@@ -300,6 +343,7 @@ class GatewayServer:
             upstream_headers=upstream_headers,
             policy=effective_policy,
             sanitizer_trusted_domains=sanitizer_trusted_domains,
+            trusted_output_tools=trusted_output_tools,
         )
         self._mcp = FastMCP(
             name,
