@@ -191,11 +191,13 @@ chat:
 # KNOWLEDGE BASE
 # ==============================================================================
 knowledge_base:
+  # Scope learnings and issues to this repo only. Prevents a public PR from
+  # poisoning a shared knowledge store used across other repositories.
   learnings:
-    scope: auto
+    scope: local
 
   issues:
-    scope: auto
+    scope: local
 
   code_guidelines:
     enabled: true
