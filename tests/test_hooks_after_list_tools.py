@@ -160,7 +160,7 @@ def _make_registry_with_malloy() -> ToolRegistry:
 
 
 class _HideMalloyExecuteQuery:
-    """Hook that filters out malloy_executeQuery (simulates SpiceDB denial)."""
+    """Hook that filters out malloy_executeQuery (simulates an authorization denial)."""
 
     async def after_list_tools(self, tools: list[ToolEntry], context: ListToolsContext) -> list[ToolEntry]:
         return [t for t in tools if t.name != "malloy_executeQuery"]

@@ -1,4 +1,4 @@
-"""Tests for registry refresh functionality (ULT-688)."""
+"""Tests for registry refresh functionality."""
 
 from __future__ import annotations
 
