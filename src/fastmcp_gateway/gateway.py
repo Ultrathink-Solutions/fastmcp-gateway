@@ -682,6 +682,12 @@ class GatewayServer:
 
             description = body.get("description")
             headers = body.get("headers")
+            discovery_url = body.get("discovery_url")
+            if discovery_url is not None and not isinstance(discovery_url, str):
+                return JSONResponse(
+                    {"error": "'discovery_url' must be a string", "code": "bad_request"},
+                    status_code=400,
+                )
             if headers is not None and (
                 not isinstance(headers, dict)
                 or not all(isinstance(k, str) and isinstance(v, str) for k, v in headers.items())
@@ -701,6 +707,17 @@ class GatewayServer:
                     url,
                     allow_private=_url_guard_allow_private(),
                 )
+                # discovery_url targets a separate endpoint (e.g.
+                # `/_introspect`) on the same upstream host. Pass through
+                # the same SSRF/private-network guards as the execution
+                # URL — there is no scenario where a discovery URL should
+                # be allowed to a destination class the execution URL is
+                # not. Skip when unset to preserve backward-compat.
+                if discovery_url is not None:
+                    await validate_registration_url(
+                        discovery_url,
+                        allow_private=_url_guard_allow_private(),
+                    )
                 if headers is not None:
                     validate_registration_headers(headers)
             except RegistrationGuardError as exc:
@@ -713,6 +730,7 @@ class GatewayServer:
                 diff = await gateway.upstream_manager.add_upstream(
                     domain,
                     url,
+                    discovery_url=discovery_url,
                     headers=headers,
                     registry_auth_headers=headers,
                 )
@@ -725,6 +743,7 @@ class GatewayServer:
                 {
                     "registered": domain,
                     "url": url,
+                    "discovery_url": discovery_url or url,
                     "tools_discovered": diff.tool_count,
                     "tools_added": diff.added,
                 }
