@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.0] - 2026-05-21
+
+### Added
+
+- **`auth` kwarg on `GatewayServer`**: accepts a `fastmcp.server.auth.AuthProvider` (or any subclass: `TokenVerifier`, `RemoteAuthProvider`, `OAuthProvider`, `OAuthProxy`) and threads it into the underlying `FastMCP(auth=...)` constructor. When set, FastMCP mounts the corresponding OAuth / discovery / DCR routes on the HTTP transport. `auth=None` (the default) preserves the prior unauthenticated behaviour bit-for-bit; existing call sites need no changes.
+- **Use case**: MCP clients that require RFC 7591 Dynamic Client Registration (Claude Code, Claude Desktop, VS Code MCP) need to talk to upstream identity providers that don't implement DCR (Microsoft Entra ID, GitHub, Google). Wrapping the IdP with `fastmcp.server.auth.OAuthProxy` and passing it as `auth=` gives those clients a DCR-capable facade while keeping a single pre-registered client downstream at the IdP.
+- **`GATEWAY_AUTH_MODULE` + `GATEWAY_ALLOWED_AUTH_PREFIXES` env loader**: mirrors the existing `GATEWAY_HOOK_MODULE` / `GATEWAY_MIDDLEWARE_MODULE` pattern (allowlist-gated dotted-path import, dot-boundary match, SystemExit on partial / malformed config). Factory may return `None` for "auth not configured for this deployment" — same semantics as not setting the env var.
+
+### Tests
+
+- 22 new tests in `tests/test_auth_allowlist.py` covering the parse helper, module-matcher (exact, dot-boundary, prefix-without-dot rejection), allowlist gating, malformed path, factory-returns-None, factory-returns-non-provider, missing attr, non-callable factory, and import-time `RuntimeError`. The existing 31 gateway-construction tests still pass under `auth=None`.
+
 ## [0.19.0] - 2026-05-21
 
 ### Added
@@ -564,6 +576,8 @@ Security-hardening release. Closes two code-injection primitives in the env-driv
 
 - Migrated `ToolEntry` and `DomainInfo` from dataclasses to Pydantic models (#9)
 
+[0.20.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.19.0...v0.20.0
+[0.19.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.15.0...v0.16.0

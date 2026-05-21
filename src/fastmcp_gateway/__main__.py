@@ -97,6 +97,33 @@ Configure via environment variables:
         ``GATEWAY_ALLOWED_HOOK_PREFIXES``.
         Example: ``GATEWAY_ALLOWED_MIDDLEWARE_PREFIXES=my_org.middleware,ops.middleware``
 
+    GATEWAY_AUTH_MODULE
+        Python dotted path to a factory function that returns a single
+        ``fastmcp.server.auth.AuthProvider`` instance (or ``None``).
+        Format: ``module.path:function_name``.  The returned provider
+        is passed straight to ``GatewayServer(auth=...)``; the gateway
+        wires it into the underlying FastMCP server's ``auth`` slot,
+        which causes FastMCP to mount the corresponding OAuth /
+        discovery / DCR routes on the HTTP transport.  Use this when
+        MCP clients that require RFC 7591 Dynamic Client Registration
+        (Claude Code, Claude Desktop, VS Code MCP) need to talk to an
+        upstream identity provider that doesn't support DCR — wrap the
+        IdP with ``fastmcp.server.auth.OAuthProxy`` and return that
+        from the factory.
+        Example: my_package.auth:build_auth
+
+        **Ignored unless GATEWAY_ALLOWED_AUTH_PREFIXES is also
+        set** — same security boundary as ``GATEWAY_HOOK_MODULE``.
+
+    GATEWAY_ALLOWED_AUTH_PREFIXES
+        Comma-separated allowlist of Python module prefixes that
+        GATEWAY_AUTH_MODULE may resolve to.  When unset,
+        GATEWAY_AUTH_MODULE is ignored entirely and the auth provider
+        must be passed programmatically to ``GatewayServer(auth=...)``.
+        Dot-boundary match, same rule as
+        ``GATEWAY_ALLOWED_HOOK_PREFIXES``.
+        Example: ``GATEWAY_ALLOWED_AUTH_PREFIXES=my_org.auth,ops.auth``
+
     GATEWAY_REGISTRATION_TOKEN
         **Deprecated.**  Shared secret that protects the dynamic
         registration REST endpoints (POST/DELETE/GET
@@ -179,6 +206,7 @@ import os
 import sys
 from typing import Any
 
+from fastmcp_gateway._auth_loading import _load_auth
 from fastmcp_gateway._hook_loading import _load_hooks
 from fastmcp_gateway._middleware_loading import _load_middleware
 from fastmcp_gateway.code_mode import CodeModeUnavailableError
@@ -466,6 +494,16 @@ def main() -> None:
     # Code mode (experimental, off by default).
     code_mode, code_mode_limits, code_mode_audit_verbatim = _load_code_mode_config()
 
+    # Inbound auth provider (optional). Loaded from the
+    # ``GATEWAY_AUTH_MODULE`` env var under the same allowlist guard
+    # that gates hook / middleware loading. Plugs a FastMCP
+    # ``AuthProvider`` (typically an ``OAuthProxy``) into the underlying
+    # ``FastMCP(auth=...)`` constructor — required when MCP clients
+    # that mandate RFC 7591 Dynamic Client Registration (Claude Code,
+    # Claude Desktop, VS Code MCP) need to talk to an upstream IdP that
+    # doesn't support DCR.
+    auth = _load_auth()
+
     try:
         gateway = GatewayServer(
             upstreams,
@@ -482,6 +520,7 @@ def main() -> None:
             code_mode_limits=code_mode_limits,
             code_mode_audit_verbatim=code_mode_audit_verbatim,
             middleware=middleware,
+            auth=auth,
         )
     except CodeModeUnavailableError as exc:
         # Friendly handling for the one construction-time error with a
