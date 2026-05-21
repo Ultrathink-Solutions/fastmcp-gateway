@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.0] - 2026-05-21
+
+### Added
+
+- **`discovery_url` parameter on `UpstreamManager.add_upstream(...)` + new `discovery_urls={domain: url}` kwarg on the `UpstreamManager` constructor**: lets operators separate the URL the registry uses for tool discovery (`list_tools`) from the URL used for tool execution (`tools/call`). Each path gets its own `Client` instance — the registry client targets `discovery_url`, the execution client always targets `url`. When `discovery_url` is omitted, both paths target the canonical URL, preserving the prior single-client behaviour exactly.
+- **Use case**: pairs with a backend that exposes an unauthenticated discovery endpoint (e.g. host-root `/_introspect` serving the MCP `initialize` + `notifications/initialized` + `tools/list` slice) protected by network policy, while keeping `tools/call` on the authenticated `/mcp` path. The registry-controller sidecar can then populate tool catalogs without holding a user JWT.
+
+### Fixed
+
+- **`registry_auth_headers` no longer bleeds onto execution clients**: the execution base client is now constructed without transport headers. Previously it was seeded with the registry-auth headers, and because `Client.new()` preserves transport headers, every per-request clone created by `_make_execution_client` would inherit the registry credential, layering it onto user-driven `execute_tool` calls. Per-request clones continue to merge the inbound request's headers via the existing `ContextVar` (unchanged path).
+- **`add_upstream` upserts close the prior client pair before replacement**: re-registering an existing domain previously dropped the prior registry and execution clients from the dict without closing them, leaking two live MCP sessions per refresh. The new code closes both via `async with old: pass` before the replacement clients are installed.
+
+### Tests
+
+- Four new tests in `tests/test_client_manager.py` covering: discovery routes `list_tools` while execution routes `call_tool`; the headerless-execution-base invariant (regression guard for the header-bleed fix); the close-on-upsert path; and the backward-compatible behaviour when `discovery_url` is omitted.
+
 ## [0.18.0] - 2026-04-24
 
 ### Added
