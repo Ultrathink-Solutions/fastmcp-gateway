@@ -31,6 +31,8 @@ from fastmcp_gateway.url_guard import (
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
+    from fastmcp.server.auth import AuthProvider
+
 logger = logging.getLogger(__name__)
 
 
@@ -182,6 +184,16 @@ class GatewayServer:
         override exists so a deployment can bypass scrubbing without
         coordinating with the upstream vendor. Patterns are applied
         at registry-populate time and re-applied on every refresh.
+    auth:
+        Optional :class:`fastmcp.server.auth.AuthProvider` for the inbound
+        MCP client connection — passed straight to the underlying
+        ``FastMCP(auth=...)`` constructor. Any ``AuthProvider`` subclass
+        works: ``TokenVerifier`` for stateless JWT validation,
+        ``RemoteAuthProvider`` for proxying to a remote authorization
+        server, ``OAuthProvider`` / ``OAuthProxy`` for full OAuth 2.1 +
+        DCR handling when the upstream IdP doesn't support RFC 7591
+        Dynamic Client Registration. ``None`` (the default) leaves the
+        FastMCP transport unauthenticated and matches prior behaviour.
 
     Usage::
 
@@ -215,6 +227,7 @@ class GatewayServer:
         sanitizer_trusted_domains: set[str] | None = None,
         output_guard: OutputGuardConfig | None = None,
         trusted_output_tools: set[str] | None = None,
+        auth: AuthProvider | None = None,
     ) -> None:
         # Accept either a plain URL mapping or an object-shaped mapping with
         # per-entry allowed_tools / denied_tools.  The explicit access_policy
@@ -345,10 +358,19 @@ class GatewayServer:
             sanitizer_trusted_domains=sanitizer_trusted_domains,
             trusted_output_tools=trusted_output_tools,
         )
+        # ``auth`` plugs an inbound auth provider (TokenVerifier,
+        # RemoteAuthProvider, OAuthProvider, or any other AuthProvider
+        # subclass) into the underlying FastMCP server. When set, FastMCP
+        # mounts the corresponding OAuth / discovery / DCR routes on the
+        # HTTP transport — relevant for clients (Claude Code, Claude
+        # Desktop, VS Code) that require RFC 7591 Dynamic Client
+        # Registration against upstream identity providers that don't
+        # speak DCR (e.g. Microsoft Entra ID).
         self._mcp = FastMCP(
             name,
             instructions=instructions if instructions is not None else self._default_instructions(),
             lifespan=self._server_lifespan if refresh_interval else None,
+            auth=auth,
         )
         self._register_meta_tools()
         self._register_health_routes()
