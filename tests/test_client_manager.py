@@ -73,17 +73,15 @@ class TestPopulateAll:
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=None)
 
-        call_count = 0
-
         def make_client(url: str) -> MagicMock:
-            nonlocal call_count
+            # Resolve domain by URL — UpstreamManager now constructs two
+            # Client instances per domain (registry + execution) so any
+            # call-order indexing breaks. Mapping by URL is order-independent.
+            domain = next(d for d, u in upstreams.items() if u == url)
             client = AsyncMock()
             client.__aenter__ = AsyncMock(return_value=client)
             client.__aexit__ = AsyncMock(return_value=None)
-            # Determine domain from call order
-            domain = list(upstreams.keys())[call_count]
             client.list_tools = AsyncMock(return_value=_make_fake_tools(domain))
-            call_count += 1
             return client
 
         with patch("fastmcp_gateway.client_manager.Client", side_effect=make_client):
@@ -98,20 +96,21 @@ class TestPopulateAll:
     @pytest.mark.asyncio
     async def test_graceful_degradation_on_failure(self, registry: ToolRegistry, upstreams: dict[str, str]) -> None:
         """One failing upstream should not prevent others from populating."""
-        call_count = 0
+        first_domain = next(iter(upstreams.keys()))
 
         def make_client(url: str) -> MagicMock:
-            nonlocal call_count
+            domain = next(d for d, u in upstreams.items() if u == url)
             client = AsyncMock()
             client.__aenter__ = AsyncMock(return_value=client)
             client.__aexit__ = AsyncMock(return_value=None)
-            domain = list(upstreams.keys())[call_count]
-            if call_count == 0:
-                # First upstream fails
+            if domain == first_domain:
+                # First-domain upstream fails (selected by domain name
+                # rather than call order — UpstreamManager now constructs
+                # two Client instances per domain, so call-order indexing
+                # would mis-target which domain fails).
                 client.list_tools = AsyncMock(side_effect=ConnectionError("unreachable"))
             else:
                 client.list_tools = AsyncMock(return_value=_make_fake_tools(domain))
-            call_count += 1
             return client
 
         with patch("fastmcp_gateway.client_manager.Client", side_effect=make_client):
@@ -414,3 +413,186 @@ class TestUpstreamHeaders:
 
         # Should use base_client.new() since "svc" has no override
         base_client.new.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# discovery_url separation (registry vs execution clients)
+# ---------------------------------------------------------------------------
+
+
+def _make_dual_client_mock(domain: str) -> MagicMock:
+    """Build a Client mock that supports both discovery and execution paths.
+
+    The base mock answers ``list_tools`` (discovery side) and exposes a
+    ``.new()`` that returns a fresh mock answering ``call_tool``
+    (execution side). Lets a single ``side_effect`` factory serve every
+    ``Client(url)`` construction the manager performs.
+    """
+    client = AsyncMock()
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=None)
+    client.list_tools = AsyncMock(return_value=_make_fake_tools(domain))
+    client.transport = MagicMock()
+    client.transport.headers = {}
+
+    fresh = AsyncMock()
+    fresh.__aenter__ = AsyncMock(return_value=fresh)
+    fresh.__aexit__ = AsyncMock(return_value=None)
+    fresh.call_tool = AsyncMock(return_value=MagicMock())
+    fresh.transport = MagicMock()
+    fresh.transport.headers = {}
+    client.new = MagicMock(return_value=fresh)
+    return client
+
+
+class TestDiscoveryUrlSeparation:
+    """The registry client targets ``discovery_url`` (e.g. ``/_introspect``)
+    while the execution client always targets the canonical MCP URL.
+
+    Verifies the new contract added to support unauth-discovery backends
+    where tool registration hits a route that does not require a JWT.
+    """
+
+    @pytest.mark.asyncio
+    async def test_discovery_serves_list_tools_execution_serves_call_tool(self, registry: ToolRegistry) -> None:
+        """The discovery URL handles ``list_tools``; the canonical URL
+        handles ``execute_tool``. The discovery client is never cloned
+        for execution — a regression that fell back to it would dispatch
+        ``tools/call`` to an endpoint that does not accept it.
+        """
+        exec_url = "http://widgets:8080/mcp"
+        disc_url = "http://widgets:8080/_introspect"
+
+        clients_by_url: dict[str, MagicMock] = {}
+
+        def make_client(url: str) -> MagicMock:
+            client = _make_dual_client_mock("widgets")
+            clients_by_url[url] = client
+            return client
+
+        with patch("fastmcp_gateway.client_manager.Client", side_effect=make_client):
+            manager = UpstreamManager({}, registry)
+            await manager.add_upstream("widgets", exec_url, discovery_url=disc_url)
+            await manager.execute_tool("widgets_users_list")
+
+        # Discovery URL served list_tools; never cloned for execution.
+        assert clients_by_url[disc_url].list_tools.await_count == 1
+        assert clients_by_url[disc_url].new.call_count == 0, (
+            "discovery client must not be cloned for execution — would dispatch tools/call to the discovery endpoint"
+        )
+
+        # Canonical URL was cloned via .new() and the fresh client served call_tool.
+        assert clients_by_url[exec_url].new.call_count == 1
+        exec_fresh = clients_by_url[exec_url].new.return_value
+        exec_fresh.call_tool.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_omitting_discovery_url_routes_both_paths_to_url(self, registry: ToolRegistry) -> None:
+        """Backward-compat: when ``discovery_url`` is omitted, both
+        ``list_tools`` and ``execute_tool`` target the single canonical URL.
+
+        Two ``Client`` instances are still constructed (registry +
+        execution), but both point at the same URL.
+        """
+        exec_url = "http://legacy:8080/mcp"
+        constructed: list[MagicMock] = []
+
+        def make_client(url: str) -> MagicMock:
+            assert url == exec_url, f"unexpected URL {url!r}"
+            client = _make_dual_client_mock("legacy")
+            constructed.append(client)
+            return client
+
+        with patch("fastmcp_gateway.client_manager.Client", side_effect=make_client):
+            manager = UpstreamManager({}, registry)
+            await manager.add_upstream("legacy", exec_url)
+            await manager.execute_tool("legacy_users_list")
+
+        # Two distinct Client instances — order-independent assertions so
+        # a future refactor of construction order in __init__/add_upstream
+        # doesn't break this test.
+        assert len(constructed) == 2
+        total_list_tools = sum(c.list_tools.await_count for c in constructed)
+        total_clones = sum(c.new.call_count for c in constructed)
+        assert total_list_tools == 1, "list_tools should fire exactly once on the registry client"
+        assert total_clones == 1, "execute_tool should clone exactly one base client"
+
+    def test_registry_auth_headers_do_not_bleed_into_execution_client(self) -> None:
+        """Regression guard for the ``Client.new()`` header-bleed bug.
+
+        FastMCP's ``Client.new()`` preserves transport headers; if
+        ``registry_auth_headers`` were applied to the execution base
+        client, every per-request clone would inherit them and leak
+        the service credential onto user-driven ``execute_tool`` calls.
+        Auth headers must stay on the registry client only.
+        """
+        constructed: list[MagicMock] = []
+
+        def make_client(url: str) -> MagicMock:
+            client = MagicMock()
+            client.transport = MagicMock()
+            client.transport.headers = {}
+            constructed.append(client)
+            return client
+
+        with patch("fastmcp_gateway.client_manager.Client", side_effect=make_client):
+            UpstreamManager(
+                {"svc": "http://svc:8080/mcp"},
+                ToolRegistry(),
+                registry_auth_headers={"Authorization": "Bearer registry-only"},
+            )
+
+        # __init__ constructs (registry, execution) in that order.
+        reg_client, exec_client = constructed
+        assert reg_client.transport.headers == {"Authorization": "Bearer registry-only"}
+        assert exec_client.transport.headers == {}, (
+            "execution base client must remain headerless; Client.new() preserves headers, "
+            "so any value here would bleed into every execute_tool() clone"
+        )
+
+    @pytest.mark.asyncio
+    async def test_add_upstream_upsert_closes_previous_client_pair(self, registry: ToolRegistry) -> None:
+        """Re-registering an existing domain must close the prior
+        registry/execution client pair before replacing them.
+
+        The two-client model doubles the leak surface — without this
+        close path, every URL/header refresh would orphan two live
+        Client sessions per domain.
+        """
+        # Each Client constructed is an AsyncMock whose __aexit__ we
+        # can audit. We tag the first pair (the ones built during the
+        # initial add_upstream) so the upsert assertions can check
+        # exactly those instances were closed.
+        constructed: list[AsyncMock] = []
+
+        def make_client(url: str) -> AsyncMock:
+            client = _make_dual_client_mock("widgets")
+            constructed.append(client)
+            return client
+
+        with patch("fastmcp_gateway.client_manager.Client", side_effect=make_client):
+            manager = UpstreamManager({}, registry)
+            await manager.add_upstream("widgets", "http://widgets-v1:8080/mcp")
+
+            # First add_upstream constructed (registry, execution) for widgets.
+            first_reg, first_exec = constructed
+            # The registry client was opened by _populate_domain — its
+            # __aexit__ has already fired once from list_tools.
+            initial_reg_exits = first_reg.__aexit__.await_count
+
+            # Re-register: should close both prior clients before
+            # constructing the replacement pair.
+            await manager.add_upstream("widgets", "http://widgets-v2:8080/mcp")
+
+        # Four total: two from the first add, two from the upsert.
+        assert len(constructed) == 4
+        # Both prior clients were entered and exited once for the close
+        # path. The registry client picks up an additional pair (it was
+        # opened a second time by the upsert's own _populate_domain
+        # before the new replacement entered the registry slot, but that
+        # is the *replacement* registry client, not the original).
+        assert first_exec.__aenter__.await_count == 1
+        assert first_exec.__aexit__.await_count == 1
+        # The first registry client's exit count grew by 1 above the
+        # initial baseline (the close-on-upsert pass).
+        assert first_reg.__aexit__.await_count == initial_reg_exits + 1

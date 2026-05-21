@@ -117,6 +117,7 @@ class UpstreamManager:
         policy: AccessPolicy | None = None,
         sanitizer_trusted_domains: set[str] | None = None,
         trusted_output_tools: set[str] | None = None,
+        discovery_urls: dict[str, str] | None = None,
     ) -> None:
         self._upstreams = upstreams
         self._registry = registry
@@ -133,13 +134,31 @@ class UpstreamManager:
         # pattern triggered trust.
         self._trusted_output_tool_patterns: list[str] = sorted(trusted_output_tools) if trusted_output_tools else []
 
-        # Persistent clients for registry operations (no user context).
+        # Per-domain client pairs. The registry client targets the
+        # discovery URL (e.g. an unauth `/_introspect` endpoint that
+        # speaks the MCP discovery slice without requiring a JWT); the
+        # execution client targets the canonical MCP URL where user
+        # tool calls are dispatched and the inbound JWT must be
+        # validated. When no discovery URL is supplied for a domain
+        # the two clients connect to the same URL, preserving the
+        # pre-discovery-url-split behaviour exactly.
+        #
+        # registry_auth_headers are applied to the registry client only.
+        # The execution base client must stay header-free: `Client.new()`
+        # preserves transport headers, so any header set here would bleed
+        # into every per-request clone made by `_make_execution_client`
+        # and leak service credentials onto user-driven `execute_tool`
+        # calls.
         self._registry_clients: dict[str, Client] = {}
+        self._execution_clients: dict[str, Client] = {}
         for domain, url in upstreams.items():
-            client = Client(url)
+            disc_url: str = (discovery_urls or {}).get(domain) or url
+            reg_client = Client(disc_url)
             if registry_auth_headers:
-                _set_transport_headers(client, registry_auth_headers)
-            self._registry_clients[domain] = client
+                _set_transport_headers(reg_client, registry_auth_headers)
+            self._registry_clients[domain] = reg_client
+
+            self._execution_clients[domain] = Client(url)
 
     # ------------------------------------------------------------------
     # Registry population
@@ -333,7 +352,7 @@ class UpstreamManager:
         """Create a fresh client for tool execution via ``client.new()``.
 
         Always uses ``client.new()`` to create a shallow copy of the
-        registry client, ensuring consistent transport configuration.
+        execution-side client, ensuring consistent transport configuration.
         If *domain* has explicit upstream headers, those are merged onto
         the new client's transport.  Otherwise the client inherits
         request-passthrough behaviour via the ContextVar.
@@ -343,7 +362,10 @@ class UpstreamManager:
         2. Static ``upstream_headers[domain]`` (e.g. per-domain API keys)
         3. Request passthrough via ContextVar (incoming request headers)
         """
-        client = self._registry_clients[domain].new()
+        # Clone the execution-side client (not the registry one); the
+        # registry client may target a separate discovery URL (e.g.
+        # `/_introspect`) that does not accept `tools/call`.
+        client = self._execution_clients[domain].new()
         merged: dict[str, str] = {}
         if domain in self._upstream_headers:
             merged.update(self._upstream_headers[domain])
@@ -362,6 +384,7 @@ class UpstreamManager:
         domain: str,
         url: str,
         *,
+        discovery_url: str | None = None,
         headers: dict[str, str] | None = None,
         registry_auth_headers: dict[str, str] | None = None,
     ) -> RegistryDiff:
@@ -375,7 +398,16 @@ class UpstreamManager:
         domain:
             Domain name for the upstream (e.g. ``"apollo"``).
         url:
-            MCP server URL (e.g. ``"http://apollo:8080/mcp"``).
+            MCP server URL (e.g. ``"http://apollo:8080/mcp"``) used for
+            ``execute_tool`` dispatch. Carries the inbound user JWT via
+            request-passthrough.
+        discovery_url:
+            Optional MCP URL used for ``list_tools`` discovery only —
+            e.g. an unauth ``/_introspect`` endpoint mounted at host
+            root, network-policy-protected, that speaks the discovery
+            slice of the MCP protocol without requiring a user JWT.
+            When ``None``, discovery uses *url* and the prior single-
+            client behaviour applies.
         headers:
             Per-domain headers for tool execution (e.g. auth tokens).
         registry_auth_headers:
@@ -384,6 +416,8 @@ class UpstreamManager:
         with _tracer.start_as_current_span("gateway.add_upstream") as span:
             span.set_attribute("gateway.domain", domain)
             span.set_attribute("gateway.url", url)
+            if discovery_url:
+                span.set_attribute("gateway.discovery_url", discovery_url)
 
             self._upstreams[domain] = url
             if headers:
@@ -396,16 +430,40 @@ class UpstreamManager:
             # None-check (not truthiness) so callers can pass {} to explicitly
             # disable auth for a specific upstream even when startup auth exists.
             effective_auth = registry_auth_headers if registry_auth_headers is not None else self._registry_auth_headers
-            client = Client(url)
-            if effective_auth:
-                _set_transport_headers(client, effective_auth)
-            self._registry_clients[domain] = client
 
-            diff = await self._populate_domain(domain, client)
+            # Idempotent upsert: when re-registering an existing domain
+            # we are about to drop the references in `_registry_clients`
+            # / `_execution_clients`, so close the previous pair first
+            # to release their sessions. Mirrors the close pattern in
+            # `remove_upstream` — same rationale (the two instances are
+            # distinct Client objects even when discovery_url == url).
+            for old in (self._registry_clients.get(domain), self._execution_clients.get(domain)):
+                if old is None:
+                    continue
+                try:
+                    async with old:
+                        pass  # __aexit__ closes the session
+                except Exception:
+                    logger.debug("Error closing prior client for domain '%s'", domain, exc_info=True)
+
+            # Registry client targets the discovery URL (defaults to url
+            # when not supplied). Execution client always targets url.
+            # Auth headers stay on the registry side only — see the
+            # comment in __init__ for the Client.new() bleed rationale.
+            disc_url: str = discovery_url or url
+            reg_client = Client(disc_url)
+            if effective_auth:
+                _set_transport_headers(reg_client, effective_auth)
+            self._registry_clients[domain] = reg_client
+
+            self._execution_clients[domain] = Client(url)
+
+            diff = await self._populate_domain(domain, reg_client)
             logger.info(
-                "Registered upstream '%s' (%s): %d tools",
+                "Registered upstream '%s' (%s, discovery=%s): %d tools",
                 domain,
                 url,
+                disc_url,
                 diff.tool_count,
             )
             return diff
@@ -429,13 +487,19 @@ class UpstreamManager:
 
             self._registry.clear_domain(domain)
             self._upstreams.pop(domain, None)
-            client = self._registry_clients.pop(domain, None)
+            reg_client = self._registry_clients.pop(domain, None)
+            exec_client = self._execution_clients.pop(domain, None)
             self._upstream_headers.pop(domain, None)
 
-            # Close the client to release connection resources.
-            if client is not None:
+            # Close both clients to release connection resources. When
+            # discovery_url == url at add_upstream time, exec_client is a
+            # distinct Client instance pointing at the same URL — closing
+            # both is correct and not a double-close.
+            for c in (reg_client, exec_client):
+                if c is None:
+                    continue
                 try:
-                    async with client:
+                    async with c:
                         pass  # __aexit__ closes the session
                 except Exception:
                     logger.debug("Error closing client for domain '%s'", domain, exc_info=True)
