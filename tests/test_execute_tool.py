@@ -34,13 +34,24 @@ def mcp_server(populated_registry: ToolRegistry, manager: UpstreamManager) -> Fa
     return mcp
 
 
-def _fake_result(text: str, *, is_error: bool = False) -> MagicMock:
-    """Create a fake CallToolResult with text content."""
+def _fake_result(
+    text: str,
+    *,
+    is_error: bool = False,
+    structured_content: dict[str, Any] | None = None,
+) -> MagicMock:
+    """Create a fake CallToolResult with text content.
+
+    ``structured_content`` defaults to ``None`` (explicit, not MagicMock-auto)
+    so ``execute_tool``'s passthrough respects the MCP-spec contract that
+    ``structuredContent`` is an object-or-absent.
+    """
     block = MagicMock()
     block.text = text
     result = MagicMock()
     result.content = [block]
     result.is_error = is_error
+    result.structured_content = structured_content
     return result
 
 
