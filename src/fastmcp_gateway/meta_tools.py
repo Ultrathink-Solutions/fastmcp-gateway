@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING, Any, Literal
 
-from mcp.types import ToolAnnotations
+from fastmcp.tools import ToolResult
+from mcp.types import TextContent, ToolAnnotations
 from opentelemetry import trace
 
 from fastmcp_gateway.errors import error_response
@@ -294,15 +295,52 @@ def register_meta_tools(
                 suggestions=suggestions,
             )
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, openWorldHint=True))
+    def _error_result(error_text: str) -> ToolResult:
+        """Wrap an ``error_response`` string in a :class:`ToolResult`.
+
+        ``execute_tool`` declares ``-> ToolResult`` (strict, not a union
+        with ``str``) so FastMCP does not infer a structured-content
+        schema from the union and silently auto-populate
+        ``structuredContent`` from dict-shaped TextContent.  All error
+        paths therefore route their error envelope through this helper.
+        """
+        return ToolResult(
+            content=[TextContent(type="text", text=error_text)],
+            structured_content=None,
+        )
+
+    @mcp.tool(
+        annotations=ToolAnnotations(readOnlyHint=False, openWorldHint=True),
+        # output_schema=None disables FastMCP's auto-derivation of an
+        # output schema from the ``-> ToolResult`` return annotation.
+        # Without this, FastMCP wraps the returned ToolResult's content
+        # text into a ``{"result": "..."}`` dict and writes that to
+        # ``structured_content``, overriding the explicit None we set
+        # for the no-upstream-structured case (and corrupting the
+        # upstream's real ``structured_content`` when a hook did set it).
+        # Explicit None preserves the contract: ``structured_content``
+        # on the wire is exactly what ``transform_result`` deposited.
+        output_schema=None,
+    )
     async def execute_tool(
         tool_name: str,
         arguments: dict[str, Any] | None = None,
-    ) -> str:
+    ) -> ToolResult:
         """Execute a tool by name with the given arguments.
 
         Use discover_tools to find available tools, then get_tool_schema
         to see what arguments a tool accepts, then call this to execute it.
+
+        Returns a :class:`fastmcp.tools.tool.ToolResult` on success and on
+        upstream errors -- the result carries the legacy
+        ``{"tool": ..., "result": ...}`` string envelope as a TextContent
+        block (for agents parsing the inner ``result`` field) and forwards
+        the upstream ``CallToolResult.structured_content`` (if a
+        :meth:`Hook.transform_result` hook populated it) on the standard
+        MCP ``structuredContent`` channel.  Gateway-level failures
+        (tool not found, hook denial, upstream exception) return the
+        legacy string envelope only -- there is no upstream
+        ``CallToolResult`` to source ``structured_content`` from.
         """
         with _tracer.start_as_current_span("gateway.execute_tool") as span:
             span.set_attribute("gateway.tool_name", tool_name)
@@ -316,11 +354,13 @@ def register_meta_tools(
                 else:
                     hint = "Use discover_tools to browse available tools."
                 span.set_attribute("gateway.error_code", "tool_not_found")
-                return error_response(
-                    "tool_not_found",
-                    f"Unknown tool '{tool_name}'. {hint}",
-                    tool_name=tool_name,
-                    suggestions=suggestions,
+                return _error_result(
+                    error_response(
+                        "tool_not_found",
+                        f"Unknown tool '{tool_name}'. {hint}",
+                        tool_name=tool_name,
+                        suggestions=suggestions,
+                    )
                 )
 
             span.set_attribute("gateway.domain", entry.domain)
@@ -344,11 +384,13 @@ def register_meta_tools(
                     await hook_runner.run_before_execute(ctx)
                 except ExecutionDenied as denied:
                     span.set_attribute("gateway.error_code", denied.code)
-                    return error_response(
-                        denied.code,
-                        denied.message,
-                        tool=tool_name,
-                        domain=entry.domain,
+                    return _error_result(
+                        error_response(
+                            denied.code,
+                            denied.message,
+                            tool=tool_name,
+                            domain=entry.domain,
+                        )
                     )
 
                 # Use potentially mutated arguments from context
@@ -371,13 +413,15 @@ def register_meta_tools(
                 if ctx is not None and hook_runner.has_hooks:
                     await hook_runner.run_on_error(ctx, exc)
 
-                return error_response(
-                    "execution_error",
-                    f"Tool '{tool_name}' failed: "
-                    f"upstream server '{entry.domain}' returned an error. "
-                    "Other domains may still be available.",
-                    tool=tool_name,
-                    domain=entry.domain,
+                return _error_result(
+                    error_response(
+                        "execution_error",
+                        f"Tool '{tool_name}' failed: "
+                        f"upstream server '{entry.domain}' returned an error. "
+                        "Other domains may still be available.",
+                        tool=tool_name,
+                        domain=entry.domain,
+                    )
                 )
 
             # Allow hooks to transform the raw ``CallToolResult`` before
@@ -399,11 +443,13 @@ def register_meta_tools(
                     result = await hook_runner.run_transform_result(ctx, result)
                 except ExecutionDenied as denied:
                     span.set_attribute("gateway.error_code", denied.code)
-                    return error_response(
-                        denied.code,
-                        denied.message,
-                        tool=tool_name,
-                        domain=entry.domain,
+                    return _error_result(
+                        error_response(
+                            denied.code,
+                            denied.message,
+                            tool=tool_name,
+                            domain=entry.domain,
+                        )
                     )
 
             # Serialize content blocks to text
@@ -415,6 +461,20 @@ def register_meta_tools(
                     content_parts.append(str(block))
 
             result_text = "\n".join(content_parts)
+
+            # Capture upstream structured_content (set by a
+            # ``transform_result`` hook, or by FastMCP-server-side
+            # promotion of a typed upstream return) before any further
+            # processing.  ``getattr`` with a default keeps this safe
+            # against duck-typed upstream stand-ins that don't expose
+            # the attribute.  The ``isinstance`` narrowing enforces the
+            # MCP-spec contract (``structuredContent`` is an object) at
+            # the gateway boundary, so a misbehaving upstream that emits
+            # a list or scalar can't poison ``ToolResult`` validation
+            # downstream.
+            upstream_structured = getattr(result, "structured_content", None)
+            if upstream_structured is not None and not isinstance(upstream_structured, dict):
+                upstream_structured = None
 
             if result.is_error:
                 span.set_attribute("gateway.error_code", "upstream_error")
@@ -434,13 +494,18 @@ def register_meta_tools(
                         # through the same structured error envelope
                         # used by before_execute denials.
                         span.set_attribute("gateway.error_code", denied.code)
-                        return error_response(
-                            denied.code,
-                            denied.message,
-                            tool=tool_name,
-                            domain=entry.domain,
+                        return _error_result(
+                            error_response(
+                                denied.code,
+                                denied.message,
+                                tool=tool_name,
+                                domain=entry.domain,
+                            )
                         )
-                return result_text
+                return ToolResult(
+                    content=[TextContent(type="text", text=result_text)],
+                    structured_content=upstream_structured,
+                )
 
             result_text = json.dumps({"tool": tool_name, "result": result_text})
 
@@ -454,14 +519,19 @@ def register_meta_tools(
                     result_text = await hook_runner.run_after_execute(ctx, result_text, False)
                 except ExecutionDenied as denied:
                     span.set_attribute("gateway.error_code", denied.code)
-                    return error_response(
-                        denied.code,
-                        denied.message,
-                        tool=tool_name,
-                        domain=entry.domain,
+                    return _error_result(
+                        error_response(
+                            denied.code,
+                            denied.message,
+                            tool=tool_name,
+                            domain=entry.domain,
+                        )
                     )
 
-            return result_text
+            return ToolResult(
+                content=[TextContent(type="text", text=result_text)],
+                structured_content=upstream_structured,
+            )
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, openWorldHint=False))
     async def refresh_registry() -> str:

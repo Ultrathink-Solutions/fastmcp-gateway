@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.22.0] - 2026-05-24
+
+### Changed
+
+- **`execute_tool` now returns `ToolResult` (was `str`)**: the meta-tool wraps its legacy `{"tool": ..., "result": ...}` string envelope in a `fastmcp.tools.tool.ToolResult` whose `content` carries the envelope as a `TextContent` block (unchanged shape, backward compatible for agents parsing the inner `result`) and whose `structured_content` field forwards the upstream `CallToolResult.structured_content` — populated either by a `Hook.transform_result` hook (see 0.21.0) or by FastMCP's server-side promotion of a typed upstream return. This is the second half of the structured-output rollout begun in 0.21.0: 0.21.0 added the hook to *deposit* `structured_content`; 0.22.0 *propagates* it to MCP-aware clients via the standard `structuredContent` channel.
+- All gateway-internal error paths (`tool_not_found`, `before_execute` / `transform_result` / `after_execute` denial, upstream exception) are now also `ToolResult`-wrapped via a small `_error_result` helper. Their text payload is the existing `error_response` JSON; `structured_content` is `None` (gateway-side errors have no upstream payload to surface).
+- `@mcp.tool(output_schema=None)` is set explicitly on `execute_tool` to suppress FastMCP's auto-derivation of an output schema from the `-> ToolResult` return annotation. Without this, FastMCP would wrap the returned content text into a `{"result": "..."}` dict on the `structured_content` channel, overriding the explicit upstream passthrough and corrupting the hook's deposit. Explicit `None` preserves the contract: `structured_content` on the wire is exactly what the upstream / `transform_result` hook produced.
+
+### Compatibility
+
+- **Backward compatible** for agents reading `content[0].text`: the legacy `{"tool": ..., "result": ...}` envelope is unchanged.
+- **Breaking** for in-process test helpers (or any caller) using `str(result.data)` to recover the envelope: `result.data` is now the upstream's `structured_content` (a dict) rather than `None`, and `str(dict)` is a Python repr, not JSON. Read `result.content[0].text` directly to recover the legacy envelope; read `result.data` / `result.structured_content` to consume the new structured channel.
+
+### Tests
+
+- New end-to-end integration test `tests/test_hooks_integration.py::TestHookTransformsResult::test_structured_content_reaches_client` exercises the full path: a `transform_result` hook deposits a parsed dict on the upstream `CallToolResult`, the gateway propagates it through `ToolResult.structured_content`, and the in-process MCP client observes it on its `result.structured_content`. The legacy text envelope is independently asserted on `result.content[0].text` to lock in backward compatibility.
+- `tests/test_execute_tool.py::_fake_result` updated to set `structured_content=None` explicitly on the fake (avoids `MagicMock` auto-generating a non-dict attribute that would trip `ToolResult`'s Pydantic validation).
+- `tests/test_hooks_integration.py::_call_tool` and `tests/test_integration.py::_call_tool` updated to read `result.content[0].text` directly rather than `str(result.data)` (matches the new contract documented above).
+
 ## [0.21.0] - 2026-05-24
 
 ### Added
@@ -587,6 +606,7 @@ Security-hardening release. Closes two code-injection primitives in the env-driv
 
 - Migrated `ToolEntry` and `DomainInfo` from dataclasses to Pydantic models (#9)
 
+[0.22.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.18.0...v0.19.0

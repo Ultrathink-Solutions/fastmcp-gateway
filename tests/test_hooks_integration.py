@@ -58,10 +58,17 @@ async def registry_and_manager(echo_server: FastMCP) -> tuple[ToolRegistry, Upst
 
 
 async def _call_tool(mcp: FastMCP, name: str, args: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Call a tool on the gateway and return parsed JSON."""
+    """Call a tool on the gateway and return the parsed legacy text envelope.
+
+    Reads ``content[0].text`` directly: ``execute_tool`` now also populates
+    ``structured_content`` on its ``ToolResult`` for the new MCP typed channel,
+    but these tests assert on the legacy ``{"tool": ..., "result": ...}``
+    envelope which lives in the TextContent block.  Tests that need to assert
+    on the structured channel read ``result.structured_content`` directly.
+    """
     async with Client(mcp) as client:
         result = await client.call_tool(name, args or {})
-    text = str(result.data) if result.data is not None else result.content[0].text  # type: ignore[union-attr]
+    text = result.content[0].text  # type: ignore[union-attr]
     return json.loads(text)
 
 
@@ -209,6 +216,44 @@ class TestHookTransformsResult:
         )
 
         assert order == ["transform_result", "after_execute"]
+
+    @pytest.mark.asyncio
+    async def test_structured_content_reaches_client(
+        self, registry_and_manager: tuple[ToolRegistry, UpstreamManager]
+    ) -> None:
+        """End-to-end: ``transform_result`` hook deposits ``structured_content``
+        on the upstream ``CallToolResult``, and the gateway's ``execute_tool``
+        propagates it through the MCP wire so the client's ``CallToolResult``
+        carries it on the standard ``structuredContent`` channel."""
+        registry, manager = registry_and_manager
+
+        class DepositStructuredHook:
+            async def transform_result(self, context: ExecutionContext, result: Any) -> Any:
+                # Mimic the wrapper's EnvelopeHook: parse the upstream text
+                # block and hoist into structured_content.
+                first = result.content[0]
+                parsed = json.loads(first.text)
+                if isinstance(parsed, dict):
+                    result.structured_content = parsed
+                return result
+
+        hook_runner = HookRunner([DepositStructuredHook()])
+        mcp = FastMCP("test-gateway")
+        register_meta_tools(mcp, registry, manager, hook_runner)
+
+        async with Client(mcp) as client:
+            result = await client.call_tool(
+                "execute_tool",
+                {"tool_name": "echo_ping", "arguments": {"message": "structured"}},
+            )
+
+        # Structured channel: the hook's deposit reached the agent.
+        assert result.structured_content == {"echo": "structured"}
+        # Legacy text envelope still present for backward-compat agents.
+        text = result.content[0].text  # type: ignore[union-attr]
+        envelope = json.loads(text)
+        assert envelope["tool"] == "echo_ping"
+        assert json.loads(envelope["result"]) == {"echo": "structured"}
 
     @pytest.mark.asyncio
     async def test_transform_result_denial_returns_error_response(

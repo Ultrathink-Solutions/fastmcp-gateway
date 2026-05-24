@@ -29,4 +29,4 @@ __all__ = [
     "OutputGuardHook",
     "get_user_headers",
 ]
-__version__ = "0.21.0"
+__version__ = "0.22.0"

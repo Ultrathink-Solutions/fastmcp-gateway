@@ -88,10 +88,16 @@ async def gateway(crm_server: FastMCP, analytics_server: FastMCP) -> FastMCP:
 
 
 async def _call_tool(mcp: FastMCP, name: str, args: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Call a tool on the gateway and return parsed JSON."""
+    """Call a tool on the gateway and return the parsed legacy text envelope.
+
+    Reads ``content[0].text`` directly: ``execute_tool`` now also populates
+    ``structured_content`` on its ``ToolResult`` for the new MCP typed channel,
+    but these tests assert on the legacy ``{"tool": ..., "result": ...}``
+    envelope which lives in the TextContent block.
+    """
     async with Client(mcp) as client:
         result = await client.call_tool(name, args or {})
-    text = str(result.data) if result.data is not None else result.content[0].text  # type: ignore[union-attr]
+    text = result.content[0].text  # type: ignore[union-attr]
     return json.loads(text)
 
 
