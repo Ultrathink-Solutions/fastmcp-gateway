@@ -380,6 +380,32 @@ def register_meta_tools(
                     domain=entry.domain,
                 )
 
+            # Allow hooks to transform the raw ``CallToolResult`` before
+            # any content-block flattening or envelope wrapping.  Hooks
+            # may preserve ``structuredContent``, rewrite content
+            # blocks, or replace the result with a domain-specific
+            # envelope while the structured payload is still intact.
+            # The string-based ``after_execute`` hook still runs later
+            # on the post-flatten result for backward compatibility.
+            #
+            # A ``transform_result`` hook may raise ``ExecutionDenied``
+            # (e.g. an operator hook inspecting the upstream payload to
+            # surface a policy rejection). Catch it here and route
+            # through the same structured error envelope used by
+            # ``before_execute`` / ``after_execute`` denials -- meta-tools
+            # must never raise ``ExecutionDenied`` to the LLM.
+            if ctx is not None and hook_runner.has_hooks:
+                try:
+                    result = await hook_runner.run_transform_result(ctx, result)
+                except ExecutionDenied as denied:
+                    span.set_attribute("gateway.error_code", denied.code)
+                    return error_response(
+                        denied.code,
+                        denied.message,
+                        tool=tool_name,
+                        domain=entry.domain,
+                    )
+
             # Serialize content blocks to text
             content_parts: list[str] = []
             for block in result.content:

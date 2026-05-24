@@ -103,6 +103,9 @@ class TestHookProtocol:
             async def before_execute(self, context: ExecutionContext) -> None:
                 pass
 
+            async def transform_result(self, context: ExecutionContext, result: Any) -> Any:
+                return result
+
             async def after_execute(self, context: ExecutionContext, result: str, is_error: bool) -> str:
                 return result
 
@@ -284,6 +287,96 @@ class TestRunBeforeExecute:
         runner = HookRunner([NoBeforeHook()])
         ctx = _make_context()
         await runner.run_before_execute(ctx)  # Should not raise
+
+
+# ---------------------------------------------------------------------------
+# run_transform_result
+# ---------------------------------------------------------------------------
+
+
+def _fake_call_tool_result(text: str = "ok", *, is_error: bool = False) -> Any:
+    """Build a duck-typed stand-in for fastmcp's ``CallToolResult``.
+
+    Mirrors the fake shape used in ``test_execute_tool.py`` -- attribute
+    access only, no dependency on the real ``CallToolResult`` class.
+    """
+
+    class _Block:
+        def __init__(self, t: str) -> None:
+            self.text = t
+
+    class _Result:
+        def __init__(self, t: str, err: bool) -> None:
+            self.content = [_Block(t)]
+            self.is_error = err
+            self.structuredContent: dict[str, Any] | None = None
+
+    return _Result(text, is_error)
+
+
+class TestRunTransformResult:
+    @pytest.mark.asyncio
+    async def test_no_hooks_returns_original(self) -> None:
+        runner = HookRunner()
+        ctx = _make_context()
+        result = _fake_call_tool_result("original")
+        out = await runner.run_transform_result(ctx, result)
+        assert out is result
+
+    @pytest.mark.asyncio
+    async def test_pipeline_transforms(self) -> None:
+        class AppendHook:
+            async def transform_result(self, context: ExecutionContext, result: Any) -> Any:
+                result.content[0].text = result.content[0].text + "-1"
+                return result
+
+        class WrapHook:
+            async def transform_result(self, context: ExecutionContext, result: Any) -> Any:
+                result.content[0].text = f"[{result.content[0].text}]"
+                return result
+
+        runner = HookRunner([AppendHook(), WrapHook()])
+        ctx = _make_context()
+        out = await runner.run_transform_result(ctx, _fake_call_tool_result("hello"))
+        assert out.content[0].text == "[hello-1]"
+
+    @pytest.mark.asyncio
+    async def test_can_replace_structured_content(self) -> None:
+        class StructHook:
+            async def transform_result(self, context: ExecutionContext, result: Any) -> Any:
+                result.structuredContent = {"shape": "envelope", "data": result.content[0].text}
+                return result
+
+        runner = HookRunner([StructHook()])
+        ctx = _make_context()
+        out = await runner.run_transform_result(ctx, _fake_call_tool_result("payload"))
+        assert out.structuredContent == {"shape": "envelope", "data": "payload"}
+
+    @pytest.mark.asyncio
+    async def test_receives_is_error_results(self) -> None:
+        captured: list[bool] = []
+
+        class CaptureHook:
+            async def transform_result(self, context: ExecutionContext, result: Any) -> Any:
+                captured.append(result.is_error)
+                return result
+
+        runner = HookRunner([CaptureHook()])
+        ctx = _make_context()
+        await runner.run_transform_result(ctx, _fake_call_tool_result("e", is_error=True))
+        assert captured == [True]
+
+    @pytest.mark.asyncio
+    async def test_hook_without_transform_result_skipped(self) -> None:
+        class NoTransformHook:
+            async def before_execute(self, context: ExecutionContext) -> None:
+                pass
+
+        runner = HookRunner([NoTransformHook()])
+        ctx = _make_context()
+        result = _fake_call_tool_result("original")
+        out = await runner.run_transform_result(ctx, result)
+        assert out is result
 
 
 # ---------------------------------------------------------------------------
