@@ -10,6 +10,7 @@ Lifecycle order for ``execute_tool``::
     on_authenticate(headers) -> ctx.user
     before_execute(context)  -> may raise ExecutionDenied
     upstream call
+    transform_result(context, result) -> transformed CallToolResult
     after_execute(context, result, is_error) -> transformed result
     on_error(context, error) -> observability only (on exception)
 
@@ -29,6 +30,8 @@ from typing import TYPE_CHECKING, Any, runtime_checkable
 from typing_extensions import Protocol
 
 if TYPE_CHECKING:
+    from fastmcp.client.client import CallToolResult
+
     from fastmcp_gateway.registry import ToolEntry
 
 logger = logging.getLogger(__name__)
@@ -116,9 +119,22 @@ class Hook(Protocol):
     before_execute(context)
         Called before each tool execution.  Raise :class:`ExecutionDenied`
         to block execution.  Modify ``context`` in-place for mutations.
+    transform_result(context, result)
+        Called after the upstream returns a :class:`CallToolResult` and
+        before the gateway flattens its content blocks into the legacy
+        string envelope.  Return a (possibly transformed) ``CallToolResult``
+        -- hooks may rewrite ``content``, replace ``structuredContent``,
+        or change ``isError`` to re-shape the output before downstream
+        serialization.  Each hook receives the previous hook's output.
+        May raise :class:`ExecutionDenied` (e.g. an output guard that
+        inspects the upstream payload and rejects it) -- the meta-tool
+        layer catches it and returns a structured error envelope.
     after_execute(context, result, is_error)
-        Called after each tool execution.  Return a (possibly transformed)
-        result string.  Each hook receives the previous hook's output.
+        Called after each tool execution, on the already-flattened result
+        string.  Return a (possibly transformed) result string.  Each hook
+        receives the previous hook's output.  Prefer ``transform_result``
+        for structured envelope rewrites where preserving ``structuredContent``
+        matters.
     after_list_tools(tools, context)
         Called after ``discover_tools`` / ``get_tool_schema`` build their
         tool list.  Return a (possibly filtered) list.  Each hook receives
@@ -130,6 +146,7 @@ class Hook(Protocol):
 
     async def on_authenticate(self, headers: dict[str, str]) -> Any | None: ...
     async def before_execute(self, context: ExecutionContext) -> None: ...
+    async def transform_result(self, context: ExecutionContext, result: CallToolResult) -> CallToolResult: ...
     async def after_execute(self, context: ExecutionContext, result: str, is_error: bool) -> str: ...
     async def after_list_tools(self, tools: list[ToolEntry], context: ListToolsContext) -> list[ToolEntry]: ...
     async def on_error(self, context: ExecutionContext, error: Exception) -> None: ...
@@ -176,6 +193,21 @@ class HookRunner:
             method = getattr(hook, "before_execute", None)
             if method is not None:
                 await method(context)
+
+    async def run_transform_result(self, context: ExecutionContext, result: CallToolResult) -> CallToolResult:
+        """Execute all ``transform_result`` hooks.  Pipelines the ``CallToolResult``.
+
+        Fires after the upstream returns and before the gateway flattens
+        content blocks into the legacy string envelope, so hooks may
+        rewrite ``content``, replace ``structuredContent``, or change
+        ``isError`` while the structured payload is still intact.
+        """
+        current = result
+        for hook in self._hooks:
+            method = getattr(hook, "transform_result", None)
+            if method is not None:
+                current = await method(context, current)
+        return current
 
     async def run_after_execute(self, context: ExecutionContext, result: str, is_error: bool) -> str:
         """Execute all ``after_execute`` hooks.  Pipelines the result string."""

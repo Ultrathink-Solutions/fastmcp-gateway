@@ -147,6 +147,97 @@ class TestHookTransformsResult:
         assert result["redacted"] is True
         assert result["tool"] == "echo_ping"
 
+    @pytest.mark.asyncio
+    async def test_transform_result_runs_before_flatten(
+        self, registry_and_manager: tuple[ToolRegistry, UpstreamManager]
+    ) -> None:
+        """``transform_result`` sees the raw ``CallToolResult`` so a hook can
+        rewrite content blocks before the legacy string envelope is built."""
+        registry, manager = registry_and_manager
+
+        class RewriteContentHook:
+            async def transform_result(self, context: ExecutionContext, result: Any) -> Any:
+                # Replace the upstream's text block with one this hook owns.
+                # The downstream string flatten reads ``.text`` off each block,
+                # so the rewrite is observable in the final agent-visible
+                # ``result`` field.
+                for block in result.content:
+                    if hasattr(block, "text"):
+                        block.text = json.dumps({"rewritten_by": "transform_result_hook"})
+                return result
+
+        hook_runner = HookRunner([RewriteContentHook()])
+        mcp = FastMCP("test-gateway")
+        register_meta_tools(mcp, registry, manager, hook_runner)
+
+        result = await _call_tool(
+            mcp,
+            "execute_tool",
+            {"tool_name": "echo_ping", "arguments": {"message": "ignored"}},
+        )
+
+        assert result["tool"] == "echo_ping"
+        # The inner ``result`` string is the rewritten block, not the upstream's.
+        assert json.loads(result["result"]) == {"rewritten_by": "transform_result_hook"}
+
+    @pytest.mark.asyncio
+    async def test_transform_result_runs_before_after_execute(
+        self, registry_and_manager: tuple[ToolRegistry, UpstreamManager]
+    ) -> None:
+        """Lifecycle order: ``transform_result`` fires, then content is flattened,
+        then ``after_execute`` sees the post-flatten string."""
+        registry, manager = registry_and_manager
+        order: list[str] = []
+
+        class OrderHook:
+            async def transform_result(self, context: ExecutionContext, result: Any) -> Any:
+                order.append("transform_result")
+                return result
+
+            async def after_execute(self, context: ExecutionContext, result: str, is_error: bool) -> str:
+                order.append("after_execute")
+                return result
+
+        hook_runner = HookRunner([OrderHook()])
+        mcp = FastMCP("test-gateway")
+        register_meta_tools(mcp, registry, manager, hook_runner)
+
+        await _call_tool(
+            mcp,
+            "execute_tool",
+            {"tool_name": "echo_ping", "arguments": {"message": "x"}},
+        )
+
+        assert order == ["transform_result", "after_execute"]
+
+    @pytest.mark.asyncio
+    async def test_transform_result_denial_returns_error_response(
+        self, registry_and_manager: tuple[ToolRegistry, UpstreamManager]
+    ) -> None:
+        """``transform_result`` may raise ``ExecutionDenied`` -- the meta-tool
+        layer must convert it to a structured error envelope, not propagate
+        the exception to the LLM."""
+        registry, manager = registry_and_manager
+
+        class RejectOnContentHook:
+            async def transform_result(self, context: ExecutionContext, result: Any) -> Any:
+                # Mirrors output-guard reject mode: inspect the upstream
+                # payload, deny if a policy is violated.
+                raise ExecutionDenied("Payload violates output policy", code="output_blocked")
+
+        hook_runner = HookRunner([RejectOnContentHook()])
+        mcp = FastMCP("test-gateway")
+        register_meta_tools(mcp, registry, manager, hook_runner)
+
+        result = await _call_tool(
+            mcp,
+            "execute_tool",
+            {"tool_name": "echo_ping", "arguments": {"message": "anything"}},
+        )
+
+        assert result["code"] == "output_blocked"
+        assert "Payload violates output policy" in result["error"]
+
 
 # ---------------------------------------------------------------------------
 # Test: hook adds extra headers

@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.21.0] - 2026-05-24
+
+### Added
+
+- **`transform_result` hook**: new `Hook.transform_result(context, result: CallToolResult) -> CallToolResult` Protocol method that fires after the upstream returns and **before** `execute_tool` flattens content blocks into the legacy `{"tool": ..., "result": ...}` string envelope. Hooks may rewrite `content`, replace `structuredContent`, or change `isError` while the structured payload is still intact. Each hook receives the previous hook's output (pipelined, matching `after_execute` semantics). Default no-op preserves prior behaviour: deployments without a `transform_result` hook see no change.
+- **Use case**: lets operator hooks emit a domain-specific structured envelope (with MCP `structuredContent` populated) instead of the gateway's default triple-encoded JSON-in-string. The existing string-based `after_execute` hook still runs later on the post-flatten result for backward compatibility — prefer `transform_result` for envelope rewrites where preserving `structuredContent` matters.
+
+### Tests
+
+- Five new unit tests in `tests/test_hooks.py::TestRunTransformResult` covering: no-hooks passthrough, multi-hook pipelining, structured-content replacement, `is_error` results reaching the hook, and hooks-without-the-method being skipped. Three new integration tests in `tests/test_hooks_integration.py::TestHookTransformsResult` covering: content-block rewrite is observable in the final agent-visible payload, lifecycle order (`transform_result` fires before `after_execute`), and `ExecutionDenied` raised from `transform_result` is converted to a structured error envelope (parity with `before_execute` / `after_execute` denial handling — the meta-tool layer never propagates `ExecutionDenied` to the LLM).
+
 ## [0.20.0] - 2026-05-21
 
 ### Added
@@ -576,6 +587,7 @@ Security-hardening release. Closes two code-injection primitives in the env-driv
 
 - Migrated `ToolEntry` and `DomainInfo` from dataclasses to Pydantic models (#9)
 
+[0.21.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.17.0...v0.18.0
