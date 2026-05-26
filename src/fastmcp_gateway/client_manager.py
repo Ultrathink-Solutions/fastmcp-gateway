@@ -199,6 +199,7 @@ class UpstreamManager:
         client: Client,
         *,
         expected_digest: str | None = None,
+        upstream_url: str | None = None,
     ) -> RegistryDiff:
         """Connect to *client*, list its tools, and register them.
 
@@ -206,6 +207,15 @@ class UpstreamManager:
         :meth:`ToolRegistry.populate_domain` to explicitly acknowledge a
         schema contract change.  See that method's docstring for the
         full integrity-gate semantics.
+
+        *upstream_url*, when provided, overrides the URL passed into
+        the registry.  :meth:`add_upstream` uses this to probe a
+        candidate URL without first staging it into
+        ``self._upstreams`` — that lets a failed probe leave the
+        manager's per-domain dicts untouched instead of relying on
+        rollback after a partial commit.  Refresh paths leave this
+        ``None`` so the URL already committed in
+        ``self._upstreams[domain]`` is used.
         """
         with _tracer.start_as_current_span("gateway.populate_domain") as span:
             span.set_attribute("gateway.domain", domain)
@@ -235,9 +245,10 @@ class UpstreamManager:
                         entry["annotations"] = annotations
                 raw_tools.append(entry)
 
+            effective_url = str(upstream_url) if upstream_url is not None else str(self._upstreams[domain])
             diff = self._registry.populate_domain(
                 domain=domain,
-                upstream_url=str(self._upstreams[domain]),
+                upstream_url=effective_url,
                 tools=raw_tools,
                 policy=self._policy,
                 expected_digest=expected_digest,
@@ -393,6 +404,28 @@ class UpstreamManager:
         If the domain already exists, its URL and headers are updated and
         the registry is re-populated (idempotent upsert).
 
+        Transactional semantics
+        -----------------------
+        The probe (:meth:`_populate_domain`) runs against a candidate
+        ``reg_client`` built as a local — none of the per-domain
+        dicts (``_upstreams``, ``_upstream_headers``,
+        ``_registry_clients``, ``_execution_clients``) are mutated
+        until the probe succeeds.  Concurrent observers
+        (:meth:`list_upstreams`, :meth:`upstream_url`,
+        :meth:`execute_tool`) therefore never see a half-staged URL
+        paired with the prior tools, nor an unverified client pair
+        routing traffic before discovery confirmed the upstream is
+        reachable.
+
+        On probe failure or ``diff.refused``, the manager state is
+        unchanged — no rollback is required because no mutation
+        occurred.  On success, the four maps are committed in a
+        single synchronous region (no ``await``), making the
+        transition atomic from the asyncio event loop's perspective;
+        the prior client pair is closed only after that commit so
+        any in-flight :meth:`execute_tool` dispatch lands on the new
+        pair rather than a half-shut-down client.
+
         Parameters
         ----------
         domain:
@@ -419,25 +452,55 @@ class UpstreamManager:
             if discovery_url:
                 span.set_attribute("gateway.discovery_url", discovery_url)
 
-            self._upstreams[domain] = url
-            if headers:
-                self._upstream_headers[domain] = headers
-            else:
-                self._upstream_headers.pop(domain, None)
-
             # Use explicitly provided registry_auth_headers, or fall back
             # to the default configured at startup (GATEWAY_REGISTRY_AUTH_TOKEN).
             # None-check (not truthiness) so callers can pass {} to explicitly
             # disable auth for a specific upstream even when startup auth exists.
             effective_auth = registry_auth_headers if registry_auth_headers is not None else self._registry_auth_headers
 
-            # Idempotent upsert: when re-registering an existing domain
-            # we are about to drop the references in `_registry_clients`
-            # / `_execution_clients`, so close the previous pair first
-            # to release their sessions. Mirrors the close pattern in
-            # `remove_upstream` — same rationale (the two instances are
-            # distinct Client objects even when discovery_url == url).
-            for old in (self._registry_clients.get(domain), self._execution_clients.get(domain)):
+            # Build candidate clients as locals — ``Client(...)`` is
+            # pure construction (no I/O) and no shared-state mutation
+            # yet.  Auth headers stay on the registry side only — see
+            # the comment in __init__ for the Client.new() bleed
+            # rationale.
+            disc_url: str = discovery_url or url
+            reg_client = Client(disc_url)
+            if effective_auth:
+                _set_transport_headers(reg_client, effective_auth)
+            exec_client = Client(url)
+
+            # Probe with the candidate URL passed explicitly so
+            # _populate_domain does NOT read from self._upstreams.
+            # If this raises or returns diff.refused, the per-domain
+            # dicts remain in their pre-call state — concurrent
+            # observers see no transient half-staged URL paired with
+            # the prior tools.
+            diff = await self._populate_domain(domain, reg_client, upstream_url=url)
+            if diff.refused:
+                # Registry preserved its prior tools on refusal;
+                # manager keeps its prior URL/clients.  No mutations
+                # to undo.  Return the diff so the caller can
+                # surface the schema-mismatch detail in its response.
+                return diff
+
+            # Probe succeeded — commit all four maps in one
+            # synchronous region.  asyncio is single-threaded between
+            # awaits, so the four assignments below are atomic from
+            # any concurrent coroutine's perspective.
+            prior_reg_client = self._registry_clients.get(domain)
+            prior_exec_client = self._execution_clients.get(domain)
+            self._upstreams[domain] = url
+            if headers:
+                self._upstream_headers[domain] = headers
+            else:
+                self._upstream_headers.pop(domain, None)
+            self._registry_clients[domain] = reg_client
+            self._execution_clients[domain] = exec_client
+
+            # Close the prior client pair after commit.  Any concurrent
+            # dispatch that resumes here sees the already-committed
+            # new pair, never a half-shut-down client.
+            for old in (prior_reg_client, prior_exec_client):
                 if old is None:
                     continue
                 try:
@@ -446,19 +509,6 @@ class UpstreamManager:
                 except Exception:
                     logger.debug("Error closing prior client for domain '%s'", domain, exc_info=True)
 
-            # Registry client targets the discovery URL (defaults to url
-            # when not supplied). Execution client always targets url.
-            # Auth headers stay on the registry side only — see the
-            # comment in __init__ for the Client.new() bleed rationale.
-            disc_url: str = discovery_url or url
-            reg_client = Client(disc_url)
-            if effective_auth:
-                _set_transport_headers(reg_client, effective_auth)
-            self._registry_clients[domain] = reg_client
-
-            self._execution_clients[domain] = Client(url)
-
-            diff = await self._populate_domain(domain, reg_client)
             logger.info(
                 "Registered upstream '%s' (%s, discovery=%s): %d tools",
                 domain,

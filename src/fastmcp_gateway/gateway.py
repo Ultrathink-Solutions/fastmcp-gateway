@@ -10,6 +10,7 @@ import warnings
 from contextlib import asynccontextmanager, suppress
 from typing import TYPE_CHECKING, Any
 
+import httpx
 from fastmcp import FastMCP
 
 from fastmcp_gateway.access_policy import AccessPolicy, normalize_upstreams
@@ -34,6 +35,185 @@ if TYPE_CHECKING:
     from fastmcp.server.auth import AuthProvider
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Registration-time error classification (POST /registry/servers)
+# ---------------------------------------------------------------------------
+# When ``add_upstream`` opens an MCP session to ``discovery_url`` and calls
+# ``tools/list``, the probe can fail in three structurally different ways
+# that controller-style callers need to disambiguate:
+#
+#   * Transient network failure  → 503 + Retry-After (caller retries)
+#   * Upstream auth failure       → 422 (caller-fixable config error)
+#   * Anything else              → 500 (genuine internal error, escalate)
+#
+# The tuples below name the concrete exception classes that map to each
+# class. ``mcp.shared.exceptions.McpError`` is the SDK's unified wrapper
+# for *any* error arriving over an MCP connection — both transport-class
+# failures (``CONNECTION_CLOSED``) and peer-application protocol errors
+# (``METHOD_NOT_FOUND``, ``INVALID_PARAMS``, ``INTERNAL_ERROR``, …).  We
+# therefore do NOT treat it wholesale as transient; instead, the route
+# handler inspects ``McpError.error.code`` per-call via
+# :func:`_is_transient_mcp_error` and only retries on the JSON-RPC codes
+# that unambiguously represent a dropped session.
+
+# httpx errors raised when the upstream is unreachable or slow. These are
+# the structural "upstream not yet Ready" failure modes a startup-window
+# controller-side caller should retry on. Tuple form so ``except`` can
+# pattern-match the whole class at once.
+_UPSTREAM_TRANSIENT_HTTPX_ERRORS: tuple[type[BaseException], ...] = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.ReadTimeout,
+    httpx.WriteTimeout,
+    httpx.PoolTimeout,
+    httpx.ReadError,
+    httpx.WriteError,
+    httpx.RemoteProtocolError,
+)
+
+
+# Class-import sentinel for ``mcp.shared.exceptions.McpError``. When the
+# MCP SDK is available, the route handler catches McpError to decide
+# transient-vs-fall-through based on the JSON-RPC error code carried in
+# ``McpError.error.code``. When the SDK lays out its exception module
+# differently in a future release, the tuple stays empty and the
+# corresponding ``except`` clause matches nothing — leaving the
+# httpx-only transient classification path load-bearing.
+try:
+    from mcp.shared.exceptions import McpError as _McpError  # type: ignore[import-not-found]
+
+    _MCP_ERROR_TUPLE: tuple[type[BaseException], ...] = (_McpError,)
+except ImportError:  # pragma: no cover — defensive fallback
+    _MCP_ERROR_TUPLE = ()
+
+
+# JSON-RPC error codes that the route handler treats as transient when
+# wrapped in ``McpError``. ``CONNECTION_CLOSED`` (-32000) is the MCP-
+# defined "session dropped" signal — the only code in the SDK's reserved
+# range that unambiguously represents a transport-class failure. The
+# rest of the JSON-RPC reserved range (-32700..-32600, plus -32603
+# ``INTERNAL_ERROR``) covers protocol / peer-application errors that
+# are NOT retry-actionable: a controller looping on ``METHOD_NOT_FOUND``
+# or ``INVALID_PARAMS`` would never make progress, and ``INTERNAL_ERROR``
+# is a peer-reported "I failed processing your request" that may or may
+# not be transient — defaulting it to "fall through to 500" surfaces it
+# as escalation-worthy rather than masking it as boot-window noise.
+_TRANSIENT_MCP_ERROR_CODES: frozenset[int] = frozenset({-32000})
+
+
+def _is_transient_mcp_error(exc: BaseException) -> bool:
+    """Return ``True`` only for ``McpError`` instances carrying a transport-class code.
+
+    ``mcp.shared.exceptions.McpError`` wraps both transport-class failures
+    (e.g. ``CONNECTION_CLOSED`` when the session drops mid-flight) AND
+    peer-application protocol errors (``METHOD_NOT_FOUND``,
+    ``INVALID_PARAMS``, ``INTERNAL_ERROR``, …).  Only the former should
+    map to 503; the latter are caller-fixable (or peer-fixable) and must
+    fall through to the generic 500 path so a controller-side caller
+    doesn't loop on an unrecoverable error.
+
+    Returns ``False`` for any non-``McpError`` exception, or when the
+    MCP SDK is unimportable (``_MCP_ERROR_TUPLE`` empty), or when the
+    error's ``code`` is missing or not in the transient set.
+    """
+    if not isinstance(exc, _MCP_ERROR_TUPLE):
+        return False
+    error_data = getattr(exc, "error", None)
+    if error_data is None:
+        return False
+    code = getattr(error_data, "code", None)
+    return code in _TRANSIENT_MCP_ERROR_CODES
+
+
+# Combined transient tuple used by the route handler's ``except`` clause.
+# httpx transients are unconditionally transient; McpError needs a
+# per-call code inspection (see :func:`_is_transient_mcp_error`).  When
+# the MCP SDK is absent, ``_MCP_ERROR_TUPLE`` is empty and the combined
+# tuple degenerates to the httpx-only set, preserving the previous
+# behaviour exactly.
+_UPSTREAM_TRANSIENT_OR_MCP_ERRORS: tuple[type[BaseException], ...] = (
+    *_UPSTREAM_TRANSIENT_HTTPX_ERRORS,
+    *_MCP_ERROR_TUPLE,
+)
+
+
+# httpx errors raised when the upstream returned a non-2xx response that
+# carries an upstream-side status code we can inspect. We treat 401/403
+# as caller-fixable config errors (422); other status codes fall through
+# to the generic 500 path. ``httpx.HTTPStatusError`` is the only entry
+# because every other status-carrying exception in httpx is a subclass.
+_UPSTREAM_AUTH_ERRORS: tuple[type[BaseException], ...] = (httpx.HTTPStatusError,)
+
+
+# Recommended retry delay (seconds) returned in the 503 body and as the
+# ``Retry-After`` header value. Matches the registry-controller's default
+# poll interval — a single missed cycle, then back to the normal rhythm.
+_UPSTREAM_RETRY_AFTER_SECONDS = 5
+
+
+def _extract_upstream_status_code(exc: BaseException) -> int | None:
+    """Pull the upstream status code from an exception when one is attached.
+
+    ``httpx.HTTPStatusError`` carries ``exc.response.status_code``;
+    other exception shapes return ``None`` and the caller logs the
+    type-name instead.
+    """
+    response = getattr(exc, "response", None)
+    if response is None:
+        return None
+    return getattr(response, "status_code", None)
+
+
+def _scrub_url_for_diagnostics(url: str) -> str:
+    """Return *url* with userinfo, query, and fragment removed.
+
+    Registration error responses and log lines echo the failing URL
+    back to the caller so operators can disambiguate which upstream
+    triggered the error. Some URL shapes carry secrets in those
+    components (basic-auth in userinfo, signed-URL tokens in the
+    query string), so we strip them before they reach a log
+    aggregator or a JSON response body. Only ``scheme://host[:port]
+    /path`` survives — enough to identify the upstream, never enough
+    to replay against it.
+
+    Malformed URLs that fail to parse fall back to the literal
+    ``"<unparseable-url>"`` placeholder so we never leak the raw
+    string by accident.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return "<unparseable-url>"
+
+    if not parts.scheme or not parts.hostname:
+        return "<unparseable-url>"
+
+    host = parts.hostname
+    # IPv6 hosts come back from ``urlsplit`` without their brackets
+    # (``[::1]:80`` → host ``"::1"``). The bracketing must be
+    # restored before composing netloc, or downstream parsers would
+    # misread the embedded colons as port separators. Detect IPv6 by
+    # the presence of a colon in the host string.
+    bracketed_host = f"[{host}]" if ":" in host else host
+
+    # ``parts.port`` accesses an underlying property that raises
+    # ``ValueError`` when the URL carries a non-numeric or
+    # out-of-range port string (e.g. ``http://h:abc/``). Treat that as
+    # "no port" rather than letting the exception propagate — the
+    # scrubber's contract is to never raise on caller-supplied input.
+    try:
+        port = parts.port
+    except ValueError:
+        port = None
+
+    netloc = f"{bracketed_host}:{port}" if port is not None else bracketed_host
+
+    # urlunsplit signature: (scheme, netloc, path, query, fragment)
+    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
 
 
 class CodeModeAuthorizerRequiredError(ValueError):
@@ -748,7 +928,46 @@ class GatewayServer:
                     status_code=400,
                 )
 
-            async with gateway._registry_lock:
+            # Differentiated error response model (#NN).  ``add_upstream``
+            # opens an MCP session to ``discovery_url`` and calls
+            # ``tools/list`` — that probe can fail in three structurally
+            # different ways that a controller-style caller needs to
+            # disambiguate:
+            #
+            #   * Transient network failure (upstream pod still booting,
+            #     intermittent DNS, transport-level timeout).  Caller
+            #     should retry on the next reconcile cycle.  We return
+            #     ``503 Service Unavailable`` + ``Retry-After`` so the
+            #     caller backs off briefly and tries again without
+            #     escalating log severity.
+            #   * Upstream authentication / authorization failure (401 /
+            #     403 from the discovery probe).  Caller-fixable config
+            #     error — retrying won't help until the operator
+            #     corrects the auth posture.  We return ``422
+            #     Unprocessable Entity`` so the caller logs once and
+            #     stops hammering the endpoint.
+            #   * Anything else — actual internal error.  Falls through
+            #     to the generic ``500`` path with the original
+            #     exception logged.
+            #
+            # Reserving 500 for true internal errors lets controllers
+            # treat 5xx-but-503 as escalation-worthy and 503 as expected
+            # boot-window noise.
+            try:
+                # Probe the upstream OUTSIDE the registry lock. The
+                # ``add_upstream`` call opens an MCP session to
+                # ``discovery_url`` and awaits ``tools/list`` —
+                # holding ``gateway._registry_lock`` across that I/O
+                # would serialize every concurrent registration
+                # against an arbitrarily slow upstream. The asyncio
+                # event loop is single-threaded, and
+                # ``add_upstream`` is documented as an idempotent
+                # upsert for same-domain re-registration; the
+                # manager's per-domain dict mutations and
+                # ``ToolRegistry.populate_domain`` are both
+                # ``await``-free synchronous regions that the event
+                # loop cannot interleave, so this remains safe
+                # without external serialization for the probe.
                 diff = await gateway.upstream_manager.add_upstream(
                     domain,
                     url,
@@ -756,10 +975,112 @@ class GatewayServer:
                     headers=headers,
                     registry_auth_headers=headers,
                 )
-                if description:
-                    gateway.registry.set_domain_description(domain, description)
-                gateway._apply_domain_descriptions()
-                gateway._update_instructions()
+                # Schema-integrity gate refusal. ``add_upstream``
+                # rolls back its per-domain dict mutations on this
+                # path, so the manager continues to point at the
+                # prior URL/clients and ``execute_tool()`` keeps
+                # routing where it did before this POST. Do NOT
+                # touch description metadata or rebuild instructions
+                # — those would commit operator-visible state for a
+                # refusal that the registry just preserved.
+                if diff.refused:
+                    safe_url = _scrub_url_for_diagnostics(discovery_url or url)
+                    logger.warning(
+                        "Registration refused for domain '%s' (%s): "
+                        "upstream schema digest changed since the prior registration",
+                        domain,
+                        safe_url,
+                    )
+                    return JSONResponse(
+                        {
+                            "error": (
+                                f"Registration refused for '{domain}': the upstream's "
+                                "tool schema changed since the prior registration. "
+                                "Re-register with an explicit expected_digest "
+                                "acknowledging the new shape."
+                            ),
+                            "code": "schema_refused",
+                            "domain": domain,
+                        },
+                        status_code=409,
+                    )
+                # Re-acquire the registry lock only for the cross-
+                # cutting registry mutations that ``add_upstream``
+                # does NOT perform (description metadata + global
+                # description/instruction rebuild). These read the
+                # registry holistically and must observe a
+                # consistent snapshot.
+                async with gateway._registry_lock:
+                    if description:
+                        gateway.registry.set_domain_description(domain, description)
+                    gateway._apply_domain_descriptions()
+                    gateway._update_instructions()
+            except _UPSTREAM_TRANSIENT_OR_MCP_ERRORS as exc:
+                # ``McpError`` is the SDK's unified wrapper for both
+                # transport-class failures and peer-application
+                # protocol errors. Re-raise the non-transient flavour
+                # so it falls through to the generic 500 path — a
+                # controller looping on ``METHOD_NOT_FOUND`` would
+                # never make progress. httpx transients (the rest of
+                # the matched tuple) are unconditionally transient.
+                if isinstance(exc, _MCP_ERROR_TUPLE) and not _is_transient_mcp_error(exc):
+                    raise
+                # Scrub userinfo / query / fragment off the URL before
+                # it lands in logs or in the response body — some URL
+                # shapes carry secrets in those components.
+                safe_url = _scrub_url_for_diagnostics(discovery_url or url)
+                logger.info(
+                    "Upstream '%s' (%s) not yet reachable: %s — returning 503 for retry",
+                    domain,
+                    safe_url,
+                    type(exc).__name__,
+                )
+                return JSONResponse(
+                    {
+                        "error": (
+                            f"Upstream '{domain}' is not yet reachable at "
+                            f"'{safe_url}' ({type(exc).__name__}). "
+                            "This is expected during pod startup; retry shortly."
+                        ),
+                        "code": "upstream_not_ready",
+                        "domain": domain,
+                        "retry_after_seconds": _UPSTREAM_RETRY_AFTER_SECONDS,
+                    },
+                    status_code=503,
+                    headers={"Retry-After": str(_UPSTREAM_RETRY_AFTER_SECONDS)},
+                )
+            except _UPSTREAM_AUTH_ERRORS as exc:
+                upstream_status = _extract_upstream_status_code(exc)
+                # Only 401/403 from the upstream maps to a caller-fixable
+                # auth-config error. Other status codes (404 missing
+                # endpoint, 5xx upstream-internal, etc.) are not
+                # actionable by a controller-side retry policy — fall
+                # through to the generic 500 handler so they surface as
+                # escalation-worthy rather than as "stop hammering this".
+                if upstream_status not in (401, 403):
+                    raise
+                safe_url = _scrub_url_for_diagnostics(discovery_url or url)
+                logger.warning(
+                    "Upstream '%s' (%s) rejected discovery probe with status %s — caller-fixable",
+                    domain,
+                    safe_url,
+                    upstream_status,
+                )
+                return JSONResponse(
+                    {
+                        "error": (
+                            f"Upstream '{domain}' rejected the discovery probe at "
+                            f"'{safe_url}' with status "
+                            f"{upstream_status}. The auth posture between the "
+                            "gateway and the upstream is misconfigured; this will "
+                            "not succeed on retry without operator action."
+                        ),
+                        "code": "upstream_auth_failed",
+                        "domain": domain,
+                        "upstream_status": upstream_status,
+                    },
+                    status_code=422,
+                )
 
             return JSONResponse(
                 {
