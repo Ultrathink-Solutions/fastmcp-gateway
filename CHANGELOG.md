@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.23.0] - 2026-05-27
+
+### Changed
+
+- **`POST /registry/servers` now returns differentiated error responses** instead of collapsing every failure to a generic 500. A controller-style caller (e.g. a sidecar that polls a service registry and registers each discovered upstream) needs to disambiguate three structurally different failure modes so its retry policy doesn't either hammer an unrecoverable error or back off from a transient one. The new model:
+  - **`503 Service Unavailable` + `Retry-After: 5` header** — transient transport-level failure reaching the upstream (httpx `ConnectError`, `ConnectTimeout`, `ReadTimeout`, `WriteTimeout`, `PoolTimeout`, `ReadError`, `WriteError`, `RemoteProtocolError`, or an MCP-SDK `McpError` carrying the JSON-RPC `CONNECTION_CLOSED` (-32000) code). Body: `{code: "upstream_not_ready", domain, retry_after_seconds, error}` with `error` naming the exception class so operators can disambiguate `ConnectError` from `ReadTimeout` without leaving the response.
+  - **`422 Unprocessable Entity`** — upstream returned 401/403 to the discovery probe. Caller-fixable config error; retrying without an operator-side fix won't succeed. Body: `{code: "upstream_auth_failed", domain, upstream_status, error}`. Other upstream status codes (404, 5xx) fall through to 500 — they aren't retry-actionable but aren't necessarily auth-fixable either.
+  - **`409 Conflict`** — the upstream's tool schema digest changed since the prior registration for this domain and no `expected_digest` was supplied acknowledging the new shape. Prior manager state (URL + clients + tools) is preserved on this path; the caller must re-register with `expected_digest` set. Body: `{code: "schema_refused", domain, error}`.
+  - **`500`** reserved for true internal errors. `McpError`s carrying non-transport JSON-RPC codes (`METHOD_NOT_FOUND`, `INVALID_PARAMS`, peer-reported `INTERNAL_ERROR`, …) deliberately fall through to 500 so they surface as escalation-worthy rather than as boot-window noise a controller would loop on.
+- **Registration is now transactional**: `UpstreamManager.add_upstream` builds the candidate registry + execution `Client` pair as locals and runs the `tools/list` probe before mutating any per-domain state. On probe failure or `diff.refused`, none of `_upstreams` / `_upstream_headers` / `_registry_clients` / `_execution_clients` is touched — concurrent observers (`list_upstreams`, `upstream_url`, `execute_tool`) never see a half-staged URL paired with the prior tools. On success, the four maps commit in one synchronous region (no `await` between assignments), making the swap atomic from the asyncio event loop's perspective. The prior client pair is closed only after the commit so any in-flight `execute_tool` dispatch lands on the new pair rather than a half-shut-down client.
+- **Discovery probe now runs outside `_registry_lock`**: holding the registry lock across the probe's MCP `initialize` + `tools/list` round-trip serialized every concurrent registration against an arbitrarily slow upstream. The lock is now re-acquired only for the cross-cutting description/instruction rebuild that touches multiple domains.
+
+### Security
+
+- **Diagnostic URLs are scrubbed before they reach response bodies and log lines**: the new `_scrub_url_for_diagnostics` helper strips `userinfo`, `query`, and `fragment` from any URL echoed back in a 503/422/409 response body or in a `WARNING`/`INFO` log line. Some URL shapes carry credentials in those components (HTTP basic-auth in userinfo, signed-URL tokens in the query string); the scrubber preserves only `scheme://host[:port]/path` — enough to identify the upstream, never enough to replay against it. IPv6 hosts are re-bracketed; malformed URLs fall back to the literal `"<unparseable-url>"` placeholder.
+
+### Backwards compatibility
+
+- **Success-path response shape unchanged** (`200` with `{registered, url, tools_discovered}`).
+- **Failure-path callers that parsed only the HTTP status** now see 503 / 422 / 409 instead of 500 for the three classified modes. Callers that parsed the response body for `error` should also read the new `code` field to discriminate.
+
+### Tests
+
+- `tests/test_registration_error_model.py` adds 16 tests across four classes: parametrized coverage of every transient httpx exception + an `McpError` test that skips cleanly when the MCP SDK exception module layout differs (`TestTransientErrorsMapTo503`); parametrized 401/403 coverage (`TestUpstreamAuthErrorsMapTo422`); non-auth upstream status codes (404, 500, 502) and a bare `RuntimeError` falling through to 500 (`TestUnclassifiedErrorsMapTo500`); and regression coverage that the try/except wrapping did not alter the 200 success response shape (`TestSuccessfulRegistrationUnchanged`). Uses an RFC 5737 documentation IP (`203.0.113.5`) as the upstream URL so the URL guard accepts the registration without DNS stubbing; ASGITransport is configured with `raise_app_exceptions=False` so the test transport mirrors the 500 a real Starlette deploy would emit on uncaught exceptions.
+
 ## [0.22.0] - 2026-05-24
 
 ### Changed
@@ -606,6 +631,7 @@ Security-hardening release. Closes two code-injection primitives in the env-driv
 
 - Migrated `ToolEntry` and `DomainInfo` from dataclasses to Pydantic models (#9)
 
+[0.23.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.19.0...v0.20.0
