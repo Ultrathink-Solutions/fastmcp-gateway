@@ -13,6 +13,7 @@ an upstream requires a different auth token).
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from collections import defaultdict
 from typing import TYPE_CHECKING, Any
@@ -22,7 +23,7 @@ from fastmcp.server.dependencies import get_http_headers
 from opentelemetry import trace
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Awaitable, Callable
 
     from fastmcp.client.client import CallToolResult
 
@@ -128,7 +129,7 @@ class UpstreamManager:
         registry: ToolRegistry,
         *,
         registry_auth_headers: dict[str, str] | None = None,
-        registry_token_provider: Callable[[], str] | None = None,
+        registry_token_provider: Callable[[], str | Awaitable[str]] | None = None,
         upstream_headers: dict[str, dict[str, str]] | None = None,
         policy: AccessPolicy | None = None,
         sanitizer_trusted_domains: set[str] | None = None,
@@ -255,7 +256,12 @@ class UpstreamManager:
             # domains still populate/refresh concurrently.
             async with self._registry_locks[domain]:
                 if self._registry_token_provider is not None:
-                    token = self._registry_token_provider()
+                    # Support both sync (`-> str`) and async (`-> Awaitable[str]`)
+                    # providers: a token cache that mints over HTTP is naturally
+                    # async, and awaiting here (rather than forcing a sync bridge)
+                    # keeps the event loop unblocked and avoids a cold-start gap.
+                    result = self._registry_token_provider()
+                    token = await result if inspect.isawaitable(result) else result
                     _set_transport_headers(client, {"Authorization": f"Bearer {token}"})
 
                 async with client:

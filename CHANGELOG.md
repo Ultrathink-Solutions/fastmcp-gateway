@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`GATEWAY_REGISTRY_TOKEN_PROVIDER_MODULE` env loader for the registry token provider.** Lets the env-driven entry point supply a `registry_token_provider` (the per-fetch rotating-credential callback added in 0.24.0) without modifying gateway code — a `module.path:factory` whose zero-arg factory returns the provider callable. Allowlist-gated by `GATEWAY_ALLOWED_REGISTRY_TOKEN_PROVIDER_PREFIXES`, mirroring the `GATEWAY_AUTH_MODULE` / hook / middleware loaders' code-injection boundary (the module is ignored unless an explicit prefix allowlist is set). `GatewayServer` now also accepts and forwards `registry_token_provider` to `UpstreamManager`, so it can be supplied programmatically or via env.
+
+- **`registry_token_provider` now accepts a sync or async callable.** A provider returning an awaitable (e.g. a client-credentials token cache's async `get_token`) is awaited on the registry-fetch path, so it can mint over the network without blocking the event loop or needing a sync bridge. Sync providers are unchanged.
+
 ## [0.24.0] - 2026-06-30
 
 ### Added
