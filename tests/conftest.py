@@ -8,6 +8,21 @@ from fastmcp_gateway.registry import ToolEntry, ToolRegistry
 
 
 @pytest.fixture
+def registry() -> ToolRegistry:
+    """A fresh, empty tool registry."""
+    return ToolRegistry()
+
+
+@pytest.fixture
+def upstreams() -> dict[str, str]:
+    """Two sample upstream domains keyed by name -> URL."""
+    return {
+        "acme": "http://acme-mcp:8080/mcp",
+        "widgets": "http://widgets-mcp:8080/mcp",
+    }
+
+
+@pytest.fixture
 def empty_registry() -> ToolRegistry:
     """An empty tool registry."""
     return ToolRegistry()
