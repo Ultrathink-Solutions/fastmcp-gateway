@@ -30,7 +30,7 @@ from fastmcp_gateway.url_guard import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Awaitable, Callable
 
     from fastmcp.server.auth import AuthProvider
 
@@ -248,6 +248,11 @@ class GatewayServer:
     registry_auth_headers:
         Headers to send to upstreams during startup registry population
         (runs outside any HTTP request context).
+    registry_token_provider:
+        Optional zero-argument callable returning a bearer token, invoked
+        before each registry fetch so a short-lived / rotating credential
+        stays current. Takes precedence over *registry_auth_headers* on the
+        fetch path; forwarded to ``UpstreamManager``.
     upstream_headers:
         Per-domain headers for tool execution.  Domains listed here use
         these headers instead of request-passthrough.
@@ -392,6 +397,7 @@ class GatewayServer:
         name: str = "fastmcp-gateway",
         instructions: str | None = None,
         registry_auth_headers: dict[str, str] | None = None,
+        registry_token_provider: Callable[[], str | Awaitable[str]] | None = None,
         upstream_headers: dict[str, dict[str, str]] | None = None,
         domain_descriptions: dict[str, str] | None = None,
         refresh_interval: float | None = None,
@@ -533,6 +539,7 @@ class GatewayServer:
             normalized_urls,
             self.registry,
             registry_auth_headers=registry_auth_headers,
+            registry_token_provider=registry_token_provider,
             upstream_headers=upstream_headers,
             policy=effective_policy,
             sanitizer_trusted_domains=sanitizer_trusted_domains,

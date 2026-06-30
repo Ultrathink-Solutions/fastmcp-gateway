@@ -36,6 +36,23 @@ Configure via environment variables:
     GATEWAY_REGISTRY_AUTH_TOKEN
         Bearer token sent to upstreams during startup registry population.
 
+    GATEWAY_REGISTRY_TOKEN_PROVIDER_MODULE
+        ``module.path:factory`` whose zero-arg factory returns a zero-arg
+        callable yielding a bearer token. Invoked before each registry fetch
+        so a short-lived / rotating credential stays current (vs the static
+        GATEWAY_REGISTRY_AUTH_TOKEN captured once at startup); overrides it
+        when set. **Ignored unless GATEWAY_ALLOWED_REGISTRY_TOKEN_PROVIDER_PREFIXES
+        is also set** — same code-injection boundary as GATEWAY_AUTH_MODULE.
+        Example: my_package.registry_auth:build_provider
+
+    GATEWAY_ALLOWED_REGISTRY_TOKEN_PROVIDER_PREFIXES
+        Comma-separated module-path allowlist GATEWAY_REGISTRY_TOKEN_PROVIDER_MODULE
+        may resolve to. When unset, GATEWAY_REGISTRY_TOKEN_PROVIDER_MODULE is
+        ignored entirely and the provider must be passed programmatically via
+        ``GatewayServer(registry_token_provider=...)``. Same semantics as
+        GATEWAY_ALLOWED_AUTH_PREFIXES.
+        Example: GATEWAY_ALLOWED_REGISTRY_TOKEN_PROVIDER_PREFIXES=my_package.registry_auth
+
     GATEWAY_DOMAIN_DESCRIPTIONS
         JSON object mapping domain names to human-readable descriptions.
         Example: {"apollo": "Sales intelligence", "hubspot": "CRM operations"}
@@ -209,6 +226,9 @@ from typing import Any
 from fastmcp_gateway._auth_loading import _load_auth
 from fastmcp_gateway._hook_loading import _load_hooks
 from fastmcp_gateway._middleware_loading import _load_middleware
+from fastmcp_gateway._registry_token_provider_loading import (
+    _load_registry_token_provider,
+)
 from fastmcp_gateway.code_mode import CodeModeUnavailableError
 from fastmcp_gateway.gateway import CodeModeAuthorizerRequiredError, GatewayServer
 from fastmcp_gateway.registration_auth import (
@@ -503,6 +523,10 @@ def main() -> None:
     # Claude Desktop, VS Code MCP) need to talk to an upstream IdP that
     # doesn't support DCR.
     auth = _load_auth()
+    # Env-driven registry token provider (allowlist-gated, same security
+    # boundary as GATEWAY_AUTH_MODULE). Refreshes the registry Authorization
+    # header before each fetch; overrides GATEWAY_REGISTRY_AUTH_TOKEN when set.
+    registry_token_provider = _load_registry_token_provider()
 
     try:
         gateway = GatewayServer(
@@ -521,6 +545,7 @@ def main() -> None:
             code_mode_audit_verbatim=code_mode_audit_verbatim,
             middleware=middleware,
             auth=auth,
+            registry_token_provider=registry_token_provider,
         )
     except CodeModeUnavailableError as exc:
         # Friendly handling for the one construction-time error with a

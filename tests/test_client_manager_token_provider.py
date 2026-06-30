@@ -229,3 +229,23 @@ class TestRegistryTokenProvider:
             await manager.add_upstream("acme", upstreams["acme"])
 
         assert seen.get("acme") == ["Bearer tok-added"]
+
+    @pytest.mark.asyncio
+    async def test_async_provider_is_awaited(self, registry: ToolRegistry, upstreams: dict[str, str]) -> None:
+        # An async provider (e.g. an HTTP-minting token cache's get_token) is
+        # awaited, not called-and-stringified — each fetch sees the resolved
+        # token, never a coroutine object.
+        async def provider() -> str:
+            return "tok-async"
+
+        seen: dict[str, list[str | None]] = {}
+        with patch(
+            "fastmcp_gateway.client_manager.Client",
+            side_effect=_client_factory(upstreams, seen),
+        ):
+            manager = UpstreamManager(upstreams, registry, registry_token_provider=provider)
+            await manager.populate_all()
+
+        presented = [h for hs in seen.values() for h in hs]
+        assert presented
+        assert all(h == "Bearer tok-async" for h in presented)
