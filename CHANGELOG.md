@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`UpstreamManager(registry_token_provider=...)` for rotating registry credentials.** A consumer that authenticates registry (`list_tools`) population with a short-lived, rotating token previously had no way to keep it current: `registry_auth_headers` is applied once to the **persistent** registry clients at construction, so a token captured there expires mid-life and every subsequent refresh / dynamic-registration `list_tools` then 401s on a timer. The new optional `registry_token_provider` — a zero-argument callable returning a bearer token — is invoked immediately **before each** registry fetch (startup population, `refresh_*`, and `add_upstream`), so the `Authorization` header is always current. No behavior change when unset; when set it takes precedence over `registry_auth_headers` on the fetch path. The callback should be non-blocking (return a cached token; refresh out of band) as it runs on the async populate/refresh path.
+
 ## [0.23.0] - 2026-05-27
 
 ### Changed

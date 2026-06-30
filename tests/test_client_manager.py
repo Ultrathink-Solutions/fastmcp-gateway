@@ -46,19 +46,6 @@ def _make_fake_tools(domain: str) -> list[FakeTool]:
     ]
 
 
-@pytest.fixture
-def registry() -> ToolRegistry:
-    return ToolRegistry()
-
-
-@pytest.fixture
-def upstreams() -> dict[str, str]:
-    return {
-        "acme": "http://acme-mcp:8080/mcp",
-        "widgets": "http://widgets-mcp:8080/mcp",
-    }
-
-
 # ---------------------------------------------------------------------------
 # populate_all
 # ---------------------------------------------------------------------------

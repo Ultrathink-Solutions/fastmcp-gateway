@@ -12,7 +12,9 @@ an upstream requires a different auth token).
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from collections import defaultdict
 from typing import TYPE_CHECKING, Any
 
 from fastmcp import Client
@@ -20,6 +22,8 @@ from fastmcp.server.dependencies import get_http_headers
 from opentelemetry import trace
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from fastmcp.client.client import CallToolResult
 
     from fastmcp_gateway.access_policy import AccessPolicy
@@ -78,6 +82,17 @@ class UpstreamManager:
         Registry clients run outside any HTTP request context, so
         ``get_http_headers()`` is empty.  Pass auth headers here
         for upstreams that require authentication on ``list_tools``.
+    registry_token_provider:
+        Optional zero-argument callable returning a bearer token string,
+        invoked immediately before every registry ``list_tools`` fetch
+        (startup population, refresh, and dynamic registration). Use this
+        when the registry credential is short-lived and rotates: the
+        registry clients are persistent, so a token passed once via
+        *registry_auth_headers* is captured at construction and then
+        expires mid-life. The returned value is sent as ``Authorization:
+        Bearer <token>`` and takes precedence over *registry_auth_headers*
+        on the fetch path. Keep it non-blocking (return a cached token and
+        refresh out of band) — it runs on the async populate/refresh path.
     upstream_headers:
         Per-domain headers for tool execution.  When ``execute_tool``
         routes to a domain listed here, these headers are used instead
@@ -113,6 +128,7 @@ class UpstreamManager:
         registry: ToolRegistry,
         *,
         registry_auth_headers: dict[str, str] | None = None,
+        registry_token_provider: Callable[[], str] | None = None,
         upstream_headers: dict[str, dict[str, str]] | None = None,
         policy: AccessPolicy | None = None,
         sanitizer_trusted_domains: set[str] | None = None,
@@ -123,6 +139,12 @@ class UpstreamManager:
         self._registry = registry
         self._upstream_headers = upstream_headers or {}
         self._registry_auth_headers = registry_auth_headers
+        self._registry_token_provider = registry_token_provider
+        # Per-domain locks serialize the (token refresh + header set + list_tools)
+        # sequence on each persistent registry client, so concurrent same-domain
+        # populate/refresh calls can't overwrite Authorization between the header
+        # update and the fetch that must use it.
+        self._registry_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._policy = policy
         # Defensive copy so later mutation by the caller doesn't silently
         # change sanitation behaviour mid-flight.
@@ -220,8 +242,24 @@ class UpstreamManager:
         with _tracer.start_as_current_span("gateway.populate_domain") as span:
             span.set_attribute("gateway.domain", domain)
 
-            async with client:
-                mcp_tools = await client.list_tools()
+            # Refresh the registry client's auth header from the token provider
+            # (if configured) so a short-lived, rotating credential is current on
+            # every fetch. The registry client is persistent, so a token applied
+            # once at construction via registry_auth_headers would expire mid-life;
+            # minting per fetch keeps populate/refresh/add_upstream authenticated.
+            #
+            # The provider call, header mutation, and fetch run under a per-domain
+            # lock: the persistent client's headers are shared, so a concurrent
+            # same-domain call must not overwrite Authorization between this fetch's
+            # header update and its list_tools. Per-domain (not global) so distinct
+            # domains still populate/refresh concurrently.
+            async with self._registry_locks[domain]:
+                if self._registry_token_provider is not None:
+                    token = self._registry_token_provider()
+                    _set_transport_headers(client, {"Authorization": f"Bearer {token}"})
+
+                async with client:
+                    mcp_tools = await client.list_tools()
 
             raw_tools: list[dict[str, Any]] = []
             for t in mcp_tools:
@@ -475,8 +513,26 @@ class UpstreamManager:
             # dicts remain in their pre-call state — concurrent
             # observers see no transient half-staged URL paired with
             # the prior tools.
-            diff = await self._populate_domain(domain, reg_client, upstream_url=url)
+            # _populate_domain lazily created a per-domain lock for this probe.
+            # If the domain is NEW and the probe fails or is refused it never
+            # enters the manager, so drop the lock to keep _registry_locks from
+            # growing without bound under add/remove churn.
+            new_domain = domain not in self._upstreams
+            try:
+                diff = await self._populate_domain(domain, reg_client, upstream_url=url)
+            except Exception:
+                # Re-check live state: a concurrent successful add_upstream for
+                # this domain may have registered it (making its lock canonical)
+                # while we awaited, so only drop the lock if it's still this
+                # failing attempt's orphan.
+                if new_domain and domain not in self._upstreams:
+                    self._registry_locks.pop(domain, None)
+                raise
             if diff.refused:
+                # Same re-check as the except path — don't evict a lock a
+                # concurrent successful registration now owns.
+                if new_domain and domain not in self._upstreams:
+                    self._registry_locks.pop(domain, None)
                 # Registry preserved its prior tools on refusal;
                 # manager keeps its prior URL/clients.  No mutations
                 # to undo.  Return the diff so the caller can
@@ -540,6 +596,7 @@ class UpstreamManager:
             reg_client = self._registry_clients.pop(domain, None)
             exec_client = self._execution_clients.pop(domain, None)
             self._upstream_headers.pop(domain, None)
+            self._registry_locks.pop(domain, None)
 
             # Close both clients to release connection resources. When
             # discovery_url == url at add_upstream time, exec_client is a
