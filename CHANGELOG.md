@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.26.0] - 2026-08-04
+
+### Added
+
+- **`execute_tool` argument validation with a self-describing error.** A call whose `arguments` don't match the target tool's declared JSON-Schema `properties`/`required` is now rejected before it reaches the upstream server, with `code="invalid_arguments"` and `details.signature` carrying the tool's full expected signature -- the same rendering `discover_tools(format="signatures")` produces. Covers both an unknown argument key and a missing required one. A tool whose schema declares no `properties` object is unchecked, matching its existing behavior. Calls whose arguments already match the schema are completely unaffected.
+
+### Documentation
+
+- README's error-codes section documents the new `invalid_arguments` code with an example payload.
+
 ## [0.25.0] - 2026-08-04
 
 ### Added
