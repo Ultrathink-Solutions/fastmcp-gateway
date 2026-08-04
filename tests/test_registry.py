@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+
+import pytest
 
 from fastmcp_gateway.registry import ToolEntry, ToolRegistry, infer_group
-
-if TYPE_CHECKING:
-    import pytest
 
 # ---------------------------------------------------------------------------
 # infer_group
@@ -423,6 +421,146 @@ class TestPopulateDomain:
         info = empty_registry.get_domain_info()
         assert len(info) == 1
         assert info[0].description == "My domain description"
+
+
+# ---------------------------------------------------------------------------
+# ToolEntry — required_scope (ULT-6012: axon MCP scope-architecture pivot W1)
+# ---------------------------------------------------------------------------
+
+
+class TestToolEntryRequiredScope:
+    def test_default_is_none(self) -> None:
+        entry = ToolEntry(
+            name="tool",
+            domain="dom",
+            group="grp",
+            description="",
+            input_schema={"type": "object"},
+            upstream_url="http://x:8080/mcp",
+        )
+        assert entry.required_scope is None
+
+    def test_frozen_model_still_accepts_the_kwarg(self) -> None:
+        """The model stays frozen=True; the new field is just another
+        constructor kwarg, not an escape hatch from immutability."""
+        entry = ToolEntry(
+            name="tool",
+            domain="dom",
+            group="grp",
+            description="",
+            input_schema={"type": "object"},
+            upstream_url="http://x:8080/mcp",
+            required_scope="mcp:d365:crm_actions:write",
+        )
+        assert entry.required_scope == "mcp:d365:crm_actions:write"
+
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            entry.required_scope = "mcp:other:write"  # type: ignore[misc]
+
+    def test_round_trips_through_register_tool_and_lookup(self, empty_registry: ToolRegistry) -> None:
+        entry = ToolEntry(
+            name="crm_add_note",
+            domain="d365_crm",
+            group="crm",
+            description="Add a note",
+            input_schema={"type": "object"},
+            upstream_url="http://d365-crm:8080/mcp",
+            required_scope="mcp:d365:crm_actions:write",
+        )
+        empty_registry.register_tool(entry)
+
+        looked_up = empty_registry.lookup("crm_add_note")
+        assert looked_up is not None
+        assert looked_up.required_scope == "mcp:d365:crm_actions:write"
+
+
+# ---------------------------------------------------------------------------
+# ToolRegistry.populate_domain — required_scope from upstream _meta
+# ---------------------------------------------------------------------------
+
+
+class TestPopulateDomainRequiredScope:
+    def test_populates_required_scope_from_meta(self, empty_registry: ToolRegistry) -> None:
+        raw_tools = [
+            {
+                "name": "crm_add_note",
+                "description": "Add a note",
+                "inputSchema": {"type": "object"},
+                "_meta": {"axon/requiredScope": "mcp:d365:crm_actions:write"},
+            },
+        ]
+        empty_registry.populate_domain("d365_crm", "http://d365-crm:8080/mcp", raw_tools)
+
+        tool = empty_registry.lookup("crm_add_note")
+        assert tool is not None
+        assert tool.required_scope == "mcp:d365:crm_actions:write"
+
+    def test_absent_meta_yields_none(self, empty_registry: ToolRegistry) -> None:
+        raw_tools = [
+            {
+                "name": "crm_get_account_360",
+                "description": "Read an account",
+                "inputSchema": {"type": "object"},
+            },
+        ]
+        empty_registry.populate_domain("d365_crm", "http://d365-crm:8080/mcp", raw_tools)
+
+        tool = empty_registry.lookup("crm_get_account_360")
+        assert tool is not None
+        assert tool.required_scope is None
+
+    def test_non_string_meta_value_collapses_to_none(self, empty_registry: ToolRegistry) -> None:
+        """A malformed upstream ``_meta`` value must never crash population
+        or silently coerce to a truthy sentinel -- it degrades to unscoped."""
+        raw_tools = [
+            {
+                "name": "dom_weird",
+                "inputSchema": {"type": "object"},
+                "_meta": {"axon/requiredScope": 123},
+            },
+        ]
+        empty_registry.populate_domain("dom", "http://x:8080/mcp", raw_tools)
+
+        tool = empty_registry.lookup("dom_weird")
+        assert tool is not None
+        assert tool.required_scope is None
+
+    def test_empty_string_meta_value_collapses_to_none(self, empty_registry: ToolRegistry) -> None:
+        raw_tools = [
+            {
+                "name": "dom_weird2",
+                "inputSchema": {"type": "object"},
+                "_meta": {"axon/requiredScope": ""},
+            },
+        ]
+        empty_registry.populate_domain("dom", "http://x:8080/mcp", raw_tools)
+
+        tool = empty_registry.lookup("dom_weird2")
+        assert tool is not None
+        assert tool.required_scope is None
+
+    def test_scoped_and_unscoped_tools_coexist_without_leaking(self, empty_registry: ToolRegistry) -> None:
+        """The per-tool merge must not leak one tool's scope onto its
+        sibling -- the failure mode a single-tool fixture cannot see."""
+        raw_tools = [
+            {
+                "name": "crm_add_note",
+                "inputSchema": {"type": "object"},
+                "_meta": {"axon/requiredScope": "mcp:d365:crm_actions:write"},
+            },
+            {
+                "name": "crm_get_account_360",
+                "inputSchema": {"type": "object"},
+            },
+        ]
+        empty_registry.populate_domain("d365_crm", "http://d365-crm:8080/mcp", raw_tools)
+
+        scoped = empty_registry.lookup("crm_add_note")
+        unscoped = empty_registry.lookup("crm_get_account_360")
+        assert scoped is not None and scoped.required_scope == "mcp:d365:crm_actions:write"
+        assert unscoped is not None and unscoped.required_scope is None
 
 
 # ---------------------------------------------------------------------------
