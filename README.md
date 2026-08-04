@@ -344,7 +344,13 @@ All meta-tools return structured JSON errors with a `code` field for programmati
 {"error": "Unknown tool 'crm_contacts'.", "code": "tool_not_found", "details": {"suggestions": ["crm_contacts_search"]}}
 ```
 
-Error codes: `tool_not_found`, `domain_not_found`, `group_not_found`, `execution_error`, `upstream_error`, `refresh_error`.
+Error codes: `tool_not_found`, `invalid_arguments`, `domain_not_found`, `group_not_found`, `execution_error`, `upstream_error`, `refresh_error`.
+
+`invalid_arguments` fires when `execute_tool`'s `arguments` don't match the target tool's declared schema (an unknown key, or a required key missing) -- checked locally before the call ever reaches the upstream server. The error's `details` carry the tool's full expected signature (the same rendering `discover_tools(format="signatures")` produces), so a caller that guessed wrong gets the correction in the first error instead of a second blind guess:
+
+```json
+{"error": "Invalid arguments for 'apollo_people_search': missing required argument(s) 'query'.", "code": "invalid_arguments", "details": {"tool": "apollo_people_search", "domain": "apollo", "signature": "apollo_people_search(query: str) -> any\n  Search for people by name, title, company, or other criteria"}}
+```
 
 ## Tool Name Collisions
 
