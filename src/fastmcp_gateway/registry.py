@@ -116,6 +116,12 @@ class ToolEntry(BaseModel):
     # operators may additionally override per-tool via
     # ``GatewayServer(trusted_output_tools={...})``.
     raw_output_trusted: bool = False
+    # ULT-6012 (axon MCP scope-architecture pivot, spec P2): the tool's
+    # DECLARED GRANULAR scope, as exported by the upstream chassis in the
+    # additive MCP ``_meta`` key ``axon/requiredScope``. ``None`` when the
+    # upstream declares no scope for this tool. Consumers coarsen at check
+    # time; this field is never coarsened at populate time.
+    required_scope: str | None = None
 
 
 class DomainInfo(BaseModel):
@@ -509,7 +515,14 @@ class ToolRegistry:
             # :class:`ToolEntry` instances.  Digest stability across
             # populate boundaries is a load-bearing invariant of the
             # schema-integrity gate.
-            accepted: list[tuple[str, str, dict[str, Any], dict[str, Any]]] = []
+            # The 5th tuple element carries the tool's declared granular
+            # scope (ULT-6012), read from the raw upstream ``_meta`` key
+            # ``axon/requiredScope`` here so the second loop below can
+            # populate :attr:`ToolEntry.required_scope` without re-indexing
+            # ``tools``. Also kept out of the digest for the same reason as
+            # ``annotations`` above — the digest fingerprints the upstream
+            # (name, description, inputSchema) contract only.
+            accepted: list[tuple[str, str, dict[str, Any], dict[str, Any], str | None]] = []
             schema_rejected_count = 0
             for raw in tools:
                 raw_name = raw.get("name", "")
@@ -538,8 +551,21 @@ class ToolRegistry:
                 # description-sanitizer discipline.
                 annotations_raw = raw.get("annotations")
                 annotations = annotations_raw if isinstance(annotations_raw, dict) else {}
-                accepted.append((raw_name, raw_description, clean_schema, annotations))
-            candidate_digest = _digest_from_triples([(n, d, s) for n, d, s, _ in accepted])
+                # ULT-6012: extract the declared granular scope from the raw
+                # upstream ``_meta`` key ``axon/requiredScope``. A malformed
+                # value (non-string, or an empty string) collapses to
+                # ``None`` rather than crashing or registering a falsy
+                # sentinel scope — one poisoned tool's ``_meta`` must not
+                # DoS its siblings, and an empty scope string is not a
+                # meaningful requirement.
+                raw_meta = raw.get("_meta")
+                meta = raw_meta if isinstance(raw_meta, dict) else {}
+                required_scope_raw = meta.get("axon/requiredScope")
+                required_scope = (
+                    required_scope_raw if isinstance(required_scope_raw, str) and required_scope_raw else None
+                )
+                accepted.append((raw_name, raw_description, clean_schema, annotations, required_scope))
+            candidate_digest = _digest_from_triples([(n, d, s) for n, d, s, _, _ in accepted])
 
             prior_digest = self._domain_digests.get(domain)
 
@@ -605,7 +631,7 @@ class ToolRegistry:
             prefix = f"{domain}_"
             domain_is_trusted = trusted_domains is not None and domain in trusted_domains
             output_patterns = trusted_output_tool_patterns or []
-            for name, raw_description, clean_schema, annotations in accepted:
+            for name, raw_description, clean_schema, annotations, required_scope in accepted:
                 # Collision renaming (see register_tool) may rewrite this tool's
                 # registered name to ``{domain}_{name}``.  Evaluate policy
                 # against both forms so rules written in either shape apply to
@@ -665,6 +691,7 @@ class ToolRegistry:
                         input_schema=clean_schema,
                         upstream_url=upstream_url,
                         raw_output_trusted=raw_output_trusted,
+                        required_scope=required_scope,
                     )
                 )
             if filtered_count > 0:
