@@ -11,7 +11,7 @@ from opentelemetry import trace
 
 from fastmcp_gateway.errors import error_response
 from fastmcp_gateway.hooks import ExecutionContext, ExecutionDenied, HookRunner, ListToolsContext
-from fastmcp_gateway.signatures import tool_to_signature
+from fastmcp_gateway.signatures import extract_params, tool_to_signature
 
 if TYPE_CHECKING:
     from fastmcp import FastMCP
@@ -56,6 +56,41 @@ def _suggest_tool_names(query: str, all_names: list[str], max_suggestions: int =
             scored.append((score, name))
     scored.sort(key=lambda x: (-x[0], x[1]))
     return [name for _, name in scored[:max_suggestions]]
+
+
+def _describe_argument_errors(entry: ToolEntry, arguments: dict[str, Any]) -> str | None:
+    """Return a human-readable argument-validation error, or ``None`` if *arguments* is valid.
+
+    Checks *arguments* against *entry*'s declared JSON-Schema ``properties``
+    for two failure modes: a key absent from ``properties`` ("unknown"), and
+    a key in ``required`` absent from *arguments* ("missing"). Reuses
+    :func:`~fastmcp_gateway.signatures.extract_params` (the same param
+    extraction the signature renderer uses) so this check can never drift
+    from what that renderer reports as the tool's shape.
+
+    A tool whose schema has no proper ``properties`` object makes no claim
+    about what's valid -- every call to it passes through unchecked, exactly
+    as before this function existed.
+    """
+    schema = entry.input_schema
+    if not isinstance(schema, dict) or not isinstance(schema.get("properties"), dict):
+        return None
+
+    params = extract_params(schema)
+    known_names = {p.name for p in params}
+    required_names = {p.name for p in params if p.required}
+
+    unknown = sorted(name for name in arguments if name not in known_names)
+    missing = sorted(required_names - arguments.keys())
+    if not unknown and not missing:
+        return None
+
+    parts: list[str] = []
+    if unknown:
+        parts.append(f"unknown argument(s) {', '.join(repr(n) for n in unknown)}")
+    if missing:
+        parts.append(f"missing required argument(s) {', '.join(repr(n) for n in missing)}")
+    return f"Invalid arguments for {entry.name!r}: {'; '.join(parts)}."
 
 
 def register_meta_tools(
@@ -395,6 +430,23 @@ def register_meta_tools(
 
                 # Use potentially mutated arguments from context
                 arguments = ctx.arguments
+
+            # Reject a call whose arguments don't match the tool's declared
+            # schema before it ever reaches the upstream server -- turns a
+            # caller's guessed argument name into an immediate, self-
+            # correcting error instead of a wasted upstream round trip.
+            arg_error = _describe_argument_errors(entry, arguments or {})
+            if arg_error is not None:
+                span.set_attribute("gateway.error_code", "invalid_arguments")
+                return _error_result(
+                    error_response(
+                        "invalid_arguments",
+                        arg_error,
+                        tool=tool_name,
+                        domain=entry.domain,
+                        signature=tool_to_signature(entry),
+                    )
+                )
 
             # Route to upstream via fresh client
             execute_kwargs: dict[str, Any] = {}

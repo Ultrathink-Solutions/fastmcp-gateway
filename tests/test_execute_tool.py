@@ -11,6 +11,7 @@ from fastmcp import Client, FastMCP
 
 from fastmcp_gateway.client_manager import UpstreamManager
 from fastmcp_gateway.meta_tools import register_meta_tools
+from fastmcp_gateway.registry import ToolEntry
 
 if TYPE_CHECKING:
     from fastmcp_gateway.registry import ToolRegistry
@@ -80,20 +81,20 @@ class TestExecuteToolSuccess:
     async def test_routes_and_returns_result(self, mcp_server: FastMCP, manager: UpstreamManager) -> None:
         manager.execute_tool = AsyncMock(return_value=_fake_result('{"people": []}'))  # type: ignore[method-assign]
 
-        data = await _call_execute(mcp_server, "apollo_people_search", {"name": "Jane"})
+        data = await _call_execute(mcp_server, "apollo_people_search", {"query": "Jane"})
 
         assert data["tool"] == "apollo_people_search"
         assert data["result"] == '{"people": []}'
-        manager.execute_tool.assert_called_once_with("apollo_people_search", {"name": "Jane"})
+        manager.execute_tool.assert_called_once_with("apollo_people_search", {"query": "Jane"})
 
     @pytest.mark.asyncio
     async def test_no_arguments_sends_none(self, mcp_server: FastMCP, manager: UpstreamManager) -> None:
         manager.execute_tool = AsyncMock(return_value=_fake_result("ok"))  # type: ignore[method-assign]
 
-        data = await _call_execute(mcp_server, "apollo_people_search")
+        data = await _call_execute(mcp_server, "hubspot_contacts_search")
 
         assert data["result"] == "ok"
-        manager.execute_tool.assert_called_once_with("apollo_people_search", None)
+        manager.execute_tool.assert_called_once_with("hubspot_contacts_search", None)
 
 
 # ---------------------------------------------------------------------------
@@ -128,7 +129,7 @@ class TestExecuteToolUpstreamError:
     async def test_connectivity_error(self, mcp_server: FastMCP, manager: UpstreamManager) -> None:
         manager.execute_tool = AsyncMock(side_effect=ConnectionError("connection refused"))  # type: ignore[method-assign]
 
-        data = await _call_execute(mcp_server, "apollo_people_search", {"name": "Jane"})
+        data = await _call_execute(mcp_server, "apollo_people_search", {"query": "Jane"})
 
         assert data["code"] == "execution_error"
         assert "failed" in data["error"]
@@ -142,9 +143,86 @@ class TestExecuteToolUpstreamError:
             return_value=_fake_result("Invalid parameter: limit must be > 0", is_error=True)
         )
 
-        data = await _call_execute(mcp_server, "apollo_people_search", {"limit": -1})
+        data = await _call_execute(mcp_server, "apollo_people_search", {"query": "Jane"})
 
         assert data["code"] == "upstream_error"
         assert "Invalid parameter" in data["error"]
         assert data["details"]["tool"] == "apollo_people_search"
         assert "result" not in data
+
+
+# ---------------------------------------------------------------------------
+# Argument validation: unknown/missing arguments are rejected before dispatch
+# ---------------------------------------------------------------------------
+
+
+class TestExecuteToolArgumentValidation:
+    """A call whose arguments don't match the tool's declared schema is
+    rejected before it ever reaches the upstream server, with the tool's
+    full expected signature in the error -- so a caller that guessed wrong
+    gets the correction in one hop instead of a second blind guess."""
+
+    @pytest.mark.asyncio
+    async def test_missing_required_argument_is_rejected_before_dispatch(
+        self, mcp_server: FastMCP, manager: UpstreamManager
+    ) -> None:
+        manager.execute_tool = AsyncMock(return_value=_fake_result("should never be called"))  # type: ignore[method-assign]
+
+        data = await _call_execute(mcp_server, "apollo_people_search", {})
+
+        assert data["code"] == "invalid_arguments"
+        assert "query" in data["error"]
+        assert data["details"]["signature"] == (
+            "apollo_people_search(query: str) -> any\n  Search for people by name, title, company, or other criteria"
+        )
+        manager.execute_tool.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_unknown_argument_is_rejected_before_dispatch(
+        self, mcp_server: FastMCP, manager: UpstreamManager
+    ) -> None:
+        """Isolates the UNKNOWN-argument branch only: the required `query`
+        arg IS supplied, alongside one bogus extra key, so `missing` is
+        empty and only the `unknown` branch of `_describe_argument_errors`
+        can fire. `apollo_people_search`'s fixture schema
+        (`required=["query"]`) means a call like `{"name": "Jane"}` (no
+        `query` at all) would trip BOTH the unknown AND missing branches at
+        once, which couldn't tell "unknown detection is broken" apart from
+        "missing detection is broken" from "both work" -- see
+        `test_missing_required_argument_is_rejected_before_dispatch` above
+        for the separate missing-only case."""
+        manager.execute_tool = AsyncMock(return_value=_fake_result("should never be called"))  # type: ignore[method-assign]
+
+        data = await _call_execute(mcp_server, "apollo_people_search", {"query": "Jane", "bogus": "x"})
+
+        assert data["code"] == "invalid_arguments"
+        assert "bogus" in data["error"]
+        assert "apollo_people_search(query: str)" in data["details"]["signature"]
+        manager.execute_tool.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_schema_without_properties_is_not_validated(self, registry: ToolRegistry) -> None:
+        """A tool whose schema declares no 'properties' object makes no claim
+        about what's valid -- every call passes through unchecked, exactly as
+        before this feature existed (matches extract_params' own fallback)."""
+        registry.set_domain_description("legacy", "Legacy passthrough tools")
+        registry.register_tool(
+            ToolEntry(
+                name="legacy_passthrough",
+                domain="legacy",
+                group="misc",
+                description="Accepts whatever the caller sends.",
+                input_schema={"type": "object"},
+                upstream_url="http://legacy-mcp:8080/mcp",
+            )
+        )
+        with patch("fastmcp_gateway.client_manager.Client"):
+            manager = UpstreamManager({"legacy": "http://legacy-mcp:8080/mcp"}, registry)
+        manager.execute_tool = AsyncMock(return_value=_fake_result("ok"))  # type: ignore[method-assign]
+        mcp = FastMCP("test-gateway")
+        register_meta_tools(mcp, registry, manager)
+
+        data = await _call_execute(mcp, "legacy_passthrough", {"anything": "goes"})
+
+        assert data["result"] == "ok"
+        manager.execute_tool.assert_called_once_with("legacy_passthrough", {"anything": "goes"})
