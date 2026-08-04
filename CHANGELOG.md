@@ -5,9 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.25.0] - 2026-08-04
 
 ### Added
+
+- **`ToolEntry.required_scope: str | None` for per-tool declared authorization scope.** Populated in `ToolRegistry.populate_domain` from the upstream `tools/list` entry's additive MCP `_meta` key `axon/requiredScope`; a tool whose `_meta` carries no such key (or a malformed — non-string or empty — value) registers with `required_scope=None`. The model stays `frozen=True`; the field is additive-only and always carries the declared **granular** scope, never a coarsened form — coarsening is a check-time concern for consumers, not a populate-time one. Lets a gateway make a per-tool authorization decision keyed on the resolved registry entry rather than on tool-name shape.
 
 - **`GATEWAY_REGISTRY_TOKEN_PROVIDER_MODULE` env loader for the registry token provider.** Lets the env-driven entry point supply a `registry_token_provider` (the per-fetch rotating-credential callback added in 0.24.0) without modifying gateway code — a `module.path:factory` whose zero-arg factory returns the provider callable. Allowlist-gated by `GATEWAY_ALLOWED_REGISTRY_TOKEN_PROVIDER_PREFIXES`, mirroring the `GATEWAY_AUTH_MODULE` / hook / middleware loaders' code-injection boundary (the module is ignored unless an explicit prefix allowlist is set). `GatewayServer` now also accepts and forwards `registry_token_provider` to `UpstreamManager`, so it can be supplied programmatically or via env.
 
