@@ -48,8 +48,10 @@ import hashlib
 import logging
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
+from copy import deepcopy
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 from opentelemetry import trace
@@ -202,6 +204,7 @@ class CodeModeRunner:
         *,
         headers: dict[str, str],
         user: Any,
+        request_meta: Mapping[str, Any] | None = None,
     ) -> str:
         """Execute *code* in the sandbox and return its final expression.
 
@@ -221,6 +224,7 @@ class CodeModeRunner:
             allowed = await self._authorizer(user, ctx)
             if not allowed:
                 raise ExecutionDenied("code_mode is not permitted for this user", code="forbidden")
+        inbound_meta_snapshot = None if request_meta is None else MappingProxyType(deepcopy(dict(request_meta)))
 
         with _tracer.start_as_current_span("gateway.execute_code") as span:
             code_bytes = code.encode("utf-8")
@@ -255,7 +259,13 @@ class CodeModeRunner:
             # 2. Build the callable namespace.  Headers and user are
             #    captured once here and closed over — no ContextVar
             #    reads from Monty's worker thread (Finding 6.2).
-            callables = self._build_callables(visible, headers, user, audit)
+            callables = self._build_callables(
+                visible,
+                headers,
+                user,
+                audit,
+                inbound_meta_snapshot,
+            )
 
             # 3. Invoke Monty.
             start = time.monotonic()
@@ -290,13 +300,21 @@ class CodeModeRunner:
         outer_headers: dict[str, str],
         outer_user: Any,
         audit: _CodeModeAudit,
+        request_meta: Mapping[str, Any] | None,
     ) -> dict[str, Callable[..., Awaitable[Any]]]:
         """Create a Python callable for each authorized tool."""
         namespace: dict[str, Callable[..., Awaitable[Any]]] = {}
         call_cap = self._limits.max_nested_calls
 
         for tool in visible:
-            namespace[tool.name] = self._make_wrapper(tool, outer_headers, outer_user, audit, call_cap)
+            namespace[tool.name] = self._make_wrapper(
+                tool,
+                outer_headers,
+                outer_user,
+                audit,
+                call_cap,
+                request_meta,
+            )
         return namespace
 
     def _make_wrapper(
@@ -306,6 +324,7 @@ class CodeModeRunner:
         outer_user: Any,
         audit: _CodeModeAudit,
         call_cap: int | None,
+        request_meta: Mapping[str, Any] | None,
     ) -> Callable[..., Awaitable[Any]]:
         """Return an async callable that dispatches one tool through the hook pipeline."""
         hook_runner = self._hook_runner
@@ -326,6 +345,7 @@ class CodeModeRunner:
                 headers=outer_headers,
                 user=outer_user,
                 metadata={"code_session_id": audit.code_session_id},
+                request_meta=(None if request_meta is None else MappingProxyType(deepcopy(dict(request_meta)))),
             )
 
             with _tracer.start_as_current_span("gateway.code_mode.step") as span:
@@ -339,6 +359,7 @@ class CodeModeRunner:
                     tool.name,
                     ctx.arguments,
                     extra_headers=ctx.extra_headers or None,
+                    request_meta=(None if request_meta is None else deepcopy(dict(request_meta))),
                 )
                 # ``call_tool`` returns ``fastmcp.client.client.CallToolResult``
                 # whose fields are snake_case (``is_error`` / ``structured_content``),

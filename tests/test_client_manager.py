@@ -7,6 +7,8 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from fastmcp import Context, FastMCP
+from opentelemetry.sdk.trace import TracerProvider
 
 from fastmcp_gateway.client_manager import UpstreamManager
 from fastmcp_gateway.registry import ToolRegistry
@@ -44,6 +46,23 @@ def _make_fake_tools(domain: str) -> list[FakeTool]:
             inputSchema={"type": "object"},
         ),
     ]
+
+
+def _make_call_client(result: Any) -> AsyncMock:
+    """Build a client double for the exact-metadata protocol call path."""
+    client = AsyncMock()
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=None)
+    client.session = MagicMock()
+    client.session.call_tool = AsyncMock(return_value=result)
+    client._progress_handler = None
+
+    async def await_result(awaitable: Any) -> Any:
+        return await awaitable
+
+    client._await_with_session_monitoring = AsyncMock(side_effect=await_result)
+    client._parse_call_tool_result = AsyncMock(return_value=result)
+    return client
 
 
 # ---------------------------------------------------------------------------
@@ -152,10 +171,7 @@ class TestExecuteTool:
         fake_result.content = []
         fake_result.is_error = False
 
-        fresh_client = AsyncMock()
-        fresh_client.__aenter__ = AsyncMock(return_value=fresh_client)
-        fresh_client.__aexit__ = AsyncMock(return_value=None)
-        fresh_client.call_tool = AsyncMock(return_value=fake_result)
+        fresh_client = _make_call_client(fake_result)
 
         base_client = MagicMock()
         base_client.new = MagicMock(return_value=fresh_client)
@@ -177,10 +193,10 @@ class TestExecuteTool:
 
         assert result is fake_result
         base_client.new.assert_called_once()
-        fresh_client.call_tool.assert_called_once_with(
+        fresh_client.session.call_tool.assert_awaited_once_with(
             "svc_users_list",
             {"limit": 10},
-            raise_on_error=False,
+            meta=None,
         )
 
     @pytest.mark.asyncio
@@ -190,10 +206,7 @@ class TestExecuteTool:
         fake_result.content = []
         fake_result.is_error = False
 
-        fresh_client = AsyncMock()
-        fresh_client.__aenter__ = AsyncMock(return_value=fresh_client)
-        fresh_client.__aexit__ = AsyncMock(return_value=None)
-        fresh_client.call_tool = AsyncMock(return_value=fake_result)
+        fresh_client = _make_call_client(fake_result)
 
         base_client = MagicMock()
         base_client.new = MagicMock(return_value=fresh_client)
@@ -230,10 +243,10 @@ class TestExecuteTool:
 
         assert result is fake_result
         # Must call upstream with the ORIGINAL name, not the prefixed one
-        fresh_client.call_tool.assert_called_once_with(
+        fresh_client.session.call_tool.assert_awaited_once_with(
             "get_server_info",
             {},
-            raise_on_error=False,
+            meta=None,
         )
 
     @pytest.mark.asyncio
@@ -247,10 +260,7 @@ class TestExecuteTool:
     async def test_execute_defaults_empty_arguments(self, registry: ToolRegistry) -> None:
         """When arguments is None, an empty dict is sent to call_tool."""
         fake_result = MagicMock()
-        fresh_client = AsyncMock()
-        fresh_client.__aenter__ = AsyncMock(return_value=fresh_client)
-        fresh_client.__aexit__ = AsyncMock(return_value=None)
-        fresh_client.call_tool = AsyncMock(return_value=fake_result)
+        fresh_client = _make_call_client(fake_result)
 
         base_client = MagicMock()
         base_client.new = MagicMock(return_value=fresh_client)
@@ -267,11 +277,66 @@ class TestExecuteTool:
 
         await manager.execute_tool("svc_ping")
 
-        fresh_client.call_tool.assert_called_once_with(
+        fresh_client.session.call_tool.assert_awaited_once_with(
             "svc_ping",
             {},
-            raise_on_error=False,
+            meta=None,
         )
+
+    @pytest.mark.asyncio
+    async def test_execute_forwards_exact_metadata_without_trace_injection(
+        self,
+        registry: ToolRegistry,
+    ) -> None:
+        upstream = FastMCP("recording-upstream")
+        recorded_meta: list[dict[str, Any] | None] = []
+
+        @upstream.tool
+        async def record(value: str, ctx: Context) -> str:
+            meta_model = ctx.request_context.meta
+            recorded_meta.append(
+                None
+                if meta_model is None
+                else meta_model.model_dump(
+                    mode="python",
+                    by_alias=True,
+                    exclude_unset=True,
+                )
+            )
+            return value
+
+        manager = UpstreamManager({"svc": upstream}, registry)
+        registry.populate_domain(
+            "svc",
+            "memory://recording-upstream",
+            [
+                {
+                    "name": "record",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"value": {"type": "string"}},
+                        "required": ["value"],
+                    },
+                }
+            ],
+        )
+        first = {
+            "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            "io.ult.action_execution.v1": "signed-first",
+            "nested": {"attempts": [1, 2]},
+        }
+        second = {
+            "traceparent": "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01",
+            "io.ult.action_execution.v1": "signed-second",
+        }
+        tracer = TracerProvider().get_tracer(__name__)
+
+        with tracer.start_as_current_span("outer"):
+            await manager.execute_tool("record", {"value": "first"}, request_meta=first)
+            await manager.execute_tool("record", {"value": "second"}, request_meta=second)
+            await manager.execute_tool("record", {"value": "absent"}, request_meta=None)
+
+        assert recorded_meta == [first, second, None]
 
 
 # ---------------------------------------------------------------------------
@@ -345,10 +410,7 @@ class TestUpstreamHeaders:
     async def test_domain_with_override_uses_new_with_headers(self, registry: ToolRegistry) -> None:
         """Domains with upstream_headers should use client.new() and merge headers."""
         fake_result = MagicMock()
-        fresh_client = AsyncMock()
-        fresh_client.__aenter__ = AsyncMock(return_value=fresh_client)
-        fresh_client.__aexit__ = AsyncMock(return_value=None)
-        fresh_client.call_tool = AsyncMock(return_value=fake_result)
+        fresh_client = _make_call_client(fake_result)
         fresh_client.transport = MagicMock()
         fresh_client.transport.headers = {}
 
@@ -377,10 +439,7 @@ class TestUpstreamHeaders:
     async def test_domain_without_override_uses_new(self, registry: ToolRegistry) -> None:
         """Domains without upstream_headers should use base_client.new()."""
         fake_result = MagicMock()
-        fresh_client = AsyncMock()
-        fresh_client.__aenter__ = AsyncMock(return_value=fresh_client)
-        fresh_client.__aexit__ = AsyncMock(return_value=None)
-        fresh_client.call_tool = AsyncMock(return_value=fake_result)
+        fresh_client = _make_call_client(fake_result)
 
         base_client = MagicMock()
         base_client.new = MagicMock(return_value=fresh_client)
@@ -422,10 +481,7 @@ def _make_dual_client_mock(domain: str) -> MagicMock:
     client.transport = MagicMock()
     client.transport.headers = {}
 
-    fresh = AsyncMock()
-    fresh.__aenter__ = AsyncMock(return_value=fresh)
-    fresh.__aexit__ = AsyncMock(return_value=None)
-    fresh.call_tool = AsyncMock(return_value=MagicMock())
+    fresh = _make_call_client(MagicMock())
     fresh.transport = MagicMock()
     fresh.transport.headers = {}
     client.new = MagicMock(return_value=fresh)
@@ -471,7 +527,7 @@ class TestDiscoveryUrlSeparation:
         # Canonical URL was cloned via .new() and the fresh client served call_tool.
         assert clients_by_url[exec_url].new.call_count == 1
         exec_fresh = clients_by_url[exec_url].new.return_value
-        exec_fresh.call_tool.assert_awaited_once()
+        exec_fresh.session.call_tool.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_omitting_discovery_url_routes_both_paths_to_url(self, registry: ToolRegistry) -> None:

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -10,6 +12,7 @@ import pytest
 from fastmcp import Client, FastMCP
 
 from fastmcp_gateway.client_manager import UpstreamManager
+from fastmcp_gateway.hooks import ExecutionContext, HookRunner
 from fastmcp_gateway.meta_tools import register_meta_tools
 from fastmcp_gateway.registry import ToolEntry
 
@@ -56,18 +59,33 @@ def _fake_result(
     return result
 
 
-async def _call_execute(mcp: FastMCP, tool_name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Helper: call execute_tool via in-process client and parse JSON."""
+async def _call_execute(
+    mcp: FastMCP,
+    tool_name: str,
+    arguments: dict[str, Any] | None = None,
+    *,
+    meta: dict[str, Any] | None = None,
+    exact_meta: bool = False,
+) -> dict[str, Any]:
+    """Call execute_tool via an in-process client and parse JSON."""
     params: dict[str, Any] = {"tool_name": tool_name}
     if arguments is not None:
         params["arguments"] = arguments
     async with Client(mcp) as client:
-        result = await client.call_tool("execute_tool", params)
-    if result.data is not None:
-        text = str(result.data)
-    else:
-        content_block = result.content[0]
-        text = content_block.text  # type: ignore[union-attr]
+        if exact_meta:
+            result = await client.session.call_tool(
+                "execute_tool",
+                params,
+                meta=meta,
+            )
+            text = result.content[0].text  # type: ignore[union-attr]
+        else:
+            result = await client.call_tool("execute_tool", params, meta=meta)
+            if result.data is not None:
+                text = str(result.data)
+            else:
+                content_block = result.content[0]
+                text = content_block.text  # type: ignore[union-attr]
     return json.loads(text)
 
 
@@ -85,7 +103,11 @@ class TestExecuteToolSuccess:
 
         assert data["tool"] == "apollo_people_search"
         assert data["result"] == '{"people": []}'
-        manager.execute_tool.assert_called_once_with("apollo_people_search", {"query": "Jane"})
+        manager.execute_tool.assert_called_once_with(
+            "apollo_people_search",
+            {"query": "Jane"},
+            request_meta={"progressToken": 1},
+        )
 
     @pytest.mark.asyncio
     async def test_no_arguments_sends_none(self, mcp_server: FastMCP, manager: UpstreamManager) -> None:
@@ -94,7 +116,11 @@ class TestExecuteToolSuccess:
         data = await _call_execute(mcp_server, "hubspot_contacts_search")
 
         assert data["result"] == "ok"
-        manager.execute_tool.assert_called_once_with("hubspot_contacts_search", None)
+        manager.execute_tool.assert_called_once_with(
+            "hubspot_contacts_search",
+            None,
+            request_meta={"progressToken": 1},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -225,4 +251,149 @@ class TestExecuteToolArgumentValidation:
         data = await _call_execute(mcp, "legacy_passthrough", {"anything": "goes"})
 
         assert data["result"] == "ok"
-        manager.execute_tool.assert_called_once_with("legacy_passthrough", {"anything": "goes"})
+        manager.execute_tool.assert_called_once_with(
+            "legacy_passthrough",
+            {"anything": "goes"},
+            request_meta={"progressToken": 1},
+        )
+
+
+class TestExecuteToolRequestMetadata:
+    @pytest.mark.asyncio
+    async def test_metadata_is_deep_isolated_from_hooks_and_business_arguments(
+        self,
+        populated_registry: ToolRegistry,
+        manager: UpstreamManager,
+    ) -> None:
+        original_meta = {
+            "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            "io.ult.action_execution.v1": "eyJhbGciOiJFZERTQSJ9.payload.signature",
+            "nested": {"items": [{"attempt": 1}]},
+        }
+        original_arguments = {"query": "Jane"}
+        observed: dict[str, Any] = {}
+
+        class MutatingHook:
+            async def before_execute(self, ctx: ExecutionContext) -> None:
+                observed["view"] = ctx.request_meta
+                with pytest.raises(TypeError):
+                    ctx.request_meta["traceparent"] = "changed"  # type: ignore[index]
+                assert ctx.request_meta is not None
+                ctx.request_meta["nested"]["items"].append({"attempt": 99})
+
+        manager.execute_tool = AsyncMock(return_value=_fake_result("ok"))  # type: ignore[method-assign]
+        mcp = FastMCP("test-gateway")
+        register_meta_tools(
+            mcp,
+            populated_registry,
+            manager,
+            HookRunner([MutatingHook()]),
+        )
+
+        data = await _call_execute(
+            mcp,
+            "apollo_people_search",
+            original_arguments,
+            meta=original_meta,
+            exact_meta=True,
+        )
+
+        assert data["result"] == "ok"
+        assert isinstance(observed["view"], Mapping)
+        assert isinstance(observed["view"], MappingProxyType)
+        assert original_meta["nested"]["items"] == [{"attempt": 1}]
+        assert original_arguments == {"query": "Jane"}
+        manager.execute_tool.assert_awaited_once_with(
+            "apollo_people_search",
+            {"query": "Jane"},
+            request_meta=original_meta,
+        )
+
+    @pytest.mark.asyncio
+    async def test_absent_metadata_remains_none(
+        self,
+        mcp_server: FastMCP,
+        manager: UpstreamManager,
+    ) -> None:
+        manager.execute_tool = AsyncMock(return_value=_fake_result("ok"))  # type: ignore[method-assign]
+
+        await _call_execute(
+            mcp_server,
+            "apollo_people_search",
+            {"query": "Jane"},
+            exact_meta=True,
+        )
+
+        manager.execute_tool.assert_awaited_once_with(
+            "apollo_people_search",
+            {"query": "Jane"},
+            request_meta=None,
+        )
+
+
+class TestExecuteCodeRequestMetadata:
+    @pytest.mark.asyncio
+    async def test_code_mode_receives_exact_request_metadata(
+        self,
+        populated_registry: ToolRegistry,
+        manager: UpstreamManager,
+    ) -> None:
+        code_mode_runner = MagicMock()
+        code_mode_runner.run = AsyncMock(return_value="42")
+        mcp = FastMCP("test-gateway")
+        register_meta_tools(
+            mcp,
+            populated_registry,
+            manager,
+            code_mode_runner=code_mode_runner,
+        )
+        request_meta = {
+            "io.ult.action_execution.v1": "signed-code-mode",
+            "nested": {"attempts": [1]},
+        }
+
+        async with Client(mcp) as client:
+            result = await client.session.call_tool(
+                "execute_code",
+                {"code": "40 + 2"},
+                meta=request_meta,
+            )
+
+        assert result.isError is False
+        code_mode_runner.run.assert_awaited_once_with(
+            "40 + 2",
+            headers={},
+            user=None,
+            request_meta=request_meta,
+        )
+
+    @pytest.mark.asyncio
+    async def test_code_mode_preserves_absent_request_metadata(
+        self,
+        populated_registry: ToolRegistry,
+        manager: UpstreamManager,
+    ) -> None:
+        code_mode_runner = MagicMock()
+        code_mode_runner.run = AsyncMock(return_value="42")
+        mcp = FastMCP("test-gateway")
+        register_meta_tools(
+            mcp,
+            populated_registry,
+            manager,
+            code_mode_runner=code_mode_runner,
+        )
+
+        async with Client(mcp) as client:
+            result = await client.session.call_tool(
+                "execute_code",
+                {"code": "40 + 2"},
+                meta=None,
+            )
+
+        assert result.isError is False
+        code_mode_runner.run.assert_awaited_once_with(
+            "40 + 2",
+            headers={},
+            user=None,
+            request_meta=None,
+        )

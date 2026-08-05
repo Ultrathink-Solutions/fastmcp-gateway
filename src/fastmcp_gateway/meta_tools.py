@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal
 
+from fastmcp import Context  # noqa: TC002 - FastMCP resolves Context for injection at runtime.
 from fastmcp.tools import ToolResult
 from mcp.types import TextContent, ToolAnnotations
 from opentelemetry import trace
@@ -20,6 +23,22 @@ if TYPE_CHECKING:
     from fastmcp_gateway.registry import ToolEntry, ToolRegistry
 
 _tracer = trace.get_tracer("fastmcp_gateway.meta_tools")
+
+
+def _request_meta_snapshot(request_ctx: Context | None) -> dict[str, Any] | None:
+    """Copy the exact inbound MCP request metadata, preserving wire aliases."""
+    if request_ctx is None or request_ctx.request_context is None:
+        return None
+    meta_model = request_ctx.request_context.meta
+    if meta_model is None:
+        return None
+    return deepcopy(
+        meta_model.model_dump(
+            mode="python",
+            by_alias=True,
+            exclude_unset=True,
+        )
+    )
 
 
 def _signatures_block(tools: list[ToolEntry]) -> str:
@@ -360,6 +379,7 @@ def register_meta_tools(
     async def execute_tool(
         tool_name: str,
         arguments: dict[str, Any] | None = None,
+        request_ctx: Context | None = None,
     ) -> ToolResult:
         """Execute a tool by name with the given arguments.
 
@@ -377,6 +397,8 @@ def register_meta_tools(
         legacy string envelope only -- there is no upstream
         ``CallToolResult`` to source ``structured_content`` from.
         """
+        request_meta = _request_meta_snapshot(request_ctx)
+        inbound_meta_snapshot = None if request_meta is None else MappingProxyType(request_meta)
         with _tracer.start_as_current_span("gateway.execute_tool") as span:
             span.set_attribute("gateway.tool_name", tool_name)
 
@@ -401,22 +423,27 @@ def register_meta_tools(
             span.set_attribute("gateway.domain", entry.domain)
 
             # Build execution context and run hooks
-            ctx: ExecutionContext | None = None
+            execution_ctx: ExecutionContext | None = None
             if hook_runner.has_hooks:
                 from fastmcp_gateway.client_manager import get_user_headers
 
-                ctx = ExecutionContext(
+                execution_ctx = ExecutionContext(
                     tool=entry,
                     arguments=arguments or {},
                     headers=get_user_headers(),
+                    request_meta=(
+                        None
+                        if inbound_meta_snapshot is None
+                        else MappingProxyType(deepcopy(dict(inbound_meta_snapshot)))
+                    ),
                 )
 
                 # Authenticate
-                ctx.user = await hook_runner.run_authenticate(ctx.headers)
+                execution_ctx.user = await hook_runner.run_authenticate(execution_ctx.headers)
 
                 # Before execute — may raise ExecutionDenied
                 try:
-                    await hook_runner.run_before_execute(ctx)
+                    await hook_runner.run_before_execute(execution_ctx)
                 except ExecutionDenied as denied:
                     span.set_attribute("gateway.error_code", denied.code)
                     return _error_result(
@@ -429,7 +456,7 @@ def register_meta_tools(
                     )
 
                 # Use potentially mutated arguments from context
-                arguments = ctx.arguments
+                arguments = execution_ctx.arguments
 
             # Reject a call whose arguments don't match the tool's declared
             # schema before it ever reaches the upstream server -- turns a
@@ -449,9 +476,11 @@ def register_meta_tools(
                 )
 
             # Route to upstream via fresh client
-            execute_kwargs: dict[str, Any] = {}
-            if ctx and ctx.extra_headers:
-                execute_kwargs["extra_headers"] = ctx.extra_headers
+            execute_kwargs: dict[str, Any] = {
+                "request_meta": (None if inbound_meta_snapshot is None else deepcopy(dict(inbound_meta_snapshot)))
+            }
+            if execution_ctx and execution_ctx.extra_headers:
+                execute_kwargs["extra_headers"] = execution_ctx.extra_headers
             try:
                 result = await upstream_manager.execute_tool(
                     tool_name,
@@ -462,8 +491,8 @@ def register_meta_tools(
                 span.set_attribute("gateway.error_code", "execution_error")
                 span.record_exception(exc)
 
-                if ctx is not None and hook_runner.has_hooks:
-                    await hook_runner.run_on_error(ctx, exc)
+                if execution_ctx is not None and hook_runner.has_hooks:
+                    await hook_runner.run_on_error(execution_ctx, exc)
 
                 return _error_result(
                     error_response(
@@ -490,9 +519,9 @@ def register_meta_tools(
             # through the same structured error envelope used by
             # ``before_execute`` / ``after_execute`` denials -- meta-tools
             # must never raise ``ExecutionDenied`` to the LLM.
-            if ctx is not None and hook_runner.has_hooks:
+            if execution_ctx is not None and hook_runner.has_hooks:
                 try:
-                    result = await hook_runner.run_transform_result(ctx, result)
+                    result = await hook_runner.run_transform_result(execution_ctx, result)
                 except ExecutionDenied as denied:
                     span.set_attribute("gateway.error_code", denied.code)
                     return _error_result(
@@ -536,9 +565,9 @@ def register_meta_tools(
                     tool=tool_name,
                 )
                 # Run after_execute even on upstream errors
-                if ctx is not None and hook_runner.has_hooks:
+                if execution_ctx is not None and hook_runner.has_hooks:
                     try:
-                        result_text = await hook_runner.run_after_execute(ctx, result_text, True)
+                        result_text = await hook_runner.run_after_execute(execution_ctx, result_text, True)
                     except ExecutionDenied as denied:
                         # An after_execute hook (output guard in
                         # reject mode, or any operator hook) may opt
@@ -566,9 +595,9 @@ def register_meta_tools(
             # (e.g., the output guard's reject mode catches prompt-
             # injection markup in the tool result). Surface that as
             # a structured error, not an uncaught exception.
-            if ctx is not None and hook_runner.has_hooks:
+            if execution_ctx is not None and hook_runner.has_hooks:
                 try:
-                    result_text = await hook_runner.run_after_execute(ctx, result_text, False)
+                    result_text = await hook_runner.run_after_execute(execution_ctx, result_text, False)
                 except ExecutionDenied as denied:
                     span.set_attribute("gateway.error_code", denied.code)
                     return _error_result(
@@ -625,7 +654,10 @@ def register_meta_tools(
     if code_mode_runner is not None:
 
         @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, openWorldHint=True))
-        async def execute_code(code: str) -> str:
+        async def execute_code(
+            code: str,
+            request_ctx: Context | None = None,
+        ) -> str:
             """Run LLM-authored Python that orchestrates multiple tool calls.
 
             Experimental.  Every registered tool is exposed as a named
@@ -648,13 +680,20 @@ def register_meta_tools(
             - All access control and audit hooks that apply to
               ``execute_tool`` also apply per nested call here.
             """
+            request_meta = _request_meta_snapshot(request_ctx)
+
             from fastmcp_gateway.client_manager import get_user_headers
 
             with _tracer.start_as_current_span("gateway.execute_code") as span:
                 headers = get_user_headers()
                 user = await hook_runner.run_authenticate(headers)
                 try:
-                    return await code_mode_runner.run(code, headers=headers, user=user)
+                    return await code_mode_runner.run(
+                        code,
+                        headers=headers,
+                        user=user,
+                        request_meta=request_meta,
+                    )
                 except ExecutionDenied as exc:
                     span.set_attribute("gateway.error_code", exc.code)
                     return error_response(exc.code, exc.message)
