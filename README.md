@@ -224,6 +224,7 @@ class AuthHook:
     async def before_execute(self, context: ExecutionContext):
         if not has_permission(context.user, context.tool.domain):
             raise ExecutionDenied("Insufficient permissions", code="forbidden")
+        signed_context = context.request_meta  # Read-only, request-bound MCP metadata
         # Inject headers for the upstream server
         context.extra_headers["X-User-Token"] = exchange_token(context.user)
 
@@ -243,8 +244,8 @@ export GATEWAY_HOOK_MODULE='my_package.hooks:create_hooks'
 For each `execute_tool` call:
 
 1. **`on_authenticate(headers)`** — Extract user identity from request headers. Last non-None result wins across multiple hooks.
-2. **`before_execute(context)`** — Validate permissions, mutate arguments, set `extra_headers`. Raise `ExecutionDenied` to block.
-3. **Upstream call** — `extra_headers` merge with highest priority over static `upstream_headers`.
+2. **`before_execute(context)`** — Validate permissions, inspect the isolated read-only `request_meta`, mutate arguments, or set `extra_headers`. Raise `ExecutionDenied` to block.
+3. **Upstream call** — The untouched inbound MCP metadata is forwarded exactly; absent metadata remains absent. `extra_headers` merge with highest priority over static `upstream_headers`.
 4. **`after_execute(context, result, is_error)`** — Transform or log the result. Each hook receives the previous hook's output.
 5. **`on_error(context, error)`** — Observability only (exceptions in hooks are logged, not raised).
 

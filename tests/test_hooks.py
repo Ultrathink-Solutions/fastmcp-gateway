@@ -60,6 +60,21 @@ class TestExecutionContext:
         ctx.metadata["request_id"] = "abc123"
         assert ctx.metadata["request_id"] == "abc123"
 
+    def test_existing_sixth_positional_argument_remains_metadata(self) -> None:
+        tool = _make_tool_entry()
+        metadata = {"request_id": "legacy-positional"}
+        ctx = ExecutionContext(
+            tool,
+            {"key": "value"},
+            {"authorization": "Bearer test-token"},
+            None,
+            {},
+            metadata,
+        )
+
+        assert ctx.metadata is metadata
+        assert ctx.request_meta is None
+
     def test_user_settable(self) -> None:
         ctx = _make_context()
         ctx.user = {"sub": "user@example.com"}

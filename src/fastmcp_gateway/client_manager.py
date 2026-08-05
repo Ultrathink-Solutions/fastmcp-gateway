@@ -16,6 +16,7 @@ import asyncio
 import inspect
 import logging
 from collections import defaultdict
+from copy import deepcopy
 from typing import TYPE_CHECKING, Any
 
 from fastmcp import Client
@@ -23,7 +24,7 @@ from fastmcp.server.dependencies import get_http_headers
 from opentelemetry import trace
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Awaitable, Callable, Mapping
 
     from fastmcp.client.client import CallToolResult
 
@@ -51,6 +52,33 @@ def get_user_headers(*, include_all: bool = False) -> dict[str, str]:
         that are normally stripped (``content-length``, ``host``, etc.).
     """
     return get_http_headers(include_all=include_all)
+
+
+async def _call_tool_without_metadata_injection(
+    client: Client,
+    name: str,
+    arguments: dict[str, Any],
+    request_meta: Mapping[str, Any] | None,
+) -> CallToolResult:
+    """Call through the MCP session without FastMCP trace metadata injection.
+
+    FastMCP 3.4.x has no public equivalents for its session monitor or raw
+    protocol-result adapter. Keep both private API dependencies isolated here.
+    """
+
+    dispatch_meta = None if request_meta is None else deepcopy(dict(request_meta))
+    raw_result = await client._await_with_session_monitoring(
+        client.session.call_tool(
+            name,
+            arguments,
+            meta=dispatch_meta,
+        )
+    )
+    return await client._parse_call_tool_result(
+        name,
+        raw_result,
+        raise_on_error=False,
+    )
 
 
 def _set_transport_headers(client: Client, headers: dict[str, str]) -> None:
@@ -355,6 +383,7 @@ class UpstreamManager:
         arguments: dict[str, Any] | None = None,
         *,
         extra_headers: dict[str, str] | None = None,
+        request_meta: Mapping[str, Any] | None = None,
     ) -> CallToolResult:
         """Execute a tool on its upstream server.
 
@@ -371,6 +400,8 @@ class UpstreamManager:
             Tool arguments.
         extra_headers:
             Additional headers from hooks, merged with highest priority.
+        request_meta:
+            Exact inbound MCP request metadata to forward. ``None`` stays absent.
 
         Raises ``KeyError`` if *tool_name* is not in the registry.
         """
@@ -392,10 +423,11 @@ class UpstreamManager:
             upstream_name = entry.original_name or entry.name
 
             async with fresh_client:
-                return await fresh_client.call_tool(
+                return await _call_tool_without_metadata_injection(
+                    fresh_client,
                     upstream_name,
                     arguments or {},
-                    raise_on_error=False,
+                    request_meta,
                 )
 
     def _make_execution_client(

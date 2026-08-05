@@ -30,6 +30,8 @@ from typing import TYPE_CHECKING, Any, runtime_checkable
 from typing_extensions import Protocol
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from fastmcp.client.client import CallToolResult
 
     from fastmcp_gateway.registry import ToolEntry
@@ -54,7 +56,10 @@ class ExecutionContext:
     extra_headers:
         Additional headers forwarded to the upstream server.
     metadata:
-        Hook-to-hook communication channel.
+        Mutable hook-to-hook communication channel.
+    request_meta:
+        Read-only, request-bound MCP metadata. Hooks may inspect it but
+        cannot replace top-level values.
     """
 
     tool: ToolEntry
@@ -63,6 +68,7 @@ class ExecutionContext:
     user: Any | None = None
     extra_headers: dict[str, str] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
+    request_meta: Mapping[str, Any] | None = None
 
 
 @dataclass

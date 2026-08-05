@@ -297,6 +297,53 @@ class TestHeaderPropagation:
         assert captured[0].user == "alice"
 
 
+class TestRequestMetadataPropagation:
+    @pytest.mark.asyncio
+    async def test_nested_call_metadata_is_isolated_from_hooks(self) -> None:
+        observed: list[ExecutionContext] = []
+
+        class MutatingHook:
+            async def before_execute(self, ctx: ExecutionContext) -> None:
+                observed.append(ctx)
+                assert ctx.request_meta is not None
+                with pytest.raises(TypeError):
+                    ctx.request_meta["signature"] = "changed"  # type: ignore[index]
+                ctx.request_meta["nested"]["attempts"].append(99)
+
+        gw = _make_gateway(hooks=[MutatingHook()])
+        _seed_registry(gw)
+        runner = _runner(gw)
+        request_meta = {
+            "signature": "signed-value",
+            "nested": {"attempts": [1]},
+        }
+        stub = _stub_execute_tool({"crm_count": _FakeCallResult(structured={"n": 42})})
+
+        with patch.object(gw.upstream_manager, "execute_tool", stub):
+            await runner.run(
+                """
+first = await crm_count()
+second = await crm_count()
+[first, second]
+""",
+                headers={},
+                user="alice",
+                request_meta=request_meta,
+            )
+
+        assert request_meta == {
+            "signature": "signed-value",
+            "nested": {"attempts": [1]},
+        }
+        assert len(observed) == 2
+        assert [ctx.request_meta["nested"]["attempts"] for ctx in observed if ctx.request_meta is not None] == [
+            [1, 99],
+            [1, 99],
+        ]
+        assert stub.await_count == 2
+        assert all(call.kwargs["request_meta"] == request_meta for call in stub.await_args_list)
+
+
 # ---------------------------------------------------------------------------
 # Per-nested-call hook reuse
 # ---------------------------------------------------------------------------

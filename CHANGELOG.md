@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.27.0] - 2026-08-04
+
+### Added
+
+- **Exact request-boundary MCP metadata relay for direct and code-mode tool execution.** `execute_tool` and `execute_code` now snapshot the inbound `CallToolRequestParams.meta` once, expose an isolated read-only view to execution hooks, and forward an isolated copy to every upstream `tools/call`. Unknown and nested metadata fields are preserved, aliases stay wire-compatible, absent metadata remains absent, and FastMCP client-side trace injection cannot overwrite a caller-supplied `traceparent`.
+
+### Security
+
+- Hook mutation cannot alter signed execution metadata. Each direct or nested code-mode call receives a deep-isolated top-level read-only mapping, while upstream dispatch uses the untouched request-boundary snapshot rather than mutable hook state or tool arguments.
+
 ## [0.26.0] - 2026-08-04
 
 ### Added
@@ -657,6 +667,7 @@ Security-hardening release. Closes two code-injection primitives in the env-driv
 
 - Migrated `ToolEntry` and `DomainInfo` from dataclasses to Pydantic models (#9)
 
+[0.27.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.26.0...v0.27.0
 [0.23.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.20.0...v0.21.0
