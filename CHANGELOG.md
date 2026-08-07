@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Relaxed schema-depth counting: `Optional[X]` / `X | None` no longer costs 2 extra nesting levels.** Pydantic (and most JSON-Schema generators) encode `Optional[X]` as `{"anyOf": [X, {"type": "null"}]}`. The registry-ingest depth counter previously charged the wrapper dict, the union array, and the null-branch member as 3 additional nesting steps versus a required `X` at the same position -- meaning an optional field started 2 levels closer to the depth cap than a required one with identical real complexity for an LLM consumer. When a dict's `anyOf`/`oneOf` value is exactly a 2-member union with one member being exactly `{"type": "null"}` (strictest reading -- a null member additionally carrying `title`/`description`/etc. does NOT qualify and keeps the old counting), that key now contributes the same depth as its non-null member alone, as if the optionality wrapper weren't there. Composes across nested optionals. 3+-branch unions and unions without a null member are unaffected. **This is a validator relaxation, not a tightening: some `inputSchema`s that were previously rejected as exceeding the depth cap are now admitted** -- specifically, tools whose rejection was solely due to `Optional[...]`-wrapped fields pushing them 1-2 levels past the cap. `$ref` detection was updated in lockstep so it can't spuriously fail-closed on a wrapper depth `_schema_depth` no longer counts.
+
+### Fixed
+
+- **Bounded the real recursive-call count independently of the new transparent-depth counting, closing a `RecursionError` DoS the transparency change would otherwise have introduced.** Because the optional-union transparency above recurses into a wrapper's non-null member without advancing the logical depth counter, a schema built from a long chain of `{"anyOf": [<inner>, {"type": "null"}]}` wrappers around one leaf previously climbed one real Python stack frame per wrapper while the reported depth stayed low -- silently admitting schemas that should have been rejected at a few hundred wrappers, and raising an uncaught `RecursionError` at a few thousand that would have escaped the registry's per-tool `SchemaValidationError` catch and aborted the whole upstream's registration. `_schema_depth` and `_contains_ref` now also track a second, always-advancing physical-recursion counter (cap 100, independent of the logical depth cap) and reject cleanly with `SchemaValidationError` well before either the false-admission or the stack-overflow threshold.
+
 ## [0.26.0] - 2026-08-04
 
 ### Added

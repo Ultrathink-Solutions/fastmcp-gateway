@@ -242,8 +242,69 @@ class SchemaValidationError(ValueError):
 # renderer.
 _MAX_SCHEMA_DEPTH = 5
 
+# JSON-Schema keys that encode a union of alternative schemas. Pydantic (and
+# most JSON-Schema generators) emit ``anyOf`` for ``Optional[X]`` /
+# ``X | None``; ``oneOf`` is JSON Schema's mutually-exclusive-union sibling
+# and is treated identically here since the null-optionality shape is the
+# same either way.
+_UNION_KEYS = ("anyOf", "oneOf")
 
-def _contains_ref(node: Any, depth: int = 0) -> bool:
+# Hard ceiling on REAL recursive call count, independent of the logical
+# depth cap. The optional-union transparency below deliberately recurses
+# into a wrapper's non-null member WITHOUT advancing the logical ``depth``
+# counter -- so a schema built entirely from chained
+# ``{"anyOf": [<inner>, {"type": "null"}]}`` wrappers around a single leaf
+# can climb arbitrarily many real Python stack frames while ``depth`` never
+# exceeds the cap, defeating the ``depth > _MAX_SCHEMA_DEPTH`` bail-out
+# below and eventually raising an uncaught ``RecursionError`` deep inside
+# registry population -- an exception the per-tool ``except
+# SchemaValidationError`` catch in ``ToolRegistry.populate_domain`` does
+# NOT catch, so it would abort the whole domain's registration instead of
+# just skipping the one malformed tool. This counter increments on EVERY
+# recursive call, transparent or not, and is checked independently of
+# ``depth``. 100 is generous -- no legitimate schema plausibly nests (or
+# chains optionality wrappers) anywhere near that deep -- while leaving
+# ample headroom under Python's default recursion limit (~1000).
+_MAX_PHYSICAL_RECURSION = 100
+
+
+def _is_null_schema(node: Any) -> bool:
+    """Strict test for the JSON-Schema null-type sentinel ``{"type": "null"}``.
+
+    Matches ONLY a dict whose single key is ``"type"`` with value
+    ``"null"`` -- the exact shape Pydantic (and most JSON-Schema
+    generators) emit for the null branch of ``Optional[X]``. A dict
+    that additionally carries annotation keys (``title``,
+    ``description``, a sibling ``default``, ...) alongside
+    ``"type": "null"`` does NOT match. This is the strictest reading of
+    "the null member": a schema author who attached an explicit
+    annotation to the null branch presumably wants it treated as
+    meaningful structure, not silently made transparent.
+    """
+    return isinstance(node, dict) and node == {"type": "null"}
+
+
+def _optional_wrapper_target(members: Any) -> Any | None:
+    """Return the sole non-null member of a 2-member null union, else ``None``.
+
+    *members* is the raw value of an ``anyOf``/``oneOf`` key. Returns
+    the other member when *members* is a list of exactly two schemas,
+    exactly one of which is :func:`_is_null_schema`. Any other shape —
+    not a list, not exactly 2 items, zero null members, or two null
+    members — returns ``None``, and the caller falls back to counting
+    the union normally. This deliberately narrow match means a
+    3+-branch union (``Union[A, B, None]``) or a union with no null
+    member is never treated as an optionality wrapper.
+    """
+    if not isinstance(members, list) or len(members) != 2:
+        return None
+    null_flags = [_is_null_schema(m) for m in members]
+    if sum(null_flags) != 1:
+        return None
+    return members[1] if null_flags[0] else members[0]
+
+
+def _contains_ref(node: Any, depth: int = 0, *, physical_depth: int = 0) -> bool:
     """Recursively check whether any dict in *node* contains a ``$ref`` key.
 
     ``$ref`` is rejected outright: resolving it requires fetching an
@@ -251,6 +312,16 @@ def _contains_ref(node: Any, depth: int = 0) -> bool:
     introduces a TOCTOU window between validation and the time the
     sandbox type renderer reads the schema. Static inline schemas are
     strictly more auditable.
+
+    Recurses through an ``Optional[X]`` union (see :func:`_schema_depth`)
+    at the SAME logical *depth* as its wrapper dict, mirroring the
+    depth-counting transparency below. *physical_depth*, in contrast,
+    increments on EVERY recursive call including transparent ones -- see
+    :data:`_MAX_PHYSICAL_RECURSION` for why a second, always-advancing
+    counter is required and cannot be replaced by *depth* alone. The null
+    member itself is never checked for ``$ref`` because
+    :func:`_is_null_schema` only matches the fixed, ref-free shape
+    ``{"type": "null"}``.
     """
     if depth > _MAX_SCHEMA_DEPTH:
         # Fail closed: conservatively treat an unexplored subtree as
@@ -266,16 +337,33 @@ def _contains_ref(node: Any, depth: int = 0) -> bool:
         # ref check silently. Returning ``True`` closes that class of
         # bug regardless of caller ordering.
         return True
+    if physical_depth > _MAX_PHYSICAL_RECURSION:
+        # Same fail-closed contract as the logical-depth bail-out above,
+        # but keyed on real recursive-call count instead of logical
+        # depth -- reachable ONLY via a chain of transparent
+        # optional-wrapper hops, since every non-transparent path already
+        # advances ``depth`` in lockstep with ``physical_depth`` and
+        # would hit the check above first.
+        return True
     if isinstance(node, dict):
         if "$ref" in node:
             return True
-        return any(_contains_ref(v, depth + 1) for v in node.values())
+        for key, value in node.items():
+            if key in _UNION_KEYS:
+                target = _optional_wrapper_target(value)
+                if target is not None:
+                    if _contains_ref(target, depth, physical_depth=physical_depth + 1):
+                        return True
+                    continue
+            if _contains_ref(value, depth + 1, physical_depth=physical_depth + 1):
+                return True
+        return False
     if isinstance(node, list):
-        return any(_contains_ref(item, depth + 1) for item in node)
+        return any(_contains_ref(item, depth + 1, physical_depth=physical_depth + 1) for item in node)
     return False
 
 
-def _schema_depth(node: Any, depth: int = 0) -> int:
+def _schema_depth(node: Any, depth: int = 0, *, physical_depth: int = 0) -> int:
     """Return the maximum nesting depth of dicts/lists in *node*.
 
     Each dict or list increments the depth counter. Used to reject
@@ -288,17 +376,68 @@ def _schema_depth(node: Any, depth: int = 0) -> int:
     already rejects any depth > cap, so an exact measurement past the
     cap is unnecessary and unsafe (Python's default recursion limit
     would fire on ~1000 levels).
+
+    Optional-union transparency
+    ----------------------------
+    Pydantic's ``Optional[X]`` / ``X | None`` encoding —
+    ``{"anyOf": [X, {"type": "null"}]}`` — costs 2 extra levels versus
+    a required ``X`` at the same position (the wrapper dict's ``anyOf``
+    key, plus the union array, plus recursing into the list member),
+    despite identical real complexity for an LLM consumer: an optional
+    list field would otherwise start 2 levels closer to the cap than a
+    required one for no structural reason. When a dict's
+    ``anyOf``/``oneOf`` value matches :func:`_optional_wrapper_target`
+    (exactly one non-null member alongside exactly one
+    ``{"type": "null"}`` member), that key's contribution to this
+    dict's depth is computed at the SAME *depth* as the dict itself — as
+    if the wrapper were replaced by the non-null member directly —
+    instead of the usual ``depth + 1``. Every other key in the same
+    dict (e.g. a sibling ``title``) is still counted normally, and this
+    composes: an optional field nested inside another optional field's
+    non-null branch keeps discounting each wrapper it crosses. A
+    3+-branch union or a union with no null member never matches
+    :func:`_optional_wrapper_target`, so it keeps the pre-existing,
+    non-transparent counting.
+
+    Physical recursion guard
+    -------------------------
+    Because the transparency above recurses WITHOUT advancing *depth*,
+    *depth* alone can no longer bound the real recursive-call count: a
+    schema built entirely from chained optional-wrapper hops around one
+    leaf keeps *depth* at (or near) 0 forever while still making one real
+    Python call per hop. *physical_depth* is a second counter that
+    increments on every recursive call — transparent or not — and is
+    checked independently via :data:`_MAX_PHYSICAL_RECURSION`. When it
+    fires, this returns ``_MAX_SCHEMA_DEPTH + 1`` — a value guaranteed to
+    exceed the cap — rather than the (possibly still-small, and
+    therefore misleading) *depth* value, so :func:`validate_input_schema`
+    reliably rejects the schema instead of silently admitting it. Without
+    this, a sufficiently long chain would either be wrongly admitted (low
+    reported depth) or, past Python's default recursion limit, raise an
+    uncaught ``RecursionError`` that escapes the registry's per-tool
+    ``SchemaValidationError`` catch and aborts the whole upstream's
+    registration.
     """
     if depth > _MAX_SCHEMA_DEPTH:
         return depth
+    if physical_depth > _MAX_PHYSICAL_RECURSION:
+        return _MAX_SCHEMA_DEPTH + 1
     if isinstance(node, dict):
         if not node:
             return depth
-        return max(_schema_depth(v, depth + 1) for v in node.values())
+        contributions: list[int] = []
+        for key, value in node.items():
+            if key in _UNION_KEYS:
+                target = _optional_wrapper_target(value)
+                if target is not None:
+                    contributions.append(_schema_depth(target, depth, physical_depth=physical_depth + 1))
+                    continue
+            contributions.append(_schema_depth(value, depth + 1, physical_depth=physical_depth + 1))
+        return max(contributions)
     if isinstance(node, list):
         if not node:
             return depth
-        return max(_schema_depth(item, depth + 1) for item in node)
+        return max(_schema_depth(item, depth + 1, physical_depth=physical_depth + 1) for item in node)
     return depth
 
 
