@@ -12,6 +12,7 @@ from opentelemetry.sdk.trace import TracerProvider
 
 from fastmcp_gateway.client_manager import UpstreamManager
 from fastmcp_gateway.registry import ToolRegistry
+from fastmcp_gateway.sanitize import MAX_ALLOWED_SCHEMA_DEPTH
 
 
 @dataclass
@@ -156,6 +157,81 @@ class TestPopulateDomain:
             manager = UpstreamManager({"svc": "http://svc:8080/mcp"}, registry)
             with pytest.raises(KeyError):
                 await manager.populate_domain("nonexistent")
+
+
+# ---------------------------------------------------------------------------
+# populate_domain — configurable max_schema_depth
+# ---------------------------------------------------------------------------
+
+
+def _deep_schema_tool(domain: str) -> FakeTool:
+    """A tool whose inputSchema exceeds the default depth cap of 5."""
+    deep: dict[str, Any] = {"type": "string"}
+    for key in ("b", "a"):
+        deep = {"type": "object", "properties": {key: deep}}
+    return FakeTool(
+        name=f"{domain}_deep",
+        description="Deeply nested tool",
+        inputSchema={"type": "object", "properties": {"root": deep}},
+    )
+
+
+class TestPopulateDomainMaxSchemaDepth:
+    @pytest.mark.asyncio
+    async def test_default_rejects_deep_schema(self, registry: ToolRegistry) -> None:
+        def make_client(url: str) -> MagicMock:
+            client = AsyncMock()
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=None)
+            client.list_tools = AsyncMock(return_value=[_deep_schema_tool("svc")])
+            return client
+
+        with patch("fastmcp_gateway.client_manager.Client", side_effect=make_client):
+            manager = UpstreamManager({"svc": "http://svc:8080/mcp"}, registry)
+            count = await manager.populate_domain("svc")
+
+        assert count == 0
+        assert registry.lookup("svc_deep") is None
+
+    @pytest.mark.asyncio
+    async def test_raised_cap_admits_deep_schema(self, registry: ToolRegistry) -> None:
+        def make_client(url: str) -> MagicMock:
+            client = AsyncMock()
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=None)
+            client.list_tools = AsyncMock(return_value=[_deep_schema_tool("svc")])
+            return client
+
+        with patch("fastmcp_gateway.client_manager.Client", side_effect=make_client):
+            manager = UpstreamManager({"svc": "http://svc:8080/mcp"}, registry, max_schema_depth=10)
+            count = await manager.populate_domain("svc")
+
+        assert count == 1
+        assert registry.lookup("svc_deep") is not None
+
+
+class TestMaxSchemaDepthConstructionValidation:
+    """UpstreamManager must validate max_schema_depth at __init__ time --
+    not defer the ValueError to the first populate() call. A caller that
+    constructs UpstreamManager directly (bypassing GatewayServer) gets the
+    same fail-fast guarantee."""
+
+    @pytest.mark.parametrize(
+        "bad_value",
+        [0, -3, MAX_ALLOWED_SCHEMA_DEPTH + 1, True, 1.5, "5", None],
+        ids=["zero", "negative", "above-ceiling", "bool", "float", "str", "none"],
+    )
+    def test_invalid_value_rejected_at_construction(self, registry: ToolRegistry, bad_value: object) -> None:
+        with patch("fastmcp_gateway.client_manager.Client"), pytest.raises(ValueError):
+            UpstreamManager({"svc": "http://svc:8080/mcp"}, registry, max_schema_depth=bad_value)  # type: ignore[arg-type]
+
+    def test_at_ceiling_accepted_at_construction(self, registry: ToolRegistry) -> None:
+        with patch("fastmcp_gateway.client_manager.Client"):
+            UpstreamManager(
+                {"svc": "http://svc:8080/mcp"},
+                registry,
+                max_schema_depth=MAX_ALLOWED_SCHEMA_DEPTH,
+            )
 
 
 # ---------------------------------------------------------------------------

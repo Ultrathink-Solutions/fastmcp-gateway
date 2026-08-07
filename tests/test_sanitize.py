@@ -8,6 +8,7 @@ import pytest
 
 from fastmcp_gateway.registry import ToolRegistry
 from fastmcp_gateway.sanitize import (
+    MAX_ALLOWED_SCHEMA_DEPTH,
     SchemaValidationError,
     sanitize_description,
     validate_input_schema,
@@ -217,6 +218,78 @@ class TestValidateInputSchema:
         }
         with pytest.raises(SchemaValidationError, match=r"\$ref"):
             validate_input_schema(schema)
+
+
+# ---------------------------------------------------------------------------
+# validate_input_schema — configurable max_depth
+# ---------------------------------------------------------------------------
+
+
+def _nested_schema(levels: int) -> dict:
+    """Build an object schema nested *levels* ``properties`` deep."""
+    deep: dict = {"type": "string"}
+    for i in range(levels):
+        deep = {"type": "object", "properties": {f"k{i}": deep}}
+    return {"type": "object", "properties": {"root": deep}}
+
+
+# A schema deep enough to sit right at the default cap's rejection boundary
+# (matches the shape used in test_rejects_excessive_depth).
+_DEPTH_6_SCHEMA = _nested_schema(2)
+
+
+class TestConfigurableSchemaDepth:
+    def test_default_still_rejects_depth_6(self) -> None:
+        """Omitting max_depth preserves the existing cap of 5 -- no behavior change."""
+        with pytest.raises(SchemaValidationError):
+            validate_input_schema(_DEPTH_6_SCHEMA)
+
+    def test_raised_cap_admits_the_same_schema(self) -> None:
+        """The identical schema passes once the caller raises max_depth."""
+        assert validate_input_schema(_DEPTH_6_SCHEMA, max_depth=10) == _DEPTH_6_SCHEMA
+
+    def test_lowered_cap_still_rejects_previously_valid_schema(self) -> None:
+        """A caller may also lower the cap below 5, tightening validation."""
+        shallow = {"type": "object", "properties": {"q": {"type": "string"}}}
+        assert validate_input_schema(shallow, max_depth=10) == shallow
+        with pytest.raises(SchemaValidationError):
+            validate_input_schema(shallow, max_depth=1)
+
+    @pytest.mark.parametrize(
+        "bad_value",
+        [0, -1, MAX_ALLOWED_SCHEMA_DEPTH + 1, True, 1.5, "5", None],
+        ids=["zero", "negative", "above-ceiling", "bool", "float", "str", "none"],
+    )
+    def test_invalid_max_depth_is_a_configuration_error(self, bad_value: object) -> None:
+        """A bad max_depth is an operator misconfiguration, not a schema-shape
+        rejection -- it must surface as a plain ValueError, never as the
+        SchemaValidationError the registry's ingest loop swallows per tool.
+
+        ``True`` is covered deliberately: ``bool`` is an ``int`` subclass, so a
+        range-only check would silently accept it as a cap of 1.
+        """
+        with pytest.raises(ValueError) as excinfo:
+            validate_input_schema({"type": "object"}, max_depth=bad_value)  # type: ignore[arg-type]
+        assert not isinstance(excinfo.value, SchemaValidationError)
+
+    def test_max_depth_at_ceiling_accepted(self) -> None:
+        """The ceiling itself is a valid, usable value."""
+        shallow = {"type": "object", "properties": {"q": {"type": "string"}}}
+        assert validate_input_schema(shallow, max_depth=MAX_ALLOWED_SCHEMA_DEPTH) == shallow
+
+    def test_pathological_depth_at_raised_cap_still_rejects_without_recursion_error(self) -> None:
+        """Even at the ceiling, an adversarially deep schema rejects cleanly.
+
+        Regression shield: raising max_depth must never re-open the
+        RecursionError DoS the original hardcoded cap closed. A schema
+        nested far past even the maximum allowed cap must still bail out
+        with SchemaValidationError, not crash the process.
+        """
+        deep: dict = {"type": "string"}
+        for i in range(2000):
+            deep = {"type": "object", "properties": {f"k{i}": deep}}
+        with pytest.raises(SchemaValidationError):
+            validate_input_schema(deep, max_depth=MAX_ALLOWED_SCHEMA_DEPTH)
 
 
 # ---------------------------------------------------------------------------

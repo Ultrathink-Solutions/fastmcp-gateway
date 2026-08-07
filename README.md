@@ -91,6 +91,7 @@ All configuration is via environment variables:
 | `GATEWAY_UPSTREAM_HEADERS` | No | — | JSON object: `{"domain": {"Header": "Value"}, ...}` |
 | `GATEWAY_REFRESH_INTERVAL` | No | Disabled | Seconds between automatic registry refresh cycles |
 | `GATEWAY_TRACE_HEALTH_ROUTES` | No | `true` | Emit an OTel span per `/healthz` / `/readyz` request (see Health Endpoints) |
+| `GATEWAY_MAX_SCHEMA_DEPTH` | No | `5` | Registry-ingest schema-nesting-depth cap, `1`-`50` (see Schema Validation) |
 | `GATEWAY_HOOK_MODULE` | No | — | Python module path for execution hooks: `module.path:factory_function` |
 | `GATEWAY_REGISTRATION_TOKEN` | No | — | Shared secret for dynamic registration endpoints (see below) |
 | `GATEWAY_CODE_MODE` | No | `false` | Enable the experimental `execute_code` meta-tool (see Code Mode) |
@@ -207,6 +208,21 @@ Patterns use `fnmatch.fnmatchcase` (case-sensitive `*` / `?` globs). Matched aga
 - **`deny`**: always applied after `allow`. A tool matching a `deny` pattern is blocked even if it also matches an `allow` pattern.
 
 When both object-shaped `upstreams` and an explicit `access_policy=` are provided, the explicit argument wins.
+
+## Schema Validation
+
+Every upstream tool's `inputSchema` is validated during registry population before the tool is registered: the root must be a JSON object with `"type": "object"`, `additionalProperties: true` is rejected at the root, `$ref` is rejected at any depth, and nesting deeper than a configurable cap is rejected. A tool that fails validation is skipped (with a `WARNING` log) rather than aborting the whole upstream — one malformed tool can't take down its siblings.
+
+The nesting-depth cap defaults to **5** and is available-but-discouraged to raise: it exists to bound schema complexity for LLM consumers, not to reject any particular upstream. Prefer flattening an over-deep schema at the source; raise the cap only deliberately, since a much higher value widens the recursion the ingest-time validator performs over upstream-controlled input.
+
+```python
+gateway = GatewayServer(
+    {"apollo": "http://apollo:8080/mcp"},
+    max_schema_depth=8,  # default is 5
+)
+```
+
+Or via `GATEWAY_MAX_SCHEMA_DEPTH` when running the CLI entry point. Must be an integer in **[1, 50]**; an invalid value fails loudly at startup rather than silently falling back to the default. The upper bound of 50 isn't arbitrary: the ingest-time depth/`$ref` recursion itself becomes a stack-overflow risk on adversarial input well before four-figure nesting depths, so the cap can't be raised without limit even for a deployment that genuinely needs deeper schemas.
 
 ## Execution Hooks
 

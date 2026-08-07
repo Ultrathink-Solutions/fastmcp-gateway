@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`GatewayServer(trace_health_routes=...)` / `GATEWAY_TRACE_HEALTH_ROUTES` to opt `/healthz` and `/readyz` out of per-request OTel spans.** Both routes previously wrapped every request in a `gateway.healthz` / `gateway.readyz` span unconditionally. Under kubelet-style liveness/readiness probing every few seconds, each probe becomes its own root trace, which a deployment may prefer to filter out at the source rather than downstream in the collector. Defaults to `True` (spans emitted, matching prior behaviour); setting it to `False` disables span creation for these two routes entirely -- response bodies and status codes are unaffected either way.
 
+- **`GatewayServer(max_schema_depth=...)` / `GATEWAY_MAX_SCHEMA_DEPTH` to configure the registry-ingest schema-nesting-depth cap.** Previously hardcoded at 5, with no deployment-side recourse for a tool whose `inputSchema` legitimately nests deeper. The default stays `5`, so existing deployments are unaffected. The cap bounds schema complexity for LLM consumers, so raising it is documented as available-but-discouraged — prefer flattening an over-deep upstream schema. Must be an integer in **[1, 50]**; the upper bound isn't a sanity nicety, since the ingest-time depth/`$ref` recursion itself becomes a stack-overflow risk on adversarial input well before four-figure depths. An out-of-range or non-integer value is rejected loudly at construction (or env-parse) time as a configuration error, distinct from the per-tool `SchemaValidationError` skip path.
+
 ## [0.27.0] - 2026-08-04
 
 ### Added

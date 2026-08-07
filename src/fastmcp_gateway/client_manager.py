@@ -23,6 +23,8 @@ from fastmcp import Client
 from fastmcp.server.dependencies import get_http_headers
 from opentelemetry import trace
 
+from fastmcp_gateway.sanitize import DEFAULT_MAX_SCHEMA_DEPTH, _validate_max_schema_depth
+
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Mapping
 
@@ -149,6 +151,15 @@ class UpstreamManager:
         enabled) bypasses it on each invocation. Complementary to the
         upstream-declared ``annotations: {"x-raw-output-trusted":
         true}`` custom extension.
+    max_schema_depth:
+        Forwarded to :meth:`ToolRegistry.populate_domain` as its
+        ``max_schema_depth`` on every populate/refresh/add_upstream
+        call. Defaults to ``5``, matching prior behaviour. Must be an
+        int between ``1`` and ``50`` inclusive; validated here at
+        construction time (not deferred to the first populate call) so
+        a caller that constructs ``UpstreamManager`` directly --
+        bypassing ``GatewayServer`` -- gets the same fail-fast
+        guarantee.
     """
 
     def __init__(
@@ -163,7 +174,14 @@ class UpstreamManager:
         sanitizer_trusted_domains: set[str] | None = None,
         trusted_output_tools: set[str] | None = None,
         discovery_urls: dict[str, str] | None = None,
+        max_schema_depth: int = DEFAULT_MAX_SCHEMA_DEPTH,
     ) -> None:
+        # Fail fast here rather than deferring to the first populate()
+        # call -- a caller that constructs UpstreamManager directly
+        # (bypassing GatewayServer's own construction-time check) must
+        # get the same immediate failure. The upper bound guards against
+        # a stack-overflow-prone recursion depth, not just a typo.
+        _validate_max_schema_depth(max_schema_depth)
         self._upstreams = upstreams
         self._registry = registry
         self._upstream_headers = upstream_headers or {}
@@ -175,6 +193,7 @@ class UpstreamManager:
         # update and the fetch that must use it.
         self._registry_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._policy = policy
+        self._max_schema_depth = max_schema_depth
         # Defensive copy so later mutation by the caller doesn't silently
         # change sanitation behaviour mid-flight.
         self._sanitizer_trusted_domains: set[str] = (
@@ -326,6 +345,7 @@ class UpstreamManager:
                 expected_digest=expected_digest,
                 trusted_domains=self._sanitizer_trusted_domains,
                 trusted_output_tool_patterns=self._trusted_output_tool_patterns,
+                max_schema_depth=self._max_schema_depth,
             )
             span.set_attribute("gateway.tool_count", diff.tool_count)
             if diff.refused:

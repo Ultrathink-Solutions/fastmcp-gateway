@@ -7,6 +7,7 @@ import logging
 import pytest
 
 from fastmcp_gateway.registry import ToolEntry, ToolRegistry, infer_group
+from fastmcp_gateway.sanitize import MAX_ALLOWED_SCHEMA_DEPTH
 
 # ---------------------------------------------------------------------------
 # infer_group
@@ -421,6 +422,64 @@ class TestPopulateDomain:
         info = empty_registry.get_domain_info()
         assert len(info) == 1
         assert info[0].description == "My domain description"
+
+    def test_populate_default_max_schema_depth_rejects_deep_tool(self, empty_registry: ToolRegistry) -> None:
+        """Omitting max_schema_depth preserves the existing cap of 5."""
+        deep: dict = {"type": "string"}
+        for key in ("b", "a"):
+            deep = {"type": "object", "properties": {key: deep}}
+        raw_tools = [
+            {"name": "dom_shallow", "inputSchema": {"type": "object"}},
+            {"name": "dom_deep", "inputSchema": {"type": "object", "properties": {"root": deep}}},
+        ]
+        diff = empty_registry.populate_domain("dom", "http://x:8080/mcp", raw_tools)
+        assert diff.tool_count == 1
+        assert empty_registry.lookup("dom_shallow") is not None
+        assert empty_registry.lookup("dom_deep") is None
+
+    def test_populate_raised_max_schema_depth_admits_deep_tool(self, empty_registry: ToolRegistry) -> None:
+        """A caller-supplied max_schema_depth threads through to the validator."""
+        deep: dict = {"type": "string"}
+        for key in ("b", "a"):
+            deep = {"type": "object", "properties": {key: deep}}
+        raw_tools = [
+            {"name": "dom_deep", "inputSchema": {"type": "object", "properties": {"root": deep}}},
+        ]
+        diff = empty_registry.populate_domain(
+            "dom",
+            "http://x:8080/mcp",
+            raw_tools,
+            max_schema_depth=10,
+        )
+        assert diff.tool_count == 1
+        assert empty_registry.lookup("dom_deep") is not None
+
+    @pytest.mark.parametrize(
+        "bad_value",
+        [0, -3, MAX_ALLOWED_SCHEMA_DEPTH + 1, True, 1.5, "5", None],
+        ids=["zero", "negative", "above-ceiling", "bool", "float", "str", "none"],
+    )
+    @pytest.mark.parametrize(
+        "raw_tools",
+        [[], [{"inputSchema": {"type": "object"}}], [{"name": "dom_ping", "inputSchema": {"type": "object"}}]],
+        ids=["no-tools", "unnamed-tool", "one-tool"],
+    )
+    def test_populate_rejects_invalid_max_schema_depth_regardless_of_payload(
+        self,
+        empty_registry: ToolRegistry,
+        raw_tools: list[dict],
+        bad_value: object,
+    ) -> None:
+        """A bad cap is a caller bug, so it must raise before the tool loop --
+        an empty or unnamed-tool payload must not let it slip through with a
+        clean diff."""
+        with pytest.raises(ValueError):
+            empty_registry.populate_domain(
+                "dom",
+                "http://x:8080/mcp",
+                raw_tools,
+                max_schema_depth=bad_value,  # type: ignore[arg-type]
+            )
 
 
 # ---------------------------------------------------------------------------
