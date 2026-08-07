@@ -213,6 +213,8 @@ When both object-shaped `upstreams` and an explicit `access_policy=` are provide
 
 Every upstream tool's `inputSchema` is validated during registry population before the tool is registered: the root must be a JSON object with `"type": "object"`, `additionalProperties: true` is rejected at the root, `$ref` is rejected at any depth, and nesting deeper than a configurable cap is rejected. A tool that fails validation is skipped (with a `WARNING` log) rather than aborting the whole upstream — one malformed tool can't take down its siblings.
 
+Optional fields don't count against the cap twice. Pydantic and most JSON-Schema generators encode `Optional[X]` / `X | None` as `{"anyOf": [X, {"type": "null"}]}`; depth counting treats that two-member null union as transparent, so an optional field costs exactly what the required equivalent costs. Unions with three or more branches, unions with no null member, and null branches carrying their own annotations are counted normally.
+
 The nesting-depth cap defaults to **5** and is available-but-discouraged to raise: it exists to bound schema complexity for LLM consumers, not to reject any particular upstream. Prefer flattening an over-deep schema at the source; raise the cap only deliberately, since a much higher value widens the recursion the ingest-time validator performs over upstream-controlled input.
 
 ```python
