@@ -90,6 +90,7 @@ All configuration is via environment variables:
 | `GATEWAY_DOMAIN_DESCRIPTIONS` | No | — | JSON object: `{"domain": "description", ...}` |
 | `GATEWAY_UPSTREAM_HEADERS` | No | — | JSON object: `{"domain": {"Header": "Value"}, ...}` |
 | `GATEWAY_REFRESH_INTERVAL` | No | Disabled | Seconds between automatic registry refresh cycles |
+| `GATEWAY_TRACE_HEALTH_ROUTES` | No | `true` | Emit an OTel span per `/healthz` / `/readyz` request (see Health Endpoints) |
 | `GATEWAY_HOOK_MODULE` | No | — | Python module path for execution hooks: `module.path:factory_function` |
 | `GATEWAY_REGISTRATION_TOKEN` | No | — | Shared secret for dynamic registration endpoints (see below) |
 | `GATEWAY_CODE_MODE` | No | `false` | Enable the experimental `execute_code` meta-tool (see Code Mode) |
@@ -385,6 +386,8 @@ The gateway exposes Kubernetes-compatible health checks:
 
 - **`GET /healthz`** — Liveness probe. Always returns 200.
 - **`GET /readyz`** — Readiness probe. Returns 200 if tools are populated, 503 otherwise.
+
+Each request to these routes creates an OpenTelemetry span (`gateway.healthz` / `gateway.readyz`) by default. Under kubelet-style probing every few seconds, that's a root trace born and discarded on every cycle — set `trace_health_routes=False` (or `GATEWAY_TRACE_HEALTH_ROUTES=false`) to disable span creation for these two routes entirely; the response bodies and status codes are unaffected.
 
 ## Docker & Kubernetes
 

@@ -67,6 +67,15 @@ Configure via environment variables:
         When set, the gateway periodically re-queries all upstreams
         to detect added/removed tools.  Disabled by default.
 
+    GATEWAY_TRACE_HEALTH_ROUTES
+        When ``false``, ``/healthz`` and ``/readyz`` handlers create no
+        OpenTelemetry span.  Defaults to ``true`` (matches prior
+        behaviour: every probe request gets its own
+        ``gateway.healthz`` / ``gateway.readyz`` span).  Kubelet-style
+        probing every few seconds means each probe becomes its own
+        root trace; set this to ``false`` to opt a deployment out of
+        that per-probe span volume entirely.
+
     GATEWAY_HOOK_MODULE
         Python dotted path to a factory function that returns a list of hook
         instances.  Format: ``module.path:function_name``.
@@ -482,6 +491,9 @@ def main() -> None:
             )
             sys.exit(1)
 
+    # Health-route span opt-out (default preserves prior behaviour: traced).
+    trace_health_routes = _bool_env("GATEWAY_TRACE_HEALTH_ROUTES", default=True)
+
     # Execution hooks.
     hooks = _load_hooks()
 
@@ -546,6 +558,7 @@ def main() -> None:
             middleware=middleware,
             auth=auth,
             registry_token_provider=registry_token_provider,
+            trace_health_routes=trace_health_routes,
         )
     except CodeModeUnavailableError as exc:
         # Friendly handling for the one construction-time error with a

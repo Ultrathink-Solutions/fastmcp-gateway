@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`GatewayServer(trace_health_routes=...)` / `GATEWAY_TRACE_HEALTH_ROUTES` to opt `/healthz` and `/readyz` out of per-request OTel spans.** Both routes previously wrapped every request in a `gateway.healthz` / `gateway.readyz` span unconditionally. Under kubelet-style liveness/readiness probing every few seconds, each probe becomes its own root trace, which a deployment may prefer to filter out at the source rather than downstream in the collector. Defaults to `True` (spans emitted, matching prior behaviour); setting it to `False` disables span creation for these two routes entirely -- response bodies and status codes are unaffected either way.
+
 ## [0.27.0] - 2026-08-04
 
 ### Added
