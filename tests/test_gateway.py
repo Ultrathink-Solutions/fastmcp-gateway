@@ -55,6 +55,46 @@ class TestGatewayConstructor:
 
 
 # ---------------------------------------------------------------------------
+# max_schema_depth
+# ---------------------------------------------------------------------------
+
+
+class TestMaxSchemaDepth:
+    def test_default_forwarded_to_upstream_manager(self) -> None:
+        from fastmcp_gateway.sanitize import DEFAULT_MAX_SCHEMA_DEPTH
+
+        with patch("fastmcp_gateway.client_manager.Client"):
+            gw = GatewayServer({"svc": "http://svc:8080/mcp"})
+        assert gw.upstream_manager._max_schema_depth == DEFAULT_MAX_SCHEMA_DEPTH
+
+    def test_custom_value_forwarded_to_upstream_manager(self) -> None:
+        with patch("fastmcp_gateway.client_manager.Client"):
+            gw = GatewayServer({"svc": "http://svc:8080/mcp"}, max_schema_depth=12)
+        assert gw.upstream_manager._max_schema_depth == 12
+
+    def test_zero_rejected_at_construction(self) -> None:
+        with patch("fastmcp_gateway.client_manager.Client"), pytest.raises(ValueError, match="max_schema_depth"):
+            GatewayServer({"svc": "http://svc:8080/mcp"}, max_schema_depth=0)
+
+    def test_negative_rejected_at_construction(self) -> None:
+        with patch("fastmcp_gateway.client_manager.Client"), pytest.raises(ValueError, match="max_schema_depth"):
+            GatewayServer({"svc": "http://svc:8080/mcp"}, max_schema_depth=-3)
+
+    def test_above_ceiling_rejected_at_construction(self) -> None:
+        from fastmcp_gateway.sanitize import MAX_ALLOWED_SCHEMA_DEPTH
+
+        with patch("fastmcp_gateway.client_manager.Client"), pytest.raises(ValueError, match="max_schema_depth"):
+            GatewayServer({"svc": "http://svc:8080/mcp"}, max_schema_depth=MAX_ALLOWED_SCHEMA_DEPTH + 1)
+
+    def test_at_ceiling_accepted_at_construction(self) -> None:
+        from fastmcp_gateway.sanitize import MAX_ALLOWED_SCHEMA_DEPTH
+
+        with patch("fastmcp_gateway.client_manager.Client"):
+            gw = GatewayServer({"svc": "http://svc:8080/mcp"}, max_schema_depth=MAX_ALLOWED_SCHEMA_DEPTH)
+        assert gw.upstream_manager._max_schema_depth == MAX_ALLOWED_SCHEMA_DEPTH
+
+
+# ---------------------------------------------------------------------------
 # Domain descriptions applied after populate
 # ---------------------------------------------------------------------------
 

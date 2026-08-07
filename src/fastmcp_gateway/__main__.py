@@ -67,6 +67,17 @@ Configure via environment variables:
         When set, the gateway periodically re-queries all upstreams
         to detect added/removed tools.  Disabled by default.
 
+    GATEWAY_MAX_SCHEMA_DEPTH
+        Overrides the registry-ingest schema-nesting-depth cap (default
+        5) applied to every upstream tool's inputSchema during
+        population.  A tool whose schema nests deeper than this is
+        rejected at registration.  The cap exists to bound schema
+        complexity for LLM consumers -- prefer flattening an over-deep
+        upstream schema; raise this only deliberately.  Must be an
+        integer between 1 and 50 (inclusive) -- the upper bound exists
+        because the ingest-time recursion itself becomes a
+        stack-overflow risk well before four-figure depths.
+
     GATEWAY_HOOK_MODULE
         Python dotted path to a factory function that returns a list of hook
         instances.  Format: ``module.path:function_name``.
@@ -235,6 +246,7 @@ from fastmcp_gateway.registration_auth import (
     JWTRegistrationValidator,
     RegistrationTokenValidator,
 )
+from fastmcp_gateway.sanitize import DEFAULT_MAX_SCHEMA_DEPTH, MAX_ALLOWED_SCHEMA_DEPTH
 
 logger = logging.getLogger("fastmcp_gateway")
 
@@ -482,6 +494,21 @@ def main() -> None:
             )
             sys.exit(1)
 
+    # Registry-ingest schema-depth cap (optional; default preserved when unset).
+    # The upper bound (MAX_ALLOWED_SCHEMA_DEPTH) isn't a sanity nicety: the
+    # ingest-time depth/$ref recursion itself becomes a stack-overflow risk
+    # on adversarial input well before four-figure depths, so an unbounded
+    # value here would let an operator unknowingly re-open that DoS surface.
+    max_schema_depth_raw = _int_env("GATEWAY_MAX_SCHEMA_DEPTH")
+    if max_schema_depth_raw is not None and not (1 <= max_schema_depth_raw <= MAX_ALLOWED_SCHEMA_DEPTH):
+        logger.error(
+            "Invalid GATEWAY_MAX_SCHEMA_DEPTH: %d (must be between 1 and %d inclusive)",
+            max_schema_depth_raw,
+            MAX_ALLOWED_SCHEMA_DEPTH,
+        )
+        sys.exit(1)
+    max_schema_depth = max_schema_depth_raw if max_schema_depth_raw is not None else DEFAULT_MAX_SCHEMA_DEPTH
+
     # Execution hooks.
     hooks = _load_hooks()
 
@@ -546,6 +573,7 @@ def main() -> None:
             middleware=middleware,
             auth=auth,
             registry_token_provider=registry_token_provider,
+            max_schema_depth=max_schema_depth,
         )
     except CodeModeUnavailableError as exc:
         # Friendly handling for the one construction-time error with a

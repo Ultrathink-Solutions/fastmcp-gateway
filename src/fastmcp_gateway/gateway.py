@@ -22,6 +22,7 @@ from fastmcp_gateway.registration_auth import (
     RegistrationTokenValidator,
 )
 from fastmcp_gateway.registry import ToolRegistry
+from fastmcp_gateway.sanitize import DEFAULT_MAX_SCHEMA_DEPTH, MAX_ALLOWED_SCHEMA_DEPTH
 from fastmcp_gateway.url_guard import (
     RegistrationGuardError,
     _url_guard_allow_private,
@@ -379,6 +380,25 @@ class GatewayServer:
         DCR handling when the upstream IdP doesn't support RFC 7591
         Dynamic Client Registration. ``None`` (the default) leaves the
         FastMCP transport unauthenticated and matches prior behaviour.
+    max_schema_depth:
+        Overrides the registry-ingest schema-nesting-depth cap (default
+        5, unchanged) applied to every upstream tool's ``inputSchema``
+        during population. A tool whose schema nests deeper than this
+        is rejected at registration with no deployment-side recourse
+        other than raising this value. The cap exists to bound schema
+        complexity for LLM consumers, not to reject any particular
+        upstream — prefer flattening an over-deep schema at the source;
+        raise this only deliberately, since a much higher value widens
+        the recursion the ingest-time validator performs over
+        upstream-controlled input. Must be between ``1`` and
+        :data:`~fastmcp_gateway.sanitize.MAX_ALLOWED_SCHEMA_DEPTH`
+        (``50``) inclusive; a value outside that range raises
+        :class:`ValueError` at construction -- the upper bound exists
+        because the ingest-time recursion itself becomes a
+        stack-overflow risk well before four-figure depths, so this
+        can't be raised without limit even deliberately. Also settable
+        via ``GATEWAY_MAX_SCHEMA_DEPTH`` when running via the CLI entry
+        point.
 
     Usage::
 
@@ -414,7 +434,21 @@ class GatewayServer:
         output_guard: OutputGuardConfig | None = None,
         trusted_output_tools: set[str] | None = None,
         auth: AuthProvider | None = None,
+        max_schema_depth: int = DEFAULT_MAX_SCHEMA_DEPTH,
     ) -> None:
+        # Fail fast at construction rather than deferring to the first
+        # populate() call — an operator misconfiguration here should
+        # surface immediately, not after the process has already
+        # started accepting traffic. The upper bound isn't just a sanity
+        # check: the ingest-time depth/$ref recursion becomes a real
+        # stack-overflow risk well before four-figure depths, so an
+        # unbounded max_schema_depth would let an operator unknowingly
+        # re-open that DoS surface.
+        if not (1 <= max_schema_depth <= MAX_ALLOWED_SCHEMA_DEPTH):
+            raise ValueError(
+                f"max_schema_depth must be between 1 and {MAX_ALLOWED_SCHEMA_DEPTH} (inclusive); got {max_schema_depth}"
+            )
+
         # Accept either a plain URL mapping or an object-shaped mapping with
         # per-entry allowed_tools / denied_tools.  The explicit access_policy
         # kwarg wins when both are provided.
@@ -544,6 +578,7 @@ class GatewayServer:
             policy=effective_policy,
             sanitizer_trusted_domains=sanitizer_trusted_domains,
             trusted_output_tools=trusted_output_tools,
+            max_schema_depth=max_schema_depth,
         )
         # ``auth`` plugs an inbound auth provider (TokenVerifier,
         # RemoteAuthProvider, OAuthProvider, or any other AuthProvider

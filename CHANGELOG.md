@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`GatewayServer(max_schema_depth=...)` / `GATEWAY_MAX_SCHEMA_DEPTH` to configure the registry-ingest schema-nesting-depth cap.** Previously hardcoded at 5 with no deployment-side recourse for a tool whose `inputSchema` legitimately nests deeper. Threaded through `UpstreamManager` and `ToolRegistry.populate_domain` to `sanitize.validate_input_schema`'s new `max_depth` parameter. Default stays `5` (unchanged); the cap exists to bound schema complexity for LLM consumers, so raising it is documented as available-but-discouraged -- prefer flattening an over-deep upstream schema, and raise the cap only deliberately. Must be an integer in **[1, 50]** (`fastmcp_gateway.sanitize.MAX_ALLOWED_SCHEMA_DEPTH`) -- the upper bound isn't a sanity nicety: the ingest-time depth/`$ref` recursion itself becomes a stack-overflow risk on adversarial input well before four-figure depths, so the cap can't be raised without limit even deliberately. An out-of-range value (via the Python API, `GATEWAY_MAX_SCHEMA_DEPTH`, or a directly-constructed `UpstreamManager`) is rejected loudly at construction time as a configuration error, distinct from the per-tool `SchemaValidationError` skip path.
+- **`fastmcp_gateway.sanitize.DEFAULT_MAX_SCHEMA_DEPTH`** exported (was the private `_MAX_SCHEMA_DEPTH`) so callers configuring a custom cap can reference the shipped default instead of hardcoding `5` again.
+- **`fastmcp_gateway.sanitize.MAX_ALLOWED_SCHEMA_DEPTH`** (`50`) exported as the upper ceiling any caller may configure `max_schema_depth` to.
+
 ## [0.26.0] - 2026-08-04
 
 ### Added

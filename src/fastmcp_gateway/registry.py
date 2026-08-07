@@ -12,6 +12,7 @@ from opentelemetry import trace
 from pydantic import BaseModel, ConfigDict
 
 from fastmcp_gateway.sanitize import (
+    DEFAULT_MAX_SCHEMA_DEPTH,
     SchemaValidationError,
     sanitize_description,
     validate_input_schema,
@@ -408,6 +409,7 @@ class ToolRegistry:
         expected_digest: str | None = None,
         trusted_domains: set[str] | None = None,
         trusted_output_tool_patterns: list[str] | None = None,
+        max_schema_depth: int = DEFAULT_MAX_SCHEMA_DEPTH,
     ) -> RegistryDiff:
         """Populate the registry with tools from an upstream server.
 
@@ -427,9 +429,10 @@ class ToolRegistry:
         :func:`~fastmcp_gateway.sanitize.sanitize_description` (Unicode
         normalization, control-char + zero-width strip, injection-pattern
         scrub, length cap). Each tool's ``inputSchema`` is passed through
-        :func:`~fastmcp_gateway.sanitize.validate_input_schema`; a
-        malformed schema skips that tool (only) with a WARNING log, so
-        one poisoned tool can't DoS its siblings.
+        :func:`~fastmcp_gateway.sanitize.validate_input_schema` (with
+        *max_schema_depth* as its ``max_depth``); a malformed schema
+        skips that tool (only) with a WARNING log, so one poisoned tool
+        can't DoS its siblings.
 
         When a domain appears in *trusted_domains*, the injection-pattern
         scan on descriptions is skipped for that domain. Unicode
@@ -530,7 +533,7 @@ class ToolRegistry:
                     continue
                 schema_raw = raw.get("inputSchema", {}) or {}
                 try:
-                    clean_schema = validate_input_schema(schema_raw)
+                    clean_schema = validate_input_schema(schema_raw, max_depth=max_schema_depth)
                 except SchemaValidationError as exc:
                     logger.warning(
                         "Rejected tool: domain=%s name=%r reason=invalid_schema detail=%s",

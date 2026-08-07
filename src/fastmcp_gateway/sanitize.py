@@ -240,10 +240,26 @@ class SchemaValidationError(ValueError):
 # 5 accommodates edge cases without giving adversaries room to build
 # gigantic nested structures designed to exhaust the sandbox's type
 # renderer.
-_MAX_SCHEMA_DEPTH = 5
+#
+# Public (part of :data:`__all__`) so a deployment that needs to raise
+# the cap -- see :func:`validate_input_schema`'s *max_depth* parameter --
+# can reference the shipped default instead of hardcoding ``5`` again.
+DEFAULT_MAX_SCHEMA_DEPTH = 5
+
+# Upper ceiling any caller may configure *max_depth* to. Generous relative
+# to the "3-4 levels is typical" reasoning behind DEFAULT_MAX_SCHEMA_DEPTH
+# -- no legitimate schema should ever need to approach it -- but bounded
+# well below the point at which the ingest-time depth/$ref recursion
+# itself becomes a stack-overflow risk on adversarial input (measured
+# uncaught RecursionError from a few hundred levels of plain nesting in
+# this recursion-limit environment). Enforced at every site that accepts
+# a caller-supplied depth: this module's own validate_input_schema,
+# GatewayServer.__init__, UpstreamManager.__init__, and the
+# GATEWAY_MAX_SCHEMA_DEPTH env parser in __main__.py.
+MAX_ALLOWED_SCHEMA_DEPTH = 50
 
 
-def _contains_ref(node: Any, depth: int = 0) -> bool:
+def _contains_ref(node: Any, depth: int = 0, *, max_depth: int = DEFAULT_MAX_SCHEMA_DEPTH) -> bool:
     """Recursively check whether any dict in *node* contains a ``$ref`` key.
 
     ``$ref`` is rejected outright: resolving it requires fetching an
@@ -252,7 +268,7 @@ def _contains_ref(node: Any, depth: int = 0) -> bool:
     sandbox type renderer reads the schema. Static inline schemas are
     strictly more auditable.
     """
-    if depth > _MAX_SCHEMA_DEPTH:
+    if depth > max_depth:
         # Fail closed: conservatively treat an unexplored subtree as
         # potentially containing a ``$ref``. In the current caller
         # ordering inside :func:`validate_input_schema`, the depth
@@ -264,45 +280,50 @@ def _contains_ref(node: Any, depth: int = 0) -> bool:
         # different callsite that did not gate on depth) could let a
         # pathologically-deep schema with a hidden ``$ref`` pass the
         # ref check silently. Returning ``True`` closes that class of
-        # bug regardless of caller ordering.
+        # bug regardless of caller ordering. *max_depth* must match the
+        # depth check's cap for this fail-closed guarantee to hold —
+        # :func:`validate_input_schema` always passes the same value to
+        # both.
         return True
     if isinstance(node, dict):
         if "$ref" in node:
             return True
-        return any(_contains_ref(v, depth + 1) for v in node.values())
+        return any(_contains_ref(v, depth + 1, max_depth=max_depth) for v in node.values())
     if isinstance(node, list):
-        return any(_contains_ref(item, depth + 1) for item in node)
+        return any(_contains_ref(item, depth + 1, max_depth=max_depth) for item in node)
     return False
 
 
-def _schema_depth(node: Any, depth: int = 0) -> int:
+def _schema_depth(node: Any, depth: int = 0, *, max_depth: int = DEFAULT_MAX_SCHEMA_DEPTH) -> int:
     """Return the maximum nesting depth of dicts/lists in *node*.
 
     Each dict or list increments the depth counter. Used to reject
     pathologically nested schemas before they reach the sandbox type
     renderer.
 
-    Bounded by :data:`_MAX_SCHEMA_DEPTH` to avoid ``RecursionError`` on
-    adversarially deep inputs. Once ``depth`` exceeds the cap we stop
-    recursing and return the current depth — :func:`validate_input_schema`
+    Bounded by *max_depth* to avoid ``RecursionError`` on adversarially
+    deep inputs. Once ``depth`` exceeds *max_depth* we stop recursing
+    and return the current depth — :func:`validate_input_schema`
     already rejects any depth > cap, so an exact measurement past the
     cap is unnecessary and unsafe (Python's default recursion limit
-    would fire on ~1000 levels).
+    would fire on ~1000 levels). *max_depth* must be the same value the
+    caller will compare the result against, or the early bail-out
+    stops short of (or overshoots) the caller's actual cap.
     """
-    if depth > _MAX_SCHEMA_DEPTH:
+    if depth > max_depth:
         return depth
     if isinstance(node, dict):
         if not node:
             return depth
-        return max(_schema_depth(v, depth + 1) for v in node.values())
+        return max(_schema_depth(v, depth + 1, max_depth=max_depth) for v in node.values())
     if isinstance(node, list):
         if not node:
             return depth
-        return max(_schema_depth(item, depth + 1) for item in node)
+        return max(_schema_depth(item, depth + 1, max_depth=max_depth) for item in node)
     return depth
 
 
-def validate_input_schema(schema: Any) -> dict[str, Any]:
+def validate_input_schema(schema: Any, *, max_depth: int = DEFAULT_MAX_SCHEMA_DEPTH) -> dict[str, Any]:
     """Validate an upstream inputSchema and return it unchanged on pass.
 
     Rejects:
@@ -313,15 +334,40 @@ def validate_input_schema(schema: Any) -> dict[str, Any]:
     * Root-level ``"additionalProperties": true``. This keeps adversary
       upstreams from declaring an open schema that lets them smuggle
       arbitrary keys into the ``execute_tool`` forwarded call.
-    * Nesting deeper than :data:`_MAX_SCHEMA_DEPTH`.
+    * Nesting deeper than *max_depth*.
     * Any ``$ref`` key at any depth — the static-inline discipline is
       strictly easier to audit than a ref-resolution layer.
+
+    Parameters
+    ----------
+    max_depth:
+        Overrides :data:`DEFAULT_MAX_SCHEMA_DEPTH` for this call. The
+        cap exists to bound schema complexity for LLM consumers, not
+        to reject any particular shape -- raise it only deliberately,
+        and prefer flattening an over-deep upstream schema instead.
+        Must be between ``1`` and :data:`MAX_ALLOWED_SCHEMA_DEPTH`
+        (inclusive); a value outside that range is a caller
+        configuration mistake and raises :class:`ValueError`
+        immediately (this is distinct from
+        :class:`SchemaValidationError`, which the registry's per-tool
+        ingest loop catches and treats as "skip this one tool" -- a
+        bad *max_depth* is an operator misconfiguration that must
+        fail loudly at startup instead of silently rejecting every
+        tool from every upstream one warning log at a time). The
+        upper bound isn't arbitrary: the depth/``$ref`` recursion
+        itself becomes a stack-overflow risk on adversarial input well
+        before four-figure depths, so *max_depth* can't be raised
+        without limit even for a deployment that genuinely wants
+        deeper schemas.
 
     Returns the *schema* unchanged when all checks pass. Raises
     :class:`SchemaValidationError` with a human-readable reason
     otherwise; callers in the registry log the reason and skip the
     offending tool.
     """
+    if not (1 <= max_depth <= MAX_ALLOWED_SCHEMA_DEPTH):
+        raise ValueError(f"max_depth must be between 1 and {MAX_ALLOWED_SCHEMA_DEPTH} (inclusive); got {max_depth}")
+
     if not isinstance(schema, dict):
         raise SchemaValidationError(f"inputSchema must be a JSON object; got {type(schema).__name__}")
 
@@ -343,11 +389,11 @@ def validate_input_schema(schema: Any) -> dict[str, Any]:
             "keys through execute_tool"
         )
 
-    depth = _schema_depth(schema)
-    if depth > _MAX_SCHEMA_DEPTH:
-        raise SchemaValidationError(f"inputSchema nesting depth {depth} exceeds cap of {_MAX_SCHEMA_DEPTH}")
+    depth = _schema_depth(schema, max_depth=max_depth)
+    if depth > max_depth:
+        raise SchemaValidationError(f"inputSchema nesting depth {depth} exceeds cap of {max_depth}")
 
-    if _contains_ref(schema):
+    if _contains_ref(schema, max_depth=max_depth):
         raise SchemaValidationError(
             "inputSchema must not contain '$ref' at any depth — inline schemas are required for auditability"
         )
@@ -356,6 +402,8 @@ def validate_input_schema(schema: Any) -> dict[str, Any]:
 
 
 __all__ = [
+    "DEFAULT_MAX_SCHEMA_DEPTH",
+    "MAX_ALLOWED_SCHEMA_DEPTH",
     "SchemaValidationError",
     "sanitize_description",
     "validate_input_schema",

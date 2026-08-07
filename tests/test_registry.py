@@ -422,6 +422,37 @@ class TestPopulateDomain:
         assert len(info) == 1
         assert info[0].description == "My domain description"
 
+    def test_populate_default_max_schema_depth_rejects_deep_tool(self, empty_registry: ToolRegistry) -> None:
+        """Omitting max_schema_depth preserves the existing cap of 5."""
+        deep: dict = {"type": "string"}
+        for key in ("b", "a"):
+            deep = {"type": "object", "properties": {key: deep}}
+        raw_tools = [
+            {"name": "dom_shallow", "inputSchema": {"type": "object"}},
+            {"name": "dom_deep", "inputSchema": {"type": "object", "properties": {"root": deep}}},
+        ]
+        diff = empty_registry.populate_domain("dom", "http://x:8080/mcp", raw_tools)
+        assert diff.tool_count == 1
+        assert empty_registry.lookup("dom_shallow") is not None
+        assert empty_registry.lookup("dom_deep") is None
+
+    def test_populate_raised_max_schema_depth_admits_deep_tool(self, empty_registry: ToolRegistry) -> None:
+        """A caller-supplied max_schema_depth threads through to the validator."""
+        deep: dict = {"type": "string"}
+        for key in ("b", "a"):
+            deep = {"type": "object", "properties": {key: deep}}
+        raw_tools = [
+            {"name": "dom_deep", "inputSchema": {"type": "object", "properties": {"root": deep}}},
+        ]
+        diff = empty_registry.populate_domain(
+            "dom",
+            "http://x:8080/mcp",
+            raw_tools,
+            max_schema_depth=10,
+        )
+        assert diff.tool_count == 1
+        assert empty_registry.lookup("dom_deep") is not None
+
 
 # ---------------------------------------------------------------------------
 # ToolEntry — required_scope (ULT-6012: axon MCP scope-architecture pivot W1)
