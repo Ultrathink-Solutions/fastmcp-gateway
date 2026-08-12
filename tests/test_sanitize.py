@@ -473,7 +473,7 @@ class TestOptionalNullDepthTransparency:
             validate_input_schema(plain)
         assert not isinstance(excinfo.value, _PhysicalRecursionExceeded)
 
-    def test_physical_recursion_error_is_caught_by_the_registry_skip_path(self) -> None:
+    def test_physical_recursion_error_is_caught_by_the_registry_skip_path(self, registry: ToolRegistry) -> None:
         """The distinct type must stay a SchemaValidationError subclass.
 
         ``ToolRegistry.populate_domain`` catches only
@@ -486,7 +486,6 @@ class TestOptionalNullDepthTransparency:
         chained: dict = {"type": "string"}
         for _ in range(500):
             chained = {"anyOf": [chained, {"type": "null"}]}
-        registry = ToolRegistry()
         diff = registry.populate_domain(
             "dom",
             "http://x:8080/mcp",
