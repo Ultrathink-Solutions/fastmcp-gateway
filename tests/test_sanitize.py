@@ -8,7 +8,11 @@ import pytest
 
 from fastmcp_gateway.registry import ToolRegistry
 from fastmcp_gateway.sanitize import (
+    MAX_ALLOWED_SCHEMA_DEPTH,
     SchemaValidationError,
+    _contains_ref,
+    _PhysicalRecursionExceeded,
+    _schema_depth,
     sanitize_description,
     validate_input_schema,
 )
@@ -217,6 +221,314 @@ class TestValidateInputSchema:
         }
         with pytest.raises(SchemaValidationError, match=r"\$ref"):
             validate_input_schema(schema)
+
+
+# ---------------------------------------------------------------------------
+# validate_input_schema — configurable max_depth
+# ---------------------------------------------------------------------------
+
+
+def _nested_schema(levels: int) -> dict:
+    """Build an object schema wrapping a scalar leaf *levels* + 1 times.
+
+    The loop wraps *levels* times and the ``root`` property wraps once
+    more, so the measured depth is ``2 * (levels + 1) + 1`` -- each
+    wrapper costs two counted levels and the leaf's scalar value costs
+    one.
+    """
+    deep: dict = {"type": "string"}
+    for i in range(levels):
+        deep = {"type": "object", "properties": {f"k{i}": deep}}
+    return {"type": "object", "properties": {"root": deep}}
+
+
+# Three wrappers => depth 7, the first odd depth clear of the default cap
+# of 5 and comfortably under the raised cap of 10 used below.
+_DEPTH_7_SCHEMA = _nested_schema(2)
+
+
+class TestConfigurableSchemaDepth:
+    def test_fixture_depth_is_what_its_name_claims(self) -> None:
+        """Pin the shared fixture's depth so the name can't drift from reality.
+
+        Without this, an edit that trusts the constant to sit a specific
+        distance from the cap would silently set a boundary value that
+        doesn't test the boundary.
+        """
+        assert _schema_depth(_DEPTH_7_SCHEMA, max_depth=MAX_ALLOWED_SCHEMA_DEPTH) == 7
+
+    def test_default_still_rejects_depth_7(self) -> None:
+        """Omitting max_depth preserves the existing cap of 5 -- no behavior change."""
+        with pytest.raises(SchemaValidationError):
+            validate_input_schema(_DEPTH_7_SCHEMA)
+
+    def test_raised_cap_admits_the_same_schema(self) -> None:
+        """The identical schema passes once the caller raises max_depth."""
+        assert validate_input_schema(_DEPTH_7_SCHEMA, max_depth=10) == _DEPTH_7_SCHEMA
+
+    def test_lowered_cap_still_rejects_previously_valid_schema(self) -> None:
+        """A caller may also lower the cap below 5, tightening validation."""
+        shallow = {"type": "object", "properties": {"q": {"type": "string"}}}
+        assert validate_input_schema(shallow, max_depth=10) == shallow
+        with pytest.raises(SchemaValidationError):
+            validate_input_schema(shallow, max_depth=1)
+
+    @pytest.mark.parametrize(
+        "bad_value",
+        [0, -1, MAX_ALLOWED_SCHEMA_DEPTH + 1, True, 1.5, "5", None],
+        ids=["zero", "negative", "above-ceiling", "bool", "float", "str", "none"],
+    )
+    def test_invalid_max_depth_is_a_configuration_error(self, bad_value: object) -> None:
+        """A bad max_depth is an operator misconfiguration, not a schema-shape
+        rejection -- it must surface as a plain ValueError, never as the
+        SchemaValidationError the registry's ingest loop swallows per tool.
+
+        ``True`` is covered deliberately: ``bool`` is an ``int`` subclass, so a
+        range-only check would silently accept it as a cap of 1.
+        """
+        with pytest.raises(ValueError) as excinfo:
+            validate_input_schema({"type": "object"}, max_depth=bad_value)  # type: ignore[arg-type]
+        assert not isinstance(excinfo.value, SchemaValidationError)
+
+    def test_max_depth_at_ceiling_accepted(self) -> None:
+        """The ceiling itself is a valid, usable value."""
+        shallow = {"type": "object", "properties": {"q": {"type": "string"}}}
+        assert validate_input_schema(shallow, max_depth=MAX_ALLOWED_SCHEMA_DEPTH) == shallow
+
+    def test_pathological_depth_at_raised_cap_still_rejects_without_recursion_error(self) -> None:
+        """Even at the ceiling, an adversarially deep schema rejects cleanly.
+
+        Regression shield: raising max_depth must never re-open the
+        RecursionError DoS the original hardcoded cap closed. A schema
+        nested far past even the maximum allowed cap must still bail out
+        with SchemaValidationError, not crash the process.
+        """
+        deep: dict = {"type": "string"}
+        for i in range(2000):
+            deep = {"type": "object", "properties": {f"k{i}": deep}}
+        with pytest.raises(SchemaValidationError):
+            validate_input_schema(deep, max_depth=MAX_ALLOWED_SCHEMA_DEPTH)
+
+
+# ---------------------------------------------------------------------------
+# _schema_depth — Optional[X] union transparency
+# ---------------------------------------------------------------------------
+#
+# Pydantic (and most JSON-Schema generators) encode ``Optional[X]`` /
+# ``X | None`` as ``{"anyOf": [X, {"type": "null"}]}``. Before this change,
+# the wrapper dict + union array + null-branch member added 2 depth levels
+# versus a required ``X`` at the same position, despite identical real
+# complexity for an LLM consumer. These tests pin the new "the wrapper is
+# transparent" counting directly against ``_schema_depth`` and confirm the
+# unaffected cases (3+-branch unions, unions without a null member) keep
+# their prior counting exactly.
+
+
+def _optional_of(inner: dict) -> dict:
+    """``Optional[inner]`` as Pydantic would encode it."""
+    return {"anyOf": [inner, {"type": "null"}]}
+
+
+_ARRAY_OF_STR = {"type": "array", "items": {"type": "string"}}
+_NESTED_OBJECT = {"type": "object", "properties": {"bar": {"type": "string"}}}
+
+
+class TestOptionalNullDepthTransparency:
+    def test_optional_list_matches_required_list_depth(self) -> None:
+        """Optional[list[str]] costs the same depth as a required list[str]."""
+        required = {"type": "object", "properties": {"foo": _ARRAY_OF_STR}}
+        optional = {"type": "object", "properties": {"foo": _optional_of(_ARRAY_OF_STR)}}
+        assert _schema_depth(optional) == _schema_depth(required)
+
+    def test_optional_nested_model_matches_required_depth(self) -> None:
+        """Optional[NestedModel] costs the same depth as a required NestedModel."""
+        required = {"type": "object", "properties": {"foo": _NESTED_OBJECT}}
+        optional = {"type": "object", "properties": {"foo": _optional_of(_NESTED_OBJECT)}}
+        assert _schema_depth(optional) == _schema_depth(required)
+
+    def test_oneof_null_union_also_transparent(self) -> None:
+        """``oneOf`` gets the same transparency as ``anyOf``."""
+        required = {"type": "object", "properties": {"foo": _ARRAY_OF_STR}}
+        optional = {"type": "object", "properties": {"foo": {"oneOf": [_ARRAY_OF_STR, {"type": "null"}]}}}
+        assert _schema_depth(optional) == _schema_depth(required)
+
+    def test_three_branch_union_depth_unchanged(self) -> None:
+        """A 3-branch union (even with a null member) is not transparency-eligible."""
+        three_branch = {
+            "type": "object",
+            "properties": {"foo": {"anyOf": [{"type": "string"}, {"type": "integer"}, {"type": "null"}]}},
+        }
+        # Regression pin: this is the same value _schema_depth reported
+        # before the transparency change, confirming the 3-branch case is
+        # untouched by it.
+        assert _schema_depth(three_branch) == 5
+
+    def test_union_without_null_member_depth_unchanged(self) -> None:
+        """A 2-branch union with no null member keeps normal counting."""
+        two_nonnull = {"type": "object", "properties": {"foo": {"anyOf": [{"type": "string"}, {"type": "integer"}]}}}
+        # Regression pin: unchanged from pre-transparency behaviour.
+        assert _schema_depth(two_nonnull) == 5
+
+    def test_strict_null_shape_with_extra_keys_not_transparent(self) -> None:
+        """``{"type": "null", "description": "..."}`` is NOT the transparency sentinel.
+
+        Strictest reading: the null member must be exactly the single
+        key ``"type"``. A schema author who attached an annotation to
+        the null branch gets normal (non-transparent) counting for that
+        union -- same as a 3-branch union.
+        """
+        annotated_null_union = {
+            "type": "object",
+            "properties": {"foo": {"anyOf": [_ARRAY_OF_STR, {"type": "null", "description": "absent"}]}},
+        }
+        plain_null_union = {"type": "object", "properties": {"foo": _optional_of(_ARRAY_OF_STR)}}
+        assert _schema_depth(annotated_null_union) > _schema_depth(plain_null_union)
+
+    def test_nested_optionals_compose(self) -> None:
+        """An optional field nested inside another optional field's non-null branch
+        discounts each wrapper it crosses, matching the fully-required equivalent."""
+        required_inner = {"type": "object", "properties": {"bar": {"type": "string"}}}
+        optional_inner = {"type": "object", "properties": {"bar": _optional_of({"type": "string"})}}
+
+        required_outer = {"type": "object", "properties": {"foo": required_inner}}
+        optional_of_optional_inner = {"type": "object", "properties": {"foo": _optional_of(optional_inner)}}
+
+        assert _schema_depth(optional_of_optional_inner) == _schema_depth(required_outer)
+
+    def test_validate_input_schema_admits_previously_rejected_optional_list(self) -> None:
+        """End-to-end: a schema rejected under the old counting now passes.
+
+        Before this change, Optional[list[str]] at this position measured
+        depth 6 (> the cap of 5) and was rejected; the required
+        equivalent measures depth 4. This is a deliberate validator
+        relaxation -- more schemas are now admitted, not fewer.
+        """
+        schema = {"type": "object", "properties": {"foo": _optional_of(_ARRAY_OF_STR)}}
+        assert validate_input_schema(schema) == schema
+
+    def test_ref_inside_optional_non_null_branch_still_rejected(self) -> None:
+        """A ``$ref`` hidden inside Optional[X]'s non-null branch is still caught.
+
+        Regression shield: the transparency optimization must not let a
+        ``$ref`` inside the non-null member evade detection just because
+        the wrapper's own depth accounting changed.
+        """
+        schema = {
+            "type": "object",
+            "properties": {"foo": _optional_of({"$ref": "#/definitions/Item"})},
+        }
+        with pytest.raises(SchemaValidationError, match=r"\$ref"):
+            validate_input_schema(schema)
+
+    def test_rejects_pathological_optional_chain_without_recursion_error(self) -> None:
+        """A chain of hundreds of transparent Optional-wrapper hops rejects
+        cleanly -- no RecursionError, and NOT silently admitted.
+
+        Regression shield for a defect in the transparency implementation
+        itself: because the transparent path recurses at the SAME logical
+        depth, a chain of ``{"anyOf": [<inner>, {"type": "null"}]}``
+        wrappers can climb arbitrarily many real Python stack frames while
+        the logical depth counter never advances -- silently admitting a
+        schema that should have been rejected (depth measured as low
+        regardless of chain length), and, past a few thousand wrappers,
+        overflowing Python's call stack with an uncaught RecursionError
+        that would escape registry.py's per-tool SchemaValidationError
+        catch and take the whole domain's registration down with it.
+        """
+        deep: dict = {"type": "string"}
+        for _ in range(500):
+            deep = {"anyOf": [deep, {"type": "null"}]}
+        schema = {"type": "object", "properties": {"foo": deep}}
+        with pytest.raises(SchemaValidationError):
+            validate_input_schema(schema)
+
+    def test_rejects_thousands_deep_optional_chain_without_recursion_error(self) -> None:
+        """Same shield at a much larger chain length (thousands, not hundreds)."""
+        deep: dict = {"type": "string"}
+        for _ in range(3000):
+            deep = {"anyOf": [deep, {"type": "null"}]}
+        schema = {"type": "object", "properties": {"foo": deep}}
+        with pytest.raises(SchemaValidationError):
+            validate_input_schema(schema)
+
+    def test_wrapper_chain_and_plain_nesting_reject_for_distinct_reasons(self) -> None:
+        """The two rejection causes are separate types, so the audit log is truthful.
+
+        A wrapper chain exhausts the physical-recursion ceiling while its
+        logical depth stays tiny; reporting that as a nesting-depth
+        violation would hand an operator a depth number that appears
+        nowhere in their schema. Plain over-deep nesting must keep the
+        ordinary depth rejection.
+        """
+        chained: dict = {"type": "string"}
+        for _ in range(500):
+            chained = {"anyOf": [chained, {"type": "null"}]}
+        with pytest.raises(_PhysicalRecursionExceeded):
+            validate_input_schema({"type": "object", "properties": {"foo": chained}})
+
+        plain: dict = {"type": "string"}
+        for i in range(20):
+            plain = {"type": "object", "properties": {f"k{i}": plain}}
+        with pytest.raises(SchemaValidationError) as excinfo:
+            validate_input_schema(plain)
+        assert not isinstance(excinfo.value, _PhysicalRecursionExceeded)
+
+    def test_physical_recursion_error_is_caught_by_the_registry_skip_path(self, registry: ToolRegistry) -> None:
+        """The distinct type must stay a SchemaValidationError subclass.
+
+        ``ToolRegistry.populate_domain`` catches only
+        ``SchemaValidationError``; if this diverged, a wrapper-chain
+        schema would abort the whole domain's registration instead of
+        skipping the one offending tool.
+        """
+        assert issubclass(_PhysicalRecursionExceeded, SchemaValidationError)
+
+        chained: dict = {"type": "string"}
+        for _ in range(500):
+            chained = {"anyOf": [chained, {"type": "null"}]}
+        diff = registry.populate_domain(
+            "dom",
+            "http://x:8080/mcp",
+            [
+                {"name": "dom_chained", "inputSchema": {"type": "object", "properties": {"foo": chained}}},
+                {"name": "dom_ok", "inputSchema": {"type": "object"}},
+            ],
+        )
+        assert diff.tool_count == 1
+        assert registry.lookup("dom_ok") is not None
+        assert registry.lookup("dom_chained") is None
+
+    @pytest.mark.parametrize("chain_length", [500, 3000], ids=["hundreds", "thousands"])
+    def test_pathological_optional_chain_rejected_at_raised_cap_too(self, chain_length: int) -> None:
+        """The physical-recursion guard holds at the highest configurable cap.
+
+        The guard's headroom is what keeps a raised ``max_schema_depth``
+        from re-opening the RecursionError DoS: it must fire on a
+        transparent-wrapper chain at the ceiling exactly as it does at
+        the default.
+        """
+        deep: dict = {"type": "string"}
+        for _ in range(chain_length):
+            deep = {"anyOf": [deep, {"type": "null"}]}
+        schema = {"type": "object", "properties": {"foo": deep}}
+        with pytest.raises(SchemaValidationError):
+            validate_input_schema(schema, max_depth=MAX_ALLOWED_SCHEMA_DEPTH)
+
+    def test_contains_ref_handles_pathological_optional_chain_without_recursion_error(self) -> None:
+        """``_contains_ref`` itself must not RecursionError on a deep transparent
+        chain, independent of whether ``_schema_depth``'s own cap would already
+        have rejected the schema first -- defense in depth for any future
+        callsite that invokes ``_contains_ref`` directly without a preceding
+        depth gate (see its own docstring on fail-closed behaviour).
+        """
+        deep: dict = {"type": "string"}
+        for _ in range(3000):
+            deep = {"anyOf": [deep, {"type": "null"}]}
+        # Fail-closed (True) is the documented contract for an
+        # unexplored/over-deep subtree -- the point of this test is that it
+        # returns a bool at all rather than raising RecursionError.
+        assert _contains_ref(deep) is True
+        assert _contains_ref(deep, max_depth=MAX_ALLOWED_SCHEMA_DEPTH) is True
 
 
 # ---------------------------------------------------------------------------

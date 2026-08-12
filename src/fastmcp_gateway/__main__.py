@@ -76,6 +76,18 @@ Configure via environment variables:
         root trace; set this to ``false`` to opt a deployment out of
         that per-probe span volume entirely.
 
+    GATEWAY_MAX_SCHEMA_DEPTH
+        Overrides the registry-ingest schema-nesting-depth cap (default
+        5) applied to every upstream tool's inputSchema during
+        population.  A tool whose schema nests deeper than this is
+        rejected at registration.  The cap exists to bound schema
+        complexity for LLM consumers -- prefer flattening an over-deep
+        upstream schema; raise this only deliberately.  Must be an
+        integer between 1 and sanitize.MAX_ALLOWED_SCHEMA_DEPTH
+        (inclusive) -- the upper bound exists because the ingest-time
+        recursion itself becomes a stack-overflow risk well before
+        four-figure depths.
+
     GATEWAY_HOOK_MODULE
         Python dotted path to a factory function that returns a list of hook
         instances.  Format: ``module.path:function_name``.
@@ -244,6 +256,7 @@ from fastmcp_gateway.registration_auth import (
     JWTRegistrationValidator,
     RegistrationTokenValidator,
 )
+from fastmcp_gateway.sanitize import DEFAULT_MAX_SCHEMA_DEPTH, _validate_max_schema_depth
 
 logger = logging.getLogger("fastmcp_gateway")
 
@@ -494,6 +507,23 @@ def main() -> None:
     # Health-route span opt-out (default preserves prior behaviour: traced).
     trace_health_routes = _bool_env("GATEWAY_TRACE_HEALTH_ROUTES", default=True)
 
+    # Registry-ingest schema-depth cap (optional; default preserved when unset).
+    # The upper bound (MAX_ALLOWED_SCHEMA_DEPTH) isn't a sanity nicety: the
+    # ingest-time depth/$ref recursion itself becomes a stack-overflow risk
+    # on adversarial input well before four-figure depths, so an unbounded
+    # value here would let an operator unknowingly re-open that DoS surface.
+    max_schema_depth = DEFAULT_MAX_SCHEMA_DEPTH
+    max_schema_depth_raw = _int_env("GATEWAY_MAX_SCHEMA_DEPTH")
+    if max_schema_depth_raw is not None:
+        # Reuse the same strict check the Python API applies, so the two
+        # entry points can never disagree about what's acceptable, and
+        # turn its ValueError into the CLI's operator-facing message.
+        try:
+            max_schema_depth = _validate_max_schema_depth(max_schema_depth_raw)
+        except ValueError as exc:
+            logger.error("Invalid GATEWAY_MAX_SCHEMA_DEPTH: %s", exc)
+            sys.exit(1)
+
     # Execution hooks.
     hooks = _load_hooks()
 
@@ -559,6 +589,7 @@ def main() -> None:
             auth=auth,
             registry_token_provider=registry_token_provider,
             trace_health_routes=trace_health_routes,
+            max_schema_depth=max_schema_depth,
         )
     except CodeModeUnavailableError as exc:
         # Friendly handling for the one construction-time error with a

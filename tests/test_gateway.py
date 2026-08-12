@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from fastmcp_gateway.gateway import GatewayServer
+from fastmcp_gateway.sanitize import MAX_ALLOWED_SCHEMA_DEPTH
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 # ---------------------------------------------------------------------------
 # Constructor parameters
@@ -52,6 +57,86 @@ class TestGatewayConstructor:
                 instructions="Custom instructions",
             )
         assert gw.mcp.instructions == "Custom instructions"
+
+
+# ---------------------------------------------------------------------------
+# max_schema_depth
+# ---------------------------------------------------------------------------
+
+
+class TestMaxSchemaDepth:
+    """The cap is observable through what a gateway admits at registration,
+    so these assert on registry contents after a populate rather than on the
+    manager's private depth field. Depth is ``2 * wrappers + 1`` -- see the
+    ``deep_schema_tool`` factory in conftest."""
+
+    @pytest.mark.asyncio
+    async def test_default_rejects_schema_deeper_than_five(
+        self, deep_schema_tool: Callable[..., Any], patch_upstream_client: Callable[..., Any]
+    ) -> None:
+        """Depth 7 — over the unchanged default cap of 5."""
+        with patch_upstream_client(deep_schema_tool(3)):
+            gw = GatewayServer({"svc": "http://svc:8080/mcp"})
+            await gw.upstream_manager.populate_domain("svc")
+
+        assert gw.registry.lookup("svc_deep") is None
+
+    @pytest.mark.asyncio
+    async def test_default_admits_schema_within_five(
+        self, deep_schema_tool: Callable[..., Any], patch_upstream_client: Callable[..., Any]
+    ) -> None:
+        """Depth 5 — exactly at the unchanged default cap."""
+        with patch_upstream_client(deep_schema_tool(2)):
+            gw = GatewayServer({"svc": "http://svc:8080/mcp"})
+            await gw.upstream_manager.populate_domain("svc")
+
+        assert gw.registry.lookup("svc_deep") is not None
+
+    @pytest.mark.asyncio
+    async def test_raised_cap_admits_schema_the_default_rejects(
+        self, deep_schema_tool: Callable[..., Any], patch_upstream_client: Callable[..., Any]
+    ) -> None:
+        """The same depth-7 schema the default rejects is admitted at 12."""
+        with patch_upstream_client(deep_schema_tool(3)):
+            gw = GatewayServer({"svc": "http://svc:8080/mcp"}, max_schema_depth=12)
+            await gw.upstream_manager.populate_domain("svc")
+
+        assert gw.registry.lookup("svc_deep") is not None
+
+    @pytest.mark.asyncio
+    async def test_lowered_cap_rejects_schema_the_default_admits(
+        self, deep_schema_tool: Callable[..., Any], patch_upstream_client: Callable[..., Any]
+    ) -> None:
+        """The cap tightens as well as loosens: depth 5 is refused at 1."""
+        with patch_upstream_client(deep_schema_tool(2)):
+            gw = GatewayServer({"svc": "http://svc:8080/mcp"}, max_schema_depth=1)
+            await gw.upstream_manager.populate_domain("svc")
+
+        assert gw.registry.lookup("svc_deep") is None
+
+    @pytest.mark.asyncio
+    async def test_ceiling_admits_deeper_still(
+        self, deep_schema_tool: Callable[..., Any], patch_upstream_client: Callable[..., Any]
+    ) -> None:
+        """Depth 49 — admitted only at the ceiling, rejected at every default."""
+        with patch_upstream_client(deep_schema_tool(24)):
+            gw = GatewayServer({"svc": "http://svc:8080/mcp"}, max_schema_depth=MAX_ALLOWED_SCHEMA_DEPTH)
+            await gw.upstream_manager.populate_domain("svc")
+
+        assert gw.registry.lookup("svc_deep") is not None
+
+    @pytest.mark.parametrize(
+        "bad_value",
+        [0, -3, MAX_ALLOWED_SCHEMA_DEPTH + 1, True, 1.5, "5", None],
+        ids=["zero", "negative", "above-ceiling", "bool", "float", "str", "none"],
+    )
+    def test_invalid_value_rejected_at_construction(self, bad_value: object) -> None:
+        """A bad cap is an operator misconfiguration, so it must fail at
+        construction rather than silently rejecting every upstream tool.
+        ``True`` is included deliberately: ``bool`` is an ``int`` subclass,
+        so a range-only check would accept it as a cap of 1."""
+        with patch("fastmcp_gateway.client_manager.Client"), pytest.raises(ValueError):
+            GatewayServer({"svc": "http://svc:8080/mcp"}, max_schema_depth=bad_value)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
