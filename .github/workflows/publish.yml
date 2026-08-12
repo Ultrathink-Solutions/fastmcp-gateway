@@ -3,21 +3,62 @@ name: Publish to PyPI
 on:
   release:
     types: [published]
+  # Manual re-publish path. The `release: published` event fires exactly once
+  # and runs the workflow file as it existed at the tagged commit, so a tag
+  # whose publish failed for a reason external to the code (e.g. a build-backend
+  # metadata version the pinned publisher could not yet parse) cannot be
+  # recovered by fixing this file and re-running. Dispatching against the tag
+  # builds the same tagged source with the current workflow file.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Bare git tag name to build and publish (e.g. v1.2.3)"
+        required: true
+        type: string
 
-permissions:
-  id-token: write  # Required for PyPI trusted publisher (OIDC)
+# A release-triggered run and a manual re-publish of the same tag would race to
+# upload the same version, and the loser dies on PyPI's immutable-version rule.
+# Serialize per tag -- `ref_name` rather than `ref` so both trigger paths land in
+# the same group. Never cancel in flight: an interrupted upload is worse than a
+# queued one.
+#
+# Only one run stays pending per group, and a newer one evicts it. That is the
+# behaviour we want and `queue: max` is deliberately not set: every run in a
+# given group targets the same tag, hence the same immutable PyPI version, so at
+# most one can ever succeed. Preserving the rest would only queue up runs
+# guaranteed to fail on "File already exists".
+concurrency:
+  group: pypi-publish-${{ inputs.tag || github.ref_name || github.sha }}
+  cancel-in-progress: false
 
 jobs:
-  publish:
-    name: Build and publish to PyPI
+  # Building and publishing are separate jobs so that they hold different
+  # credentials. `python -m build` resolves and executes a build backend from
+  # PyPI at run time, i.e. third-party code this repository does not pin. That
+  # code must never run in a job carrying `id-token: write`, because the OIDC
+  # request token is exposed to every step of such a job and could be exchanged
+  # through the trusted publisher to upload an arbitrary artifact under this
+  # project's name. The build job therefore gets no publishing credential, and
+  # the publish job never executes a build backend -- it only moves an already
+  # built artifact.
+  build:
+    name: Build distributions
     runs-on: ubuntu-latest
 
-    environment:
-      name: pypi
-      url: https://pypi.org/p/fastmcp-gateway
+    permissions:
+      contents: read
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # On `release`, `github.sha` is the tagged commit -- identical to the
+          # action's own default. On `workflow_dispatch`, qualify the input as a
+          # tag ref so that a branch name or a bare SHA fails to resolve here
+          # rather than reaching PyPI: every published artifact must correspond
+          # to an immutable named tag.
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.sha }}
+          # Nothing after this step runs a git operation.
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
@@ -30,5 +71,38 @@ jobs:
       - name: Build package
         run: python -m build
 
+      - name: Upload distributions
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist
+          path: dist/
+          # A publish job that silently uploads nothing is worse than a red run.
+          if-no-files-found: error
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write # Required for PyPI trusted publisher (OIDC)
+
+    # Trusted publishing matches on repository, workflow filename and
+    # environment -- not on job name -- so this stays valid across the split.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/fastmcp-gateway
+
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: dist/
+
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
+        # v1.14.2 is the first release carrying Twine 7 / packaging 26, i.e. the
+        # first that accepts `Metadata-Version: 2.5` -- emitted by hatchling
+        # >=1.32.0. Older publishers reject such a wheel at `twine check` with
+        # "'2.5' is not a valid metadata version" even though the wheel is valid.
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
