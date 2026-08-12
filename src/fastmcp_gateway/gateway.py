@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 from fastmcp import FastMCP
+from opentelemetry import trace
 
 from fastmcp_gateway.access_policy import AccessPolicy, normalize_upstreams
 from fastmcp_gateway.client_manager import UpstreamManager
@@ -35,6 +36,7 @@ if TYPE_CHECKING:
     from fastmcp.server.auth import AuthProvider
 
 logger = logging.getLogger(__name__)
+_tracer = trace.get_tracer("fastmcp_gateway.gateway")
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +381,16 @@ class GatewayServer:
         DCR handling when the upstream IdP doesn't support RFC 7591
         Dynamic Client Registration. ``None`` (the default) leaves the
         FastMCP transport unauthenticated and matches prior behaviour.
+    trace_health_routes:
+        When ``True`` (default, matches prior behaviour), each
+        ``/healthz`` and ``/readyz`` request is wrapped in its own
+        OpenTelemetry span (``gateway.healthz`` / ``gateway.readyz``).
+        Set to ``False`` to opt out: under kubelet-style probing every
+        few seconds, each probe becomes its own root trace, and a
+        deployment that doesn't want that per-probe span volume can
+        disable it here (or via ``GATEWAY_TRACE_HEALTH_ROUTES=false``).
+        When disabled, the handlers create no span at all — the
+        response bodies and status codes are unaffected either way.
 
     Usage::
 
@@ -414,6 +426,7 @@ class GatewayServer:
         output_guard: OutputGuardConfig | None = None,
         trusted_output_tools: set[str] | None = None,
         auth: AuthProvider | None = None,
+        trace_health_routes: bool = True,
     ) -> None:
         # Accept either a plain URL mapping or an object-shaped mapping with
         # per-entry allowed_tools / denied_tools.  The explicit access_policy
@@ -545,6 +558,7 @@ class GatewayServer:
             sanitizer_trusted_domains=sanitizer_trusted_domains,
             trusted_output_tools=trusted_output_tools,
         )
+        self._trace_health_routes = trace_health_routes
         # ``auth`` plugs an inbound auth provider (TokenVerifier,
         # RemoteAuthProvider, OAuthProvider, or any other AuthProvider
         # subclass) into the underlying FastMCP server. When set, FastMCP
@@ -685,13 +699,10 @@ class GatewayServer:
 
     async def _refresh_loop(self) -> None:
         """Periodically re-query all upstreams to keep the registry fresh."""
-        from opentelemetry import trace
-
-        tracer = trace.get_tracer("fastmcp_gateway.gateway")
         assert self._refresh_interval is not None
         while True:
             await asyncio.sleep(self._refresh_interval)
-            with tracer.start_as_current_span("gateway.background_refresh") as span:
+            with _tracer.start_as_current_span("gateway.background_refresh") as span:
                 try:
                     async with self._registry_lock:
                         diffs = await self.upstream_manager.refresh_all()
@@ -751,23 +762,36 @@ class GatewayServer:
         )
 
     def _register_health_routes(self) -> None:
-        """Register /healthz and /readyz health check endpoints."""
-        from opentelemetry import trace
+        """Register /healthz and /readyz health check endpoints.
+
+        Span creation is gated on *trace_health_routes* (see the
+        constructor docstring). Kubelet-style probes hit these routes
+        every few seconds; when a deployment doesn't want each probe
+        to become its own root trace, it sets ``trace_health_routes=False``
+        (or ``GATEWAY_TRACE_HEALTH_ROUTES=false``) and the handlers run
+        with no span creation at all -- not even a no-op span.
+        """
         from starlette.responses import JSONResponse
 
-        tracer = trace.get_tracer(__name__)
         registry = self.registry
+        trace_health_routes = self._trace_health_routes
 
         @self._mcp.custom_route("/healthz", methods=["GET"])
         async def _healthz(_request: Any) -> Any:
-            with tracer.start_as_current_span("gateway.healthz") as span:
+            body = {"status": "ok"}
+            if not trace_health_routes:
+                return JSONResponse(body)
+            with _tracer.start_as_current_span("gateway.healthz") as span:
                 span.set_attribute("http.method", "GET")
                 span.set_attribute("http.route", "/healthz")
-                return JSONResponse({"status": "ok"})
+                return JSONResponse(body)
 
         @self._mcp.custom_route("/readyz", methods=["GET"])
         async def _readyz(_request: Any) -> Any:
-            with tracer.start_as_current_span("gateway.readyz") as span:
+            body = {"status": "ready"}
+            if not trace_health_routes:
+                return JSONResponse(body)
+            with _tracer.start_as_current_span("gateway.readyz") as span:
                 span.set_attribute("http.method", "GET")
                 span.set_attribute("http.route", "/readyz")
                 # Tool count remains observable via the OTel span for
@@ -779,7 +803,7 @@ class GatewayServer:
                 # gateway has routed tells an attacker the size of
                 # the attack surface).
                 span.set_attribute("registry.tool_count", registry.tool_count)
-                return JSONResponse({"status": "ready"})
+                return JSONResponse(body)
 
     def _register_registry_routes(self) -> None:
         """Register /registry/servers REST endpoints for dynamic upstream management.

@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 if TYPE_CHECKING:
     from collections.abc import Generator
 
+import httpx
 import pytest
 from fastmcp import Client, FastMCP
 from opentelemetry.sdk.trace import TracerProvider
@@ -15,9 +16,11 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 import fastmcp_gateway.client_manager as cm_mod
+import fastmcp_gateway.gateway as gw_mod
 import fastmcp_gateway.meta_tools as mt_mod
 import fastmcp_gateway.registry as reg_mod
 from fastmcp_gateway.client_manager import UpstreamManager
+from fastmcp_gateway.gateway import GatewayServer
 from fastmcp_gateway.meta_tools import register_meta_tools
 from fastmcp_gateway.registry import ToolRegistry
 
@@ -37,16 +40,19 @@ def _otel_setup() -> Generator[InMemorySpanExporter, None, None]:
     old_mt = mt_mod._tracer
     old_cm = cm_mod._tracer
     old_reg = reg_mod._tracer
+    old_gw = gw_mod._tracer
 
     mt_mod._tracer = provider.get_tracer("test.meta_tools")
     cm_mod._tracer = provider.get_tracer("test.client_manager")
     reg_mod._tracer = provider.get_tracer("test.registry")
+    gw_mod._tracer = provider.get_tracer("test.gateway")
 
     yield exporter
 
     mt_mod._tracer = old_mt
     cm_mod._tracer = old_cm
     reg_mod._tracer = old_reg
+    gw_mod._tracer = old_gw
     provider.shutdown()
 
 
@@ -232,3 +238,79 @@ class TestRegistrySpans:
         attrs = dict(spans[-1].attributes or {})
         assert attrs.get("gateway.query") == "search"
         assert "gateway.result_count" in attrs
+
+
+# ---------------------------------------------------------------------------
+# Health-route spans
+# ---------------------------------------------------------------------------
+
+
+def _health_transport(gateway: GatewayServer) -> httpx.ASGITransport:
+    """Build an ASGI transport for a gateway's health routes."""
+    app = gateway.mcp.http_app(transport="streamable-http")
+    return httpx.ASGITransport(app=app)
+
+
+class TestHealthRouteSpans:
+    """Kubelet-style liveness/readiness probes hit /healthz and /readyz every
+    few seconds. Each call becomes its own root trace by default (matching
+    prior behaviour); ``trace_health_routes=False`` opts a deployment out of
+    that per-probe span volume entirely.
+    """
+
+    @pytest.mark.asyncio
+    async def test_healthz_emits_span_by_default(self, exporter: InMemorySpanExporter) -> None:
+        with patch("fastmcp_gateway.client_manager.Client"):
+            gateway = GatewayServer({})
+
+        transport = _health_transport(gateway)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/healthz")
+
+        assert response.status_code == 200
+        spans = _get_spans(exporter, "gateway.healthz")
+        assert len(spans) == 1
+        attrs = dict(spans[0].attributes or {})
+        assert attrs.get("http.route") == "/healthz"
+
+    @pytest.mark.asyncio
+    async def test_readyz_emits_span_by_default(self, exporter: InMemorySpanExporter) -> None:
+        with patch("fastmcp_gateway.client_manager.Client"):
+            gateway = GatewayServer({})
+
+        transport = _health_transport(gateway)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/readyz")
+
+        assert response.status_code == 200
+        spans = _get_spans(exporter, "gateway.readyz")
+        assert len(spans) == 1
+        attrs = dict(spans[0].attributes or {})
+        assert attrs.get("http.route") == "/readyz"
+        assert "registry.tool_count" in attrs
+
+    @pytest.mark.asyncio
+    async def test_healthz_emits_no_span_when_disabled(self, exporter: InMemorySpanExporter) -> None:
+        with patch("fastmcp_gateway.client_manager.Client"):
+            gateway = GatewayServer({}, trace_health_routes=False)
+
+        transport = _health_transport(gateway)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/healthz")
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "ok"
+        assert _get_spans(exporter, "gateway.healthz") == []
+
+    @pytest.mark.asyncio
+    async def test_readyz_emits_no_span_when_disabled(self, exporter: InMemorySpanExporter) -> None:
+        with patch("fastmcp_gateway.client_manager.Client"):
+            gateway = GatewayServer({}, trace_health_routes=False)
+
+        transport = _health_transport(gateway)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/readyz")
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "ready"
+        assert _get_spans(exporter, "gateway.readyz") == []
