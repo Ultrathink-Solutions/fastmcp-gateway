@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.28.0] - 2026-08-12
 
 ### Added
 
@@ -683,7 +683,11 @@ Security-hardening release. Closes two code-injection primitives in the env-driv
 
 - Migrated `ToolEntry` and `DomainInfo` from dataclasses to Pydantic models (#9)
 
+[0.28.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.27.0...v0.28.0
 [0.27.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.26.0...v0.27.0
+[0.26.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.25.0...v0.26.0
+[0.25.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.24.0...v0.25.0
+[0.24.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/Ultrathink-Solutions/fastmcp-gateway/compare/v0.20.0...v0.21.0
