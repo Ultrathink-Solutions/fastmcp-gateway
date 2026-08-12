@@ -1,0 +1,12 @@
+version: 2
+
+updates:
+  # Third-party actions are pinned to full commit SHAs, which is correct for
+  # supply-chain reasons but means a pin silently ages out of step with the
+  # ecosystem it has to interoperate with. Keep the pins moving.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "chore(ci)"
