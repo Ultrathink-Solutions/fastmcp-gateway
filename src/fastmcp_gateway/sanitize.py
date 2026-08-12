@@ -234,6 +234,20 @@ class SchemaValidationError(ValueError):
     """
 
 
+class _PhysicalRecursionExceeded(SchemaValidationError):
+    """Raised when traversal exhausts :data:`_MAX_PHYSICAL_RECURSION`.
+
+    A :class:`SchemaValidationError` subclass, so the registry's
+    per-tool ingest loop keeps skipping just the offending tool and the
+    fail-closed contract is unchanged. It exists as a distinct type so
+    the rejection *reason* stays truthful: a schema that chains more
+    wrapper levels than the traversal will follow is not the same
+    defect as one that nests deeper than the logical cap, and the
+    operator reading the audit log should not be handed a nesting-depth
+    number that doesn't appear anywhere in their schema.
+    """
+
+
 # Depth at which schema recursion is considered pathological. Legitimate
 # MCP tool schemas almost never exceed 3 levels of nesting
 # (``properties.foo.items.properties.bar`` is already depth 4). A cap of
@@ -469,20 +483,37 @@ def _schema_depth(
     Python call per hop. *physical_depth* is a second counter that
     increments on every recursive call — transparent or not — and is
     checked independently via :data:`_MAX_PHYSICAL_RECURSION`. When it
-    fires, this returns ``max_depth + 1`` — a value guaranteed to exceed
-    the caller's cap — rather than the (possibly still-small, and
-    therefore misleading) *depth* value, so :func:`validate_input_schema`
-    reliably rejects the schema instead of silently admitting it. Without
-    this, a sufficiently long chain would either be wrongly admitted (low
+    fires, this raises :class:`_PhysicalRecursionExceeded` rather than
+    returning a depth number at all. Returning a fabricated
+    over-the-cap depth would reject the schema correctly but describe it
+    wrongly: the registry logs the exception text verbatim, so an
+    operator debugging a rejected tool would read a nesting depth that
+    appears nowhere in their schema. Raising a distinct
+    :class:`SchemaValidationError` subclass keeps the fail-closed
+    contract (the per-tool ingest loop still skips just this tool) while
+    naming the actual defect. Without the counter entirely, a
+    sufficiently long chain would either be wrongly admitted (low
     reported depth) or, past Python's default recursion limit, raise an
     uncaught ``RecursionError`` that escapes the registry's per-tool
     ``SchemaValidationError`` catch and aborts the whole upstream's
     registration.
+
+    Note that a transparent hop advances *physical_depth* without
+    advancing *depth*, so a schema crossing more than
+    :data:`_MAX_PHYSICAL_RECURSION` optional wrappers on a single path
+    exhausts this counter before the logical cap even at a raised
+    *max_depth*. That is the intended trade: the ceiling is what keeps a
+    raised cap from re-opening the stack-overflow surface, and such a
+    schema is now rejected with an accurate reason rather than a
+    misleading depth.
     """
     if depth > max_depth:
         return depth
     if physical_depth > _MAX_PHYSICAL_RECURSION:
-        return max_depth + 1
+        raise _PhysicalRecursionExceeded(
+            f"inputSchema traversal exceeded the physical recursion ceiling of {_MAX_PHYSICAL_RECURSION} — "
+            "the schema chains more wrapper levels than the validator will follow"
+        )
     if isinstance(node, dict):
         if not node:
             return depth

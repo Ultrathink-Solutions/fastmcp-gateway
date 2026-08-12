@@ -154,8 +154,11 @@ class UpstreamManager:
     max_schema_depth:
         Forwarded to :meth:`ToolRegistry.populate_domain` as its
         ``max_schema_depth`` on every populate/refresh/add_upstream
-        call. Defaults to ``5``, matching prior behaviour. Must be an
-        int between ``1`` and ``50`` inclusive; validated here at
+        call. Defaults to
+        :data:`~fastmcp_gateway.sanitize.DEFAULT_MAX_SCHEMA_DEPTH`,
+        matching prior behaviour. Must be an int between ``1`` and
+        :data:`~fastmcp_gateway.sanitize.MAX_ALLOWED_SCHEMA_DEPTH`
+        inclusive; validated here at
         construction time (not deferred to the first populate call) so
         a caller that constructs ``UpstreamManager`` directly --
         bypassing ``GatewayServer`` -- gets the same fail-fast

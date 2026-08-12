@@ -83,9 +83,10 @@ Configure via environment variables:
         rejected at registration.  The cap exists to bound schema
         complexity for LLM consumers -- prefer flattening an over-deep
         upstream schema; raise this only deliberately.  Must be an
-        integer between 1 and 50 (inclusive) -- the upper bound exists
-        because the ingest-time recursion itself becomes a
-        stack-overflow risk well before four-figure depths.
+        integer between 1 and sanitize.MAX_ALLOWED_SCHEMA_DEPTH
+        (inclusive) -- the upper bound exists because the ingest-time
+        recursion itself becomes a stack-overflow risk well before
+        four-figure depths.
 
     GATEWAY_HOOK_MODULE
         Python dotted path to a factory function that returns a list of hook

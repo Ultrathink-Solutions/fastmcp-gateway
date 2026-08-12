@@ -2,9 +2,67 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+from unittest.mock import AsyncMock, MagicMock, patch
+
 import pytest
 
 from fastmcp_gateway.registry import ToolEntry, ToolRegistry
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from contextlib import AbstractContextManager
+
+
+@dataclass
+class FakeTool:
+    """Mimics ``mcp.types.Tool`` for tests that don't need the MCP dependency."""
+
+    name: str
+    description: str | None = None
+    inputSchema: dict[str, Any] | None = None
+
+
+@pytest.fixture
+def deep_schema_tool() -> Callable[..., FakeTool]:
+    """Factory for a tool whose inputSchema nests to a chosen depth.
+
+    ``wrappers`` object layers around a scalar leaf. Each wrapper costs
+    two counted levels (the object dict plus its ``properties`` dict)
+    and the leaf's scalar value costs one, so the measured nesting depth
+    is ``2 * wrappers + 1``. Callers pick *wrappers* to sit deliberately
+    above or below the cap under test.
+    """
+
+    def _build(wrappers: int, *, name: str = "svc_deep") -> FakeTool:
+        node: dict[str, Any] = {"type": "string"}
+        for index in range(wrappers):
+            node = {"type": "object", "properties": {f"level_{index}": node}}
+        return FakeTool(name=name, description="Deeply nested tool", inputSchema=node)
+
+    return _build
+
+
+@pytest.fixture
+def patch_upstream_client() -> Callable[..., AbstractContextManager[Any]]:
+    """Factory patching the upstream ``Client`` so it lists the given tools.
+
+    Returns a context manager, so the patch stays active for exactly the
+    block that constructs the gateway/manager and runs the populate.
+    """
+
+    def _patch(*tools: FakeTool) -> AbstractContextManager[Any]:
+        def make_client(url: str) -> MagicMock:
+            client = AsyncMock()
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=None)
+            client.list_tools = AsyncMock(return_value=list(tools))
+            return client
+
+        return patch("fastmcp_gateway.client_manager.Client", side_effect=make_client)
+
+    return _patch
 
 
 @pytest.fixture

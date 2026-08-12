@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from typing import TYPE_CHECKING, Any
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from fastmcp_gateway.gateway import GatewayServer
 from fastmcp_gateway.sanitize import MAX_ALLOWED_SCHEMA_DEPTH
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 # ---------------------------------------------------------------------------
 # Constructor parameters
@@ -62,86 +64,62 @@ class TestGatewayConstructor:
 # ---------------------------------------------------------------------------
 
 
-@dataclass
-class _FakeTool:
-    """Mimics mcp.types.Tool for testing without the MCP dependency."""
-
-    name: str
-    description: str | None = None
-    inputSchema: dict[str, Any] | None = None
-
-
-def _deep_schema_tool(wrappers: int) -> _FakeTool:
-    """A tool whose inputSchema wraps a leaf in *wrappers* object layers.
-
-    Each wrapper costs two counted levels (the object dict plus its
-    ``properties`` dict), and the leaf's scalar value costs one more, so
-    the measured nesting depth is ``2 * wrappers + 1``.
-    """
-    node: dict[str, Any] = {"type": "string"}
-    for index in range(wrappers):
-        node = {"type": "object", "properties": {f"level_{index}": node}}
-    return _FakeTool(name="svc_deep", description="Deeply nested tool", inputSchema=node)
-
-
-def _patched_client(tool: _FakeTool) -> Any:
-    """Patch the upstream Client so every domain lists exactly *tool*."""
-
-    def make_client(url: str) -> MagicMock:
-        client = AsyncMock()
-        client.__aenter__ = AsyncMock(return_value=client)
-        client.__aexit__ = AsyncMock(return_value=None)
-        client.list_tools = AsyncMock(return_value=[tool])
-        return client
-
-    return patch("fastmcp_gateway.client_manager.Client", side_effect=make_client)
-
-
 class TestMaxSchemaDepth:
     """The cap is observable through what a gateway admits at registration,
     so these assert on registry contents after a populate rather than on the
-    manager's private depth field."""
+    manager's private depth field. Depth is ``2 * wrappers + 1`` -- see the
+    ``deep_schema_tool`` factory in conftest."""
 
     @pytest.mark.asyncio
-    async def test_default_rejects_schema_deeper_than_five(self) -> None:
+    async def test_default_rejects_schema_deeper_than_five(
+        self, deep_schema_tool: Callable[..., Any], patch_upstream_client: Callable[..., Any]
+    ) -> None:
         """Depth 7 — over the unchanged default cap of 5."""
-        with _patched_client(_deep_schema_tool(3)):
+        with patch_upstream_client(deep_schema_tool(3)):
             gw = GatewayServer({"svc": "http://svc:8080/mcp"})
             await gw.upstream_manager.populate_domain("svc")
 
         assert gw.registry.lookup("svc_deep") is None
 
     @pytest.mark.asyncio
-    async def test_default_admits_schema_within_five(self) -> None:
+    async def test_default_admits_schema_within_five(
+        self, deep_schema_tool: Callable[..., Any], patch_upstream_client: Callable[..., Any]
+    ) -> None:
         """Depth 5 — exactly at the unchanged default cap."""
-        with _patched_client(_deep_schema_tool(2)):
+        with patch_upstream_client(deep_schema_tool(2)):
             gw = GatewayServer({"svc": "http://svc:8080/mcp"})
             await gw.upstream_manager.populate_domain("svc")
 
         assert gw.registry.lookup("svc_deep") is not None
 
     @pytest.mark.asyncio
-    async def test_raised_cap_admits_schema_the_default_rejects(self) -> None:
+    async def test_raised_cap_admits_schema_the_default_rejects(
+        self, deep_schema_tool: Callable[..., Any], patch_upstream_client: Callable[..., Any]
+    ) -> None:
         """The same depth-7 schema the default rejects is admitted at 12."""
-        with _patched_client(_deep_schema_tool(3)):
+        with patch_upstream_client(deep_schema_tool(3)):
             gw = GatewayServer({"svc": "http://svc:8080/mcp"}, max_schema_depth=12)
             await gw.upstream_manager.populate_domain("svc")
 
         assert gw.registry.lookup("svc_deep") is not None
 
     @pytest.mark.asyncio
-    async def test_lowered_cap_rejects_schema_the_default_admits(self) -> None:
+    async def test_lowered_cap_rejects_schema_the_default_admits(
+        self, deep_schema_tool: Callable[..., Any], patch_upstream_client: Callable[..., Any]
+    ) -> None:
         """The cap tightens as well as loosens: depth 5 is refused at 1."""
-        with _patched_client(_deep_schema_tool(2)):
+        with patch_upstream_client(deep_schema_tool(2)):
             gw = GatewayServer({"svc": "http://svc:8080/mcp"}, max_schema_depth=1)
             await gw.upstream_manager.populate_domain("svc")
 
         assert gw.registry.lookup("svc_deep") is None
 
     @pytest.mark.asyncio
-    async def test_ceiling_admits_deeper_still(self) -> None:
+    async def test_ceiling_admits_deeper_still(
+        self, deep_schema_tool: Callable[..., Any], patch_upstream_client: Callable[..., Any]
+    ) -> None:
         """Depth 49 — admitted only at the ceiling, rejected at every default."""
-        with _patched_client(_deep_schema_tool(24)):
+        with patch_upstream_client(deep_schema_tool(24)):
             gw = GatewayServer({"svc": "http://svc:8080/mcp"}, max_schema_depth=MAX_ALLOWED_SCHEMA_DEPTH)
             await gw.upstream_manager.populate_domain("svc")
 

@@ -11,6 +11,7 @@ from fastmcp_gateway.sanitize import (
     MAX_ALLOWED_SCHEMA_DEPTH,
     SchemaValidationError,
     _contains_ref,
+    _PhysicalRecursionExceeded,
     _schema_depth,
     sanitize_description,
     validate_input_schema,
@@ -228,27 +229,42 @@ class TestValidateInputSchema:
 
 
 def _nested_schema(levels: int) -> dict:
-    """Build an object schema nested *levels* ``properties`` deep."""
+    """Build an object schema wrapping a scalar leaf *levels* + 1 times.
+
+    The loop wraps *levels* times and the ``root`` property wraps once
+    more, so the measured depth is ``2 * (levels + 1) + 1`` -- each
+    wrapper costs two counted levels and the leaf's scalar value costs
+    one.
+    """
     deep: dict = {"type": "string"}
     for i in range(levels):
         deep = {"type": "object", "properties": {f"k{i}": deep}}
     return {"type": "object", "properties": {"root": deep}}
 
 
-# A schema deep enough to sit right at the default cap's rejection boundary
-# (matches the shape used in test_rejects_excessive_depth).
-_DEPTH_6_SCHEMA = _nested_schema(2)
+# Three wrappers => depth 7, the first odd depth clear of the default cap
+# of 5 and comfortably under the raised cap of 10 used below.
+_DEPTH_7_SCHEMA = _nested_schema(2)
 
 
 class TestConfigurableSchemaDepth:
-    def test_default_still_rejects_depth_6(self) -> None:
+    def test_fixture_depth_is_what_its_name_claims(self) -> None:
+        """Pin the shared fixture's depth so the name can't drift from reality.
+
+        Without this, an edit that trusts the constant to sit a specific
+        distance from the cap would silently set a boundary value that
+        doesn't test the boundary.
+        """
+        assert _schema_depth(_DEPTH_7_SCHEMA, max_depth=MAX_ALLOWED_SCHEMA_DEPTH) == 7
+
+    def test_default_still_rejects_depth_7(self) -> None:
         """Omitting max_depth preserves the existing cap of 5 -- no behavior change."""
         with pytest.raises(SchemaValidationError):
-            validate_input_schema(_DEPTH_6_SCHEMA)
+            validate_input_schema(_DEPTH_7_SCHEMA)
 
     def test_raised_cap_admits_the_same_schema(self) -> None:
         """The identical schema passes once the caller raises max_depth."""
-        assert validate_input_schema(_DEPTH_6_SCHEMA, max_depth=10) == _DEPTH_6_SCHEMA
+        assert validate_input_schema(_DEPTH_7_SCHEMA, max_depth=10) == _DEPTH_7_SCHEMA
 
     def test_lowered_cap_still_rejects_previously_valid_schema(self) -> None:
         """A caller may also lower the cap below 5, tightening validation."""
@@ -434,6 +450,54 @@ class TestOptionalNullDepthTransparency:
         schema = {"type": "object", "properties": {"foo": deep}}
         with pytest.raises(SchemaValidationError):
             validate_input_schema(schema)
+
+    def test_wrapper_chain_and_plain_nesting_reject_for_distinct_reasons(self) -> None:
+        """The two rejection causes are separate types, so the audit log is truthful.
+
+        A wrapper chain exhausts the physical-recursion ceiling while its
+        logical depth stays tiny; reporting that as a nesting-depth
+        violation would hand an operator a depth number that appears
+        nowhere in their schema. Plain over-deep nesting must keep the
+        ordinary depth rejection.
+        """
+        chained: dict = {"type": "string"}
+        for _ in range(500):
+            chained = {"anyOf": [chained, {"type": "null"}]}
+        with pytest.raises(_PhysicalRecursionExceeded):
+            validate_input_schema({"type": "object", "properties": {"foo": chained}})
+
+        plain: dict = {"type": "string"}
+        for i in range(20):
+            plain = {"type": "object", "properties": {f"k{i}": plain}}
+        with pytest.raises(SchemaValidationError) as excinfo:
+            validate_input_schema(plain)
+        assert not isinstance(excinfo.value, _PhysicalRecursionExceeded)
+
+    def test_physical_recursion_error_is_caught_by_the_registry_skip_path(self) -> None:
+        """The distinct type must stay a SchemaValidationError subclass.
+
+        ``ToolRegistry.populate_domain`` catches only
+        ``SchemaValidationError``; if this diverged, a wrapper-chain
+        schema would abort the whole domain's registration instead of
+        skipping the one offending tool.
+        """
+        assert issubclass(_PhysicalRecursionExceeded, SchemaValidationError)
+
+        chained: dict = {"type": "string"}
+        for _ in range(500):
+            chained = {"anyOf": [chained, {"type": "null"}]}
+        registry = ToolRegistry()
+        diff = registry.populate_domain(
+            "dom",
+            "http://x:8080/mcp",
+            [
+                {"name": "dom_chained", "inputSchema": {"type": "object", "properties": {"foo": chained}}},
+                {"name": "dom_ok", "inputSchema": {"type": "object"}},
+            ],
+        )
+        assert diff.tool_count == 1
+        assert registry.lookup("dom_ok") is not None
+        assert registry.lookup("dom_chained") is None
 
     @pytest.mark.parametrize("chain_length", [500, 3000], ids=["hundreds", "thousands"])
     def test_pathological_optional_chain_rejected_at_raised_cap_too(self, chain_length: int) -> None:

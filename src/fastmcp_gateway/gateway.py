@@ -403,8 +403,9 @@ class GatewayServer:
         raise this only deliberately, since a much higher value widens
         the recursion the ingest-time validator performs over
         upstream-controlled input. Must be an int between ``1`` and
-        ``50`` inclusive; anything else (including a ``bool`` or a
-        float) raises :class:`ValueError` at construction -- the upper
+        :data:`~fastmcp_gateway.sanitize.MAX_ALLOWED_SCHEMA_DEPTH`
+        inclusive; anything else (including a ``bool`` or a float)
+        raises :class:`ValueError` at construction -- the upper
         bound exists because the ingest-time recursion itself becomes a
         stack-overflow risk well before four-figure depths, so this
         can't be raised without limit even deliberately. Also settable

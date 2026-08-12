@@ -224,7 +224,7 @@ gateway = GatewayServer(
 )
 ```
 
-Or via `GATEWAY_MAX_SCHEMA_DEPTH` when running the CLI entry point. Must be an integer in **[1, 50]**; an invalid value fails loudly at startup rather than silently falling back to the default. The upper bound of 50 isn't arbitrary: the ingest-time depth/`$ref` recursion itself becomes a stack-overflow risk on adversarial input well before four-figure nesting depths, so the cap can't be raised without limit even for a deployment that genuinely needs deeper schemas.
+Or via `GATEWAY_MAX_SCHEMA_DEPTH` when running the CLI entry point. Must be an integer in **[1, 50]** — `fastmcp_gateway.sanitize.MAX_ALLOWED_SCHEMA_DEPTH` is the authoritative upper bound if this number ever moves. An invalid value fails loudly at startup rather than silently falling back to the default. The upper bound of 50 isn't arbitrary: the ingest-time depth/`$ref` recursion itself becomes a stack-overflow risk on adversarial input well before four-figure nesting depths, so the cap can't be raised without limit even for a deployment that genuinely needs deeper schemas.
 
 ## Execution Hooks
 
