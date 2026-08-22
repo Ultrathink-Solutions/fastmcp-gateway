@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.29.0] - 2026-08-22
+
+### Changed
+
+- **`discover_tools` renders callable signatures by default.** The domain-listing, group, and keyword-query modes now return each tool as a Python-style signature (`name(arg: type, ...)`) instead of the JSON schema summary, so a caller can go straight to `execute_tool` without a `get_tool_schema` round-trip; `format="schema"` returns the previous JSON summary, and the no-argument domain summary is unchanged (always JSON). The server's `InitializeResult` instructions now advertise the two-step `discover_tools() -> execute_tool()` workflow, offering `get_tool_schema()` only when a signature is not enough. (#85)
+
+### Fixed
+
+- **`infer_group` recognises `{group}_{action}` tool names without a domain prefix.** Previously every tool whose name did not start with its registered domain prefix fell into the `"general"` group, making `group_overrides` unreachable and `discover_tools(group=...)` useless for registries whose names are `{group}_{action}`-shaped (e.g. `query_run_query` under domain `snowflake_mcp`, now group `query`). After the existing domain-prefix branch, the group is the first `_`-segment; a single-segment name stays `"general"`, and domain-prefixed names (`apollo_people_search` under `apollo` -> `people`) are unchanged. **Deployment note:** on a registry whose tool names are `{group}_{action}`-shaped under a mismatched domain, groups change from `"general"` to the first segment at this release — re-check group filters and `group_overrides` keyed on `"general"`. (#86)
+
 ## [0.28.0] - 2026-08-12
 
 ### Added
