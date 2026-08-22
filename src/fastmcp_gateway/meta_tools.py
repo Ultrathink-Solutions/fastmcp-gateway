@@ -164,7 +164,7 @@ def register_meta_tools(
         domain: str | None = None,
         group: str | None = None,
         query: str | None = None,
-        format: Literal["schema", "signatures"] = "schema",
+        format: Literal["schema", "signatures"] = "signatures",
     ) -> str:
         """Browse available tools by domain, group, or keyword.
 
@@ -173,12 +173,11 @@ def register_meta_tools(
         Call with a domain and group to see tools in that specific group.
         Call with a query to search across all tools by keyword.
 
-        Set ``format="signatures"`` to receive each tool rendered as a
-        Python-style function signature (``name(arg: type, ...) -> any``)
-        instead of the default JSON schema summary.  Useful when the LLM
-        will subsequently write code that calls the tool directly.  The
-        domain summary (no-arguments form) ignores ``format`` and always
-        returns JSON.
+        Default ``signatures`` renders each tool as ``name(arg: type, ...)``
+        so a caller can call ``execute_tool`` without a second
+        ``get_tool_schema`` round-trip; pass ``format="schema"`` for the
+        JSON summary. The domain summary (no-arguments form) ignores
+        ``format`` and always returns JSON.
         """
         with _tracer.start_as_current_span("gateway.discover_tools") as span:
             if domain:

@@ -1338,8 +1338,11 @@ class GatewayServer:
 
         lines.append("")
         lines.append(
-            "Workflow: discover_tools() \u2192 get_tool_schema() \u2192 execute_tool()\n"
+            "Workflow: discover_tools() \u2192 execute_tool() \u2014 discovery renders each tool "
+            "as a callable signature.\n"
             'Use `discover_tools(domain="...")` to see tools in a specific domain.\n'
+            "Call get_tool_schema() only when a signature is not enough "
+            "(deeply nested arguments, or the raw JSON schema is needed).\n"
             "Skip discovery for tools you've already used in this conversation."
         )
         return "\n".join(lines)
@@ -1349,9 +1352,10 @@ class GatewayServer:
         return (
             "You have access to a tool discovery gateway with 3 tools:\n"
             "1. discover_tools - Browse available tools. Call with no arguments to see domains, "
-            "or with a domain to see specific tools.\n"
-            "2. get_tool_schema - Get a tool's parameter schema before using it.\n"
-            "3. execute_tool - Run any discovered tool.\n"
-            "Workflow: discover_tools -> get_tool_schema -> execute_tool. "
+            "or with a domain to see tool signatures.\n"
+            "2. execute_tool - Run any discovered tool.\n"
+            "3. get_tool_schema - Fetch a tool's full parameter schema when its signature "
+            "is not enough.\n"
+            "Workflow: discover_tools -> execute_tool; get_tool_schema only when needed. "
             "Skip discovery for tools you've already used in this conversation."
         )

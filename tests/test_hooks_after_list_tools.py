@@ -227,7 +227,7 @@ class TestDiscoverToolsWithFilter:
     async def test_mode2_domain_tools_filtered(self) -> None:
         """Mode 2 (domain): filtered tools excluded."""
         mcp = _make_mcp_with_hook(_HideMalloyExecuteQuery())
-        data = await _call_discover(mcp, domain="malloy")
+        data = await _call_discover(mcp, domain="malloy", format="schema")
 
         names = {t["name"] for t in data["tools"]}
         assert "malloy_executeQuery" not in names
@@ -236,7 +236,7 @@ class TestDiscoverToolsWithFilter:
     async def test_mode4_search_results_filtered(self) -> None:
         """Mode 4 (search): filtered tools excluded from search results."""
         mcp = _make_mcp_with_hook(_HideMalloyExecuteQuery())
-        data = await _call_discover(mcp, query="malloy")
+        data = await _call_discover(mcp, query="malloy", format="schema")
 
         names = {r["name"] for r in data["results"]}
         assert "malloy_executeQuery" not in names
@@ -245,7 +245,7 @@ class TestDiscoverToolsWithFilter:
     async def test_non_matching_domain_unaffected(self) -> None:
         """Tools in other domains pass through unfiltered."""
         mcp = _make_mcp_with_hook(_HideMalloyExecuteQuery())
-        data = await _call_discover(mcp, domain="apollo")
+        data = await _call_discover(mcp, domain="apollo", format="schema")
 
         assert len(data["tools"]) == 2
 

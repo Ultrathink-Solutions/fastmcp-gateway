@@ -117,7 +117,7 @@ class TestFullFlow:
         assert domain_names == {"analytics", "crm"}
 
         # Step 2: drill into CRM domain
-        crm_tools = await _call_tool(gateway, "discover_tools", {"domain": "crm"})
+        crm_tools = await _call_tool(gateway, "discover_tools", {"domain": "crm", "format": "schema"})
         assert len(crm_tools["tools"]) == 3
         tool_names = {t["name"] for t in crm_tools["tools"]}
         assert "crm_contacts_search" in tool_names
@@ -148,7 +148,7 @@ class TestMultiDomain:
     @pytest.mark.asyncio
     async def test_cross_domain_search(self, gateway: FastMCP) -> None:
         """Keyword search finds tools across both upstream domains."""
-        results = await _call_tool(gateway, "discover_tools", {"query": "query"})
+        results = await _call_tool(gateway, "discover_tools", {"query": "query", "format": "schema"})
         domains = {r["domain"] for r in results["results"]}
         assert "analytics" in domains
 
@@ -185,13 +185,15 @@ class TestGroupDiscovery:
     @pytest.mark.asyncio
     async def test_groups_inferred_from_tool_names(self, gateway: FastMCP) -> None:
         """Groups are auto-inferred from tool name prefixes."""
-        crm_tools = await _call_tool(gateway, "discover_tools", {"domain": "crm"})
+        crm_tools = await _call_tool(gateway, "discover_tools", {"domain": "crm", "format": "schema"})
         groups = {t["group"] for t in crm_tools["tools"]}
         assert groups == {"contacts", "deals"}
 
     @pytest.mark.asyncio
     async def test_filter_by_group(self, gateway: FastMCP) -> None:
-        contacts = await _call_tool(gateway, "discover_tools", {"domain": "crm", "group": "contacts"})
+        contacts = await _call_tool(
+            gateway, "discover_tools", {"domain": "crm", "group": "contacts", "format": "schema"}
+        )
         assert len(contacts["tools"]) == 2
         names = {t["name"] for t in contacts["tools"]}
         assert names == {"crm_contacts_search", "crm_contacts_create"}
