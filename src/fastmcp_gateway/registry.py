@@ -81,13 +81,29 @@ def _digest_from_triples(
 
 
 def infer_group(domain: str, tool_name: str) -> str:
-    """Infer a tool's group from its name by stripping the domain prefix.
+    """Infer a tool's group from its name.
 
-    Convention: tool names follow ``{domain}_{group}_{action}`` pattern.
-    Examples:
-        infer_group("apollo", "apollo_people_search")   -> "people"
-        infer_group("hubspot", "hubspot_contacts_create") -> "contacts"
-        infer_group("apollo", "search")                  -> "general"
+    Two conventions, tried in order:
+
+    1. ``{domain}_{group}_{action}`` — the tool name is prefixed by the
+       *registered domain* (the upstream MCP server's name in the
+       gateway config), e.g. ``infer_group("apollo",
+       "apollo_people_search") -> "people"``. This is the common case
+       for hand-registered third-party upstreams where the domain name
+       and the tool's own prefix agree.
+
+    2. ``{group}_{action}`` — an ``axon_mcp_server``-convention
+       ``ToolGroup`` name, tried when the domain prefix doesn't match
+       (or the registered domain is an upstream/server name like
+       ``"snowflake_mcp"`` that differs from the tool's own group,
+       e.g. ``infer_group("snowflake_mcp", "query_run_query") ->
+       "query"``). Any tool name with at least one underscore is
+       treated as ``{group}_{action}`` and the first segment becomes
+       the group.
+
+    A tool name with no underscore at all (or an empty name) has no
+    group to infer and falls back to ``"general"``, e.g.
+    ``infer_group("apollo", "search") -> "general"``.
     """
     prefix = f"{domain}_"
     if tool_name.startswith(prefix):
@@ -95,7 +111,8 @@ def infer_group(domain: str, tool_name: str) -> str:
         parts = remainder.split("_", 1)
         if parts[0]:
             return parts[0]
-    return "general"
+    parts = tool_name.split("_", 1)
+    return parts[0] if len(parts) == 2 and parts[0] else "general"
 
 
 class ToolEntry(BaseModel):
