@@ -232,7 +232,7 @@ class TestStructuralReuse:
         discover_data = await _call_discover(mcp)
         visible_names: set[str] = set()
         for d in discover_data["domains"]:
-            dom_data = await _call_discover(mcp, domain=d["name"])
+            dom_data = await _call_discover(mcp, domain=d["name"], format="schema")
             visible_names.update(t["name"] for t in dom_data["tools"])
 
         # Now trigger a suggestion. The garbage name should still fuzzy-match

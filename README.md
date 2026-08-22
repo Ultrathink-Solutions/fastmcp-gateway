@@ -65,7 +65,7 @@ The gateway starts on `http://0.0.0.0:8080/mcp` and exposes 4 tools to any MCP c
 
 ## How It Works
 
-1. **`discover_tools()`** — Call with no arguments to see all domains and tool counts. Call with `domain="apollo"` to see that domain's tools with descriptions. Pass `format="signatures"` to receive Python-style function signatures (`apollo_search(query: str, limit: int = None) -> any`) instead of the default JSON summary — useful when the LLM will subsequently write code against the listed tools.
+1. **`discover_tools()`** — Call with no arguments to see all domains and tool counts. Call with `domain="apollo"` to see that domain's tools with descriptions. Returns each tool as a Python-style function signature by default (`apollo_search(query: str, limit: int = None) -> any`) — useful when the LLM will subsequently write code against the listed tools. Pass `format="schema"` to receive the JSON summary instead.
 
 2. **`get_tool_schema("apollo_people_search")`** — Returns the full JSON Schema for a tool's parameters. Supports fuzzy matching.
 
@@ -322,7 +322,7 @@ export GATEWAY_CODE_MODE_MAX_NESTED_CALLS=50
 
 ### How the LLM uses it
 
-Call `discover_tools(format="signatures")` to get readable Python signatures first, then write code that calls those functions:
+Call `discover_tools(domain="crm")` (or with a `group=`/`query=`) to get readable Python signatures first — this is the default rendering for those modes; the no-argument call returns the JSON domain summary, and `format="schema"` opts any mode back into JSON. Then write code that calls those functions:
 
 ```python
 # What the LLM emits as the `code` argument to execute_code:
@@ -393,7 +393,8 @@ You have access to a tool discovery gateway with tools across these domains:
 - **apollo** (12 tools) — Apollo.io CRM and sales intelligence
 - **hubspot** (8 tools) — HubSpot CRM for contacts, companies, and deals
 
-Workflow: discover_tools() → get_tool_schema() → execute_tool()
+Workflow: discover_tools() → execute_tool() — discovery renders each tool as a callable signature.
+Call get_tool_schema() only when a signature is not enough.
 ```
 
 Instructions are automatically rebuilt when the registry changes during background refresh or dynamic registration. Custom `instructions=` passed at construction time are never overwritten.

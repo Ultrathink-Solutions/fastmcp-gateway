@@ -87,7 +87,7 @@ class TestDiscoverNoArgs:
 class TestDiscoverByDomain:
     @pytest.mark.asyncio
     async def test_lists_domain_tools(self, mcp_server: FastMCP) -> None:
-        data = await _call_discover(mcp_server, domain="apollo")
+        data = await _call_discover(mcp_server, domain="apollo", format="schema")
 
         assert data["domain"] == "apollo"
         assert len(data["tools"]) == 4
@@ -96,7 +96,7 @@ class TestDiscoverByDomain:
 
     @pytest.mark.asyncio
     async def test_tools_include_group(self, mcp_server: FastMCP) -> None:
-        data = await _call_discover(mcp_server, domain="apollo")
+        data = await _call_discover(mcp_server, domain="apollo", format="schema")
 
         tool = next(t for t in data["tools"] if t["name"] == "apollo_people_search")
         assert tool["group"] == "people"
@@ -119,7 +119,7 @@ class TestDiscoverByDomain:
 class TestDiscoverByGroup:
     @pytest.mark.asyncio
     async def test_lists_group_tools(self, mcp_server: FastMCP) -> None:
-        data = await _call_discover(mcp_server, domain="apollo", group="people")
+        data = await _call_discover(mcp_server, domain="apollo", group="people", format="schema")
 
         assert data["domain"] == "apollo"
         assert data["group"] == "people"
@@ -129,7 +129,7 @@ class TestDiscoverByGroup:
 
     @pytest.mark.asyncio
     async def test_group_tools_have_description(self, mcp_server: FastMCP) -> None:
-        data = await _call_discover(mcp_server, domain="apollo", group="people")
+        data = await _call_discover(mcp_server, domain="apollo", group="people", format="schema")
 
         tool = next(t for t in data["tools"] if t["name"] == "apollo_people_search")
         assert "Search for people" in tool["description"]
@@ -159,7 +159,7 @@ class TestDiscoverByGroup:
 class TestDiscoverByQuery:
     @pytest.mark.asyncio
     async def test_search_by_keyword(self, mcp_server: FastMCP) -> None:
-        data = await _call_discover(mcp_server, query="enrich")
+        data = await _call_discover(mcp_server, query="enrich", format="schema")
 
         assert data["query"] == "enrich"
         names = {r["name"] for r in data["results"]}
@@ -167,7 +167,7 @@ class TestDiscoverByQuery:
 
     @pytest.mark.asyncio
     async def test_search_cross_domain(self, mcp_server: FastMCP) -> None:
-        data = await _call_discover(mcp_server, query="search")
+        data = await _call_discover(mcp_server, query="search", format="schema")
 
         domains = {r["domain"] for r in data["results"]}
         assert "apollo" in domains
@@ -175,13 +175,13 @@ class TestDiscoverByQuery:
 
     @pytest.mark.asyncio
     async def test_search_no_results(self, mcp_server: FastMCP) -> None:
-        data = await _call_discover(mcp_server, query="nonexistent_xyz_123")
+        data = await _call_discover(mcp_server, query="nonexistent_xyz_123", format="schema")
 
         assert data["results"] == []
 
     @pytest.mark.asyncio
     async def test_search_results_include_domain(self, mcp_server: FastMCP) -> None:
-        data = await _call_discover(mcp_server, query="enrich")
+        data = await _call_discover(mcp_server, query="enrich", format="schema")
 
         for r in data["results"]:
             assert "domain" in r
@@ -191,7 +191,7 @@ class TestDiscoverByQuery:
     @pytest.mark.asyncio
     async def test_query_takes_priority_over_domain(self, mcp_server: FastMCP) -> None:
         """When query is provided alongside domain, query mode wins."""
-        data = await _call_discover(mcp_server, domain="apollo", query="deals")
+        data = await _call_discover(mcp_server, domain="apollo", query="deals", format="schema")
 
         # Should search across ALL domains, not filter by apollo
         assert data["query"] == "deals"
@@ -265,8 +265,35 @@ class TestDiscoverSignaturesFormat:
         assert "domains" in parsed
 
     @pytest.mark.asyncio
-    async def test_schema_format_unchanged(self, mcp_server: FastMCP) -> None:
-        """Default format=schema still returns JSON."""
-        data = await _call_discover(mcp_server, domain="apollo")
+    async def test_explicit_schema_format_returns_json(self, mcp_server: FastMCP) -> None:
+        """format="schema" (explicit) still returns the JSON summary."""
+        data = await _call_discover(mcp_server, domain="apollo", format="schema")
         assert data["domain"] == "apollo"
         assert "tools" in data
+
+    @pytest.mark.asyncio
+    async def test_default_format_is_signatures(self, mcp_server: FastMCP) -> None:
+        """No explicit ``format=`` renders signatures, not JSON, in domain and group modes."""
+        # Domain-only mode: default is signatures text, not JSON.
+        domain_out = await _call_discover_text(mcp_server, domain="apollo")
+        assert "apollo_people_search(" in domain_out
+        assert "apollo_people_enrich(" in domain_out
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(domain_out)
+
+        # Domain + group mode: default is signatures text, not JSON.
+        group_out = await _call_discover_text(mcp_server, domain="apollo", group="people")
+        assert "apollo_people_search(" in group_out
+        assert "apollo_org_search(" not in group_out
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(group_out)
+
+        # format="schema" explicitly still returns JSON.
+        schema_data = await _call_discover(mcp_server, domain="apollo", format="schema")
+        assert schema_data["domain"] == "apollo"
+        assert "tools" in schema_data
+
+        # The no-argument domain summary is unchanged: always JSON.
+        summary = await _call_discover(mcp_server)
+        assert "domains" in summary
+        assert summary["total_tools"] == 7

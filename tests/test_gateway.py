@@ -298,9 +298,12 @@ class TestDynamicInstructions:
             await gw.populate()
 
         instructions = gw.mcp.instructions
-        assert "discover_tools()" in instructions
+        workflow_line = next(line for line in instructions.splitlines() if line.startswith("Workflow:"))
+        # Structure, not prose: discovery precedes execution in the main
+        # workflow, and get_tool_schema is offered but not a mandatory step.
+        assert workflow_line.index("discover_tools()") < workflow_line.index("execute_tool()")
+        assert "get_tool_schema" not in workflow_line
         assert "get_tool_schema()" in instructions
-        assert "execute_tool()" in instructions
 
 
 # ---------------------------------------------------------------------------
