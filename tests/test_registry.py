@@ -22,12 +22,17 @@ class TestInferGroup:
         assert infer_group("hubspot", "hubspot_contacts_bulk_create") == "contacts"
 
     def test_no_domain_prefix(self) -> None:
-        """Tool name doesn't start with domain -> fallback to 'general'."""
-        assert infer_group("apollo", "search_people") == "general"
+        """Tool name doesn't start with the registered domain, but still
+        has an underscore -> falls back to the ``{group}_{action}``
+        convention rather than 'general' (ULT-7361)."""
+        assert infer_group("apollo", "search_people") == "search"
 
     def test_domain_only_prefix(self) -> None:
-        """Tool name is just the domain prefix with no remainder."""
-        assert infer_group("apollo", "apollo_") == "general"
+        """Tool name is just the domain prefix with no remainder after it
+        (empty group segment under the domain-prefix convention) ->
+        falls back to the ``{group}_{action}`` convention, splitting the
+        whole name on its first underscore (ULT-7361)."""
+        assert infer_group("apollo", "apollo_") == "apollo"
 
     def test_exact_domain_name(self) -> None:
         """Tool name equals the domain (no underscore suffix)."""
@@ -42,6 +47,21 @@ class TestInferGroup:
 
     def test_empty_tool_name(self) -> None:
         assert infer_group("apollo", "") == "general"
+
+    def test_group_action_convention_without_domain_prefix(self) -> None:
+        """axon_mcp_server tools follow ``{group}_{action}`` even when the
+        registered domain (e.g. an upstream MCP server name like
+        "snowflake_mcp") doesn't match the tool's own group prefix."""
+        assert infer_group("snowflake_mcp", "query_run_query") == "query"
+
+    def test_domain_prefix_convention_still_wins(self) -> None:
+        """Unchanged: a tool name prefixed by its own domain still infers
+        the group from the segment after that prefix."""
+        assert infer_group("apollo", "apollo_people_search") == "people"
+
+    def test_single_segment_name_falls_back_to_general(self) -> None:
+        """A tool name with no underscore at all has no group to infer."""
+        assert infer_group("x", "search") == "general"
 
 
 # ---------------------------------------------------------------------------
@@ -320,11 +340,24 @@ class TestPopulateDomain:
 
         assert set(empty_registry.get_groups_for_domain("mydom")) == {"alpha", "beta"}
 
-    def test_populate_fallback_group(self, empty_registry: ToolRegistry) -> None:
-        """Tools without the domain prefix get assigned to 'general'."""
+    def test_populate_group_action_fallback(self, empty_registry: ToolRegistry) -> None:
+        """Tools without the domain prefix, but still shaped as
+        ``{group}_{action}``, get their group from that convention
+        instead of 'general' (ULT-7361)."""
         raw_tools = [
             {"name": "standalone_tool", "inputSchema": {"type": "object"}},
             {"name": "another_one", "inputSchema": {"type": "object"}},
+        ]
+        empty_registry.populate_domain("mydom", "http://x:8080/mcp", raw_tools)
+
+        assert set(empty_registry.get_groups_for_domain("mydom")) == {"standalone", "another"}
+
+    def test_populate_fallback_group(self, empty_registry: ToolRegistry) -> None:
+        """A tool name with no underscore at all -- no group to infer --
+        still falls back to 'general'."""
+        raw_tools = [
+            {"name": "standalone", "inputSchema": {"type": "object"}},
+            {"name": "another", "inputSchema": {"type": "object"}},
         ]
         empty_registry.populate_domain("mydom", "http://x:8080/mcp", raw_tools)
 
