@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from typing import TYPE_CHECKING, Any, ClassVar
 from unittest.mock import patch
 
@@ -11,6 +10,7 @@ from fastmcp import Client, FastMCP
 
 from fastmcp_gateway.client_manager import UpstreamManager
 from fastmcp_gateway.meta_tools import _suggest_tool_names, register_meta_tools
+from tests.conftest import result_payload
 
 if TYPE_CHECKING:
     from fastmcp_gateway.registry import ToolRegistry
@@ -33,12 +33,7 @@ async def _call_schema(mcp: FastMCP, tool_name: str) -> dict[str, Any]:
     """Helper: call get_tool_schema via in-process client and parse JSON."""
     async with Client(mcp) as client:
         result = await client.call_tool("get_tool_schema", {"tool_name": tool_name})
-    if result.data is not None:
-        text = str(result.data)
-    else:
-        content_block = result.content[0]
-        text = content_block.text  # type: ignore[union-attr]
-    return json.loads(text)
+    return result_payload(result)
 
 
 # ---------------------------------------------------------------------------

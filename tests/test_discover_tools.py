@@ -11,6 +11,7 @@ from fastmcp import Client, FastMCP
 
 from fastmcp_gateway.client_manager import UpstreamManager
 from fastmcp_gateway.meta_tools import register_meta_tools
+from tests.conftest import result_payload, result_text
 
 if TYPE_CHECKING:
     from fastmcp_gateway.registry import ToolRegistry
@@ -39,13 +40,7 @@ async def _call_discover(mcp: FastMCP, **kwargs: str | None) -> dict:
     """Helper: call discover_tools via in-process client and parse JSON."""
     async with Client(mcp) as client:
         result = await client.call_tool("discover_tools", {k: v for k, v in kwargs.items() if v is not None})
-    # result.data is the parsed return value for in-process calls
-    if result.data is not None:
-        text = str(result.data)
-    else:
-        content_block = result.content[0]
-        text = content_block.text  # type: ignore[union-attr]
-    return json.loads(text)
+    return result_payload(result)
 
 
 # ---------------------------------------------------------------------------
@@ -225,10 +220,7 @@ async def _call_discover_text(mcp: FastMCP, **kwargs: object) -> str:
     """Helper: call discover_tools and return the raw string (skip JSON parse)."""
     async with Client(mcp) as client:
         result = await client.call_tool("discover_tools", {k: v for k, v in kwargs.items() if v is not None})
-    if result.data is not None:
-        return str(result.data)
-    content_block = result.content[0]
-    return content_block.text  # type: ignore[union-attr]
+    return result_text(result)
 
 
 class TestDiscoverSignaturesFormat:

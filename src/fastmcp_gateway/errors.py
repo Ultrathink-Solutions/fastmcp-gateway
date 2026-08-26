@@ -37,6 +37,31 @@ class GatewayError(BaseModel):
     details: dict[str, Any] | None = None
 
 
+def error_payload(code: str, message: str, **details: Any) -> dict[str, Any]:
+    """Build a ``GatewayError`` as a plain dict.
+
+    The dict form exists so a meta-tool can put the error on MCP's
+    ``structuredContent`` channel without a ``json.dumps`` /
+    ``json.loads`` round trip through :func:`error_response`. Both
+    functions share this one construction, so the two channels can never
+    disagree about an error's shape.
+
+    Parameters
+    ----------
+    code:
+        Machine-readable code such as ``"tool_not_found"``.
+    message:
+        Human-readable description of the error.
+    **details:
+        Arbitrary key-value pairs included in the ``details`` dict.
+    """
+    return GatewayError(
+        error=message,
+        code=code,
+        details=details or None,
+    ).model_dump()
+
+
 def error_response(code: str, message: str, **details: Any) -> str:
     """Build a JSON-serialised ``GatewayError``.
 
@@ -49,10 +74,4 @@ def error_response(code: str, message: str, **details: Any) -> str:
     **details:
         Arbitrary key-value pairs included in the ``details`` dict.
     """
-    return json.dumps(
-        GatewayError(
-            error=message,
-            code=code,
-            details=details or None,
-        ).model_dump()
-    )
+    return json.dumps(error_payload(code, message, **details))

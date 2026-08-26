@@ -12,7 +12,7 @@ from fastmcp.tools import ToolResult
 from mcp.types import TextContent, ToolAnnotations
 from opentelemetry import trace
 
-from fastmcp_gateway.errors import error_response
+from fastmcp_gateway.errors import error_payload, error_response
 from fastmcp_gateway.hooks import ExecutionContext, ExecutionDenied, HookRunner, ListToolsContext
 from fastmcp_gateway.signatures import extract_params, tool_to_signature
 
@@ -50,6 +50,66 @@ def _signatures_block(tools: list[ToolEntry]) -> str:
     if not tools:
         return ""
     return "\n\n".join(tool_to_signature(t) for t in tools)
+
+
+def _json_result(payload: dict[str, Any]) -> ToolResult:
+    """Carry *payload* on both MCP result channels.
+
+    The text block stays exactly what a caller reading ``content[0].text``
+    has always received -- ``json.dumps`` of the payload -- while
+    ``structured_content`` carries the same data as an object.
+
+    Returning a ``ToolResult`` rather than the JSON string is what keeps
+    the two channels honest. A meta-tool annotated ``-> str`` returns a
+    *non-object*, and MCP requires ``structuredContent`` to be an object,
+    so FastMCP wraps the return in ``{"result": <the JSON string>}``
+    (``fastmcp.tools.function_parsing`` sets ``x-fastmcp-wrap-result`` on
+    the derived output schema; ``fastmcp.tools.base`` applies it). The
+    payload is then encoded twice: once here, once by the client
+    rendering that wrapper object -- so every quote inside it reaches the
+    caller as ``\\"`` and every newline as ``\\n``. Consumers pay the
+    escaping in tokens and have to ``json.loads(data["result"])`` to
+    reach data the structured channel was supposed to hand them
+    directly.
+
+    Every call site must also pass ``output_schema=None`` to
+    ``@mcp.tool``; without it FastMCP derives a schema from the
+    ``-> ToolResult`` annotation and re-applies the same wrap to the
+    result's text.
+    """
+    return ToolResult(
+        content=[TextContent(type="text", text=json.dumps(payload))],
+        structured_content=payload,
+    )
+
+
+def _prose_result(text: str) -> ToolResult:
+    """Carry free text on the text channel only.
+
+    ``structured_content`` is left unset because there is no object to
+    put there -- the signatures block is prose for a model to read, not
+    data. That is a deliberate contrast with :func:`_json_result`: the
+    ``-> str`` annotation this replaces used to publish the prose as
+    ``{"result": "<the whole block>"}``, a structured channel whose only
+    field was the text already present on the text channel.
+    """
+    return ToolResult(
+        content=[TextContent(type="text", text=text)],
+        structured_content=None,
+    )
+
+
+def _gateway_error_result(code: str, message: str, **details: Any) -> ToolResult:
+    """A :class:`~fastmcp_gateway.errors.GatewayError` on both channels.
+
+    Discovery errors are authored by the gateway itself, so unlike
+    ``execute_tool``'s ``_error_result`` -- which withholds
+    ``structured_content`` because a gateway-level failure has no
+    upstream ``CallToolResult`` to source it from -- there is a
+    first-party object to publish here, and a caller can branch on
+    ``code`` without parsing text.
+    """
+    return _json_result(error_payload(code, message, **details))
 
 
 def _suggest_tool_names(query: str, all_names: list[str], max_suggestions: int = 3) -> list[str]:
@@ -159,13 +219,20 @@ def register_meta_tools(
         visible = await _filter_tools(all_tools, None)
         return sorted(t.name for t in visible)
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True))
+    @mcp.tool(
+        annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
+        # output_schema=None stops FastMCP deriving an output schema from
+        # the return annotation and re-wrapping the result's text as
+        # {"result": ...}; see _json_result for why that wrap
+        # double-encodes the payload.
+        output_schema=None,
+    )
     async def discover_tools(
         domain: str | None = None,
         group: str | None = None,
         query: str | None = None,
         format: Literal["schema", "signatures"] = "signatures",
-    ) -> str:
+    ) -> ToolResult:
         """Browse available tools by domain, group, or keyword.
 
         Call with no arguments to see all available domains and their tool counts.
@@ -194,8 +261,8 @@ def register_meta_tools(
                 results = await _filter_tools(registry.search(query), None)
                 span.set_attribute("gateway.result_count", len(results))
                 if format == "signatures":
-                    return _signatures_block(results)
-                return json.dumps(
+                    return _prose_result(_signatures_block(results))
+                return _json_result(
                     {
                         "query": query,
                         "results": [
@@ -238,7 +305,7 @@ def register_meta_tools(
                     )
 
                 span.set_attribute("gateway.result_count", len(result_domains))
-                return json.dumps(
+                return _json_result(
                     {
                         "domains": result_domains,
                         "total_tools": len(filtered),
@@ -249,7 +316,7 @@ def register_meta_tools(
             if not registry.has_domain(domain):
                 available = registry.get_domain_names()
                 span.set_attribute("gateway.error_code", "domain_not_found")
-                return error_response(
+                return _gateway_error_result(
                     "domain_not_found",
                     f"Unknown domain '{domain}'. Available domains: {', '.join(available)}"
                     if available
@@ -266,7 +333,7 @@ def register_meta_tools(
                     msg = (
                         f"Unknown group '{group}' in domain '{domain}'. Available groups: {', '.join(available_groups)}"
                     )
-                    return error_response(
+                    return _gateway_error_result(
                         "group_not_found",
                         msg,
                         domain=domain,
@@ -276,8 +343,8 @@ def register_meta_tools(
                 tools = await _filter_tools(registry.get_tools_by_group(domain, group), domain)
                 span.set_attribute("gateway.result_count", len(tools))
                 if format == "signatures":
-                    return _signatures_block(tools)
-                return json.dumps(
+                    return _prose_result(_signatures_block(tools))
+                return _json_result(
                     {
                         "domain": domain,
                         "group": group,
@@ -289,8 +356,8 @@ def register_meta_tools(
             tools = await _filter_tools(registry.get_tools_by_domain(domain), domain)
             span.set_attribute("gateway.result_count", len(tools))
             if format == "signatures":
-                return _signatures_block(tools)
-            return json.dumps(
+                return _prose_result(_signatures_block(tools))
+            return _json_result(
                 {
                     "domain": domain,
                     "tools": [
@@ -304,8 +371,15 @@ def register_meta_tools(
                 }
             )
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
-    async def get_tool_schema(tool_name: str) -> str:
+    @mcp.tool(
+        annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
+        # output_schema=None stops FastMCP deriving an output schema from
+        # the return annotation and re-wrapping the result's text as
+        # {"result": ...}; see _json_result for why that wrap
+        # double-encodes the payload.
+        output_schema=None,
+    )
+    async def get_tool_schema(tool_name: str) -> ToolResult:
         """Get the full parameter schema for a specific tool.
 
         Call this after discover_tools to get the complete input schema
@@ -324,7 +398,7 @@ def register_meta_tools(
 
             if entry is not None:
                 span.set_attribute("gateway.domain", entry.domain)
-                return json.dumps(
+                return _json_result(
                     {
                         "name": entry.name,
                         "domain": entry.domain,
@@ -341,7 +415,7 @@ def register_meta_tools(
             else:
                 hint = "Use discover_tools to browse available tools."
             span.set_attribute("gateway.error_code", "tool_not_found")
-            return error_response(
+            return _gateway_error_result(
                 "tool_not_found",
                 f"Unknown tool '{tool_name}'. {hint}",
                 tool_name=tool_name,

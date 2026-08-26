@@ -14,7 +14,6 @@ suggestion path reconstructs its own parallel filter.
 
 from __future__ import annotations
 
-import json
 from typing import Any
 from unittest.mock import patch
 
@@ -25,6 +24,7 @@ from fastmcp_gateway.client_manager import UpstreamManager
 from fastmcp_gateway.hooks import HookRunner, ListToolsContext
 from fastmcp_gateway.meta_tools import register_meta_tools
 from fastmcp_gateway.registry import ToolEntry, ToolRegistry
+from tests.conftest import result_payload
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -101,34 +101,19 @@ def _build_mcp(hook: Any | None = None) -> FastMCP:
 async def _call_get_schema(mcp: FastMCP, tool_name: str) -> dict[str, Any]:
     async with Client(mcp) as client:
         result = await client.call_tool("get_tool_schema", {"tool_name": tool_name})
-    if result.data is not None:
-        text = str(result.data)
-    else:
-        content_block = result.content[0]
-        text = content_block.text  # type: ignore[union-attr]
-    return json.loads(text)
+    return result_payload(result)
 
 
 async def _call_execute(mcp: FastMCP, tool_name: str) -> dict[str, Any]:
     async with Client(mcp) as client:
         result = await client.call_tool("execute_tool", {"tool_name": tool_name, "arguments": {}})
-    if result.data is not None:
-        text = str(result.data)
-    else:
-        content_block = result.content[0]
-        text = content_block.text  # type: ignore[union-attr]
-    return json.loads(text)
+    return result_payload(result)
 
 
 async def _call_discover(mcp: FastMCP, **kwargs: Any) -> dict[str, Any]:
     async with Client(mcp) as client:
         result = await client.call_tool("discover_tools", {k: v for k, v in kwargs.items() if v is not None})
-    if result.data is not None:
-        text = str(result.data)
-    else:
-        content_block = result.content[0]
-        text = content_block.text  # type: ignore[union-attr]
-    return json.loads(text)
+    return result_payload(result)
 
 
 # ---------------------------------------------------------------------------

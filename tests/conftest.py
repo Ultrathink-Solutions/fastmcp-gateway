@@ -1,9 +1,10 @@
-"""Shared test fixtures for fastmcp-gateway tests."""
+"""Shared test fixtures and result readers for fastmcp-gateway tests."""
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -13,6 +14,30 @@ from fastmcp_gateway.registry import ToolEntry, ToolRegistry
 if TYPE_CHECKING:
     from collections.abc import Callable
     from contextlib import AbstractContextManager
+
+
+def result_text(result: Any) -> str:
+    """The first text block of a tool result."""
+    return cast("str", result.content[0].text)
+
+
+def result_payload(result: Any) -> dict[str, Any]:
+    """A tool result's JSON payload, preferring MCP's structured channel.
+
+    A meta-tool that answers with JSON publishes the same object on both
+    channels, and reading ``structuredContent`` is what an MCP-aware
+    caller does -- so that is what these assertions exercise. A tool that
+    answers with prose leaves it unset, hence the text-block fallback.
+
+    Deliberately not ``str(result.data)``. That idiom only ever yielded
+    JSON because a ``-> str`` meta-tool got its return wrapped as
+    ``{"result": <the JSON string>}`` and ``.data`` unwrapped it back to
+    the string. Against a tool publishing a genuine object, ``str()``
+    yields a Python repr -- single-quoted, and not JSON at all.
+    """
+    if isinstance(result.structured_content, dict):
+        return result.structured_content
+    return cast("dict[str, Any]", json.loads(result_text(result)))
 
 
 @dataclass
