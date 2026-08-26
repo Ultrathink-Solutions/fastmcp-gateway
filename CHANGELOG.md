@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.30.0] - 2026-08-26
+
+### Fixed
+
+- **`discover_tools` and `get_tool_schema` no longer double-encode their payload.** Both were annotated `-> str` and returned `json.dumps(...)`. MCP requires `structuredContent` to be an object, so FastMCP derives an output schema for a non-object return, marks it `x-fastmcp-wrap-result`, and publishes the return as `{"result": <the JSON string>}` -- encoding the payload a second time. A consumer received an escaped quote for every quote and a literal `\n` for every newline, paid that escaping in tokens on every call, and had to `json.loads(data["result"])` to reach data the structured channel was meant to hand it directly. Both tools now return `ToolResult` with an explicit `output_schema=None` -- the pattern `execute_tool` has always used -- so `structuredContent` carries the payload object itself. The two never picked it up because they resolve locally from the registry and so never pass through the `transform_result` lifecycle that repopulates `structured_content` for upstream dispatch. (#88)
+
+  **Compatibility:** the text channel is unchanged. `content[0].text` is still `json.dumps` of the same payload, byte for byte, so a consumer parsing the text block is unaffected. The visible difference is for structured-content-aware clients: `result.data` now yields the payload object where it previously yielded a JSON string. A client doing `json.loads(result.data)` or `data["result"]` against either tool should read the object directly instead. The `format="signatures"` block, being prose rather than data, now leaves `structuredContent` unset where it previously arrived as `{"result": "<the whole block>"}`.
+
 ## [0.29.0] - 2026-08-22
 
 ### Changed
