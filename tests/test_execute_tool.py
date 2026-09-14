@@ -8,6 +8,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from fastmcp import Client, FastMCP
 
@@ -15,8 +16,11 @@ from fastmcp_gateway.client_manager import UpstreamManager
 from fastmcp_gateway.hooks import ExecutionContext, HookRunner
 from fastmcp_gateway.meta_tools import register_meta_tools
 from fastmcp_gateway.registry import ToolEntry
+from tests.conftest import upstream_status_error
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from fastmcp_gateway.registry import ToolRegistry
 
 
@@ -175,6 +179,148 @@ class TestExecuteToolUpstreamError:
         assert "Invalid parameter" in data["error"]
         assert data["details"]["tool"] == "apollo_people_search"
         assert "result" not in data
+
+
+# ---------------------------------------------------------------------------
+# Error: upstream refused the call
+# ---------------------------------------------------------------------------
+
+_SCOPE_CHALLENGE = 'Bearer realm="mcp", error="insufficient_scope", scope="people:read"'
+
+
+def _wrapped_by_cause(inner: Exception) -> Exception:
+    outer = RuntimeError("upstream call failed")
+    outer.__cause__ = inner
+    return outer
+
+
+def _wrapped_in_group(inner: Exception) -> Exception:
+    return ExceptionGroup("upstream call failed", [inner])
+
+
+class TestExecuteToolUpstreamRefusal:
+    """An upstream MCP server that enforces per-tool scopes refuses a call
+    with 401/403, and a 403 carrying an RFC 6750 ``insufficient_scope``
+    challenge names the scope the caller lacks. Neither is an outage, so the
+    envelope says which one it is instead of a generic execution error."""
+
+    @pytest.mark.asyncio
+    async def test_insufficient_scope_challenge_is_a_scope_denial(
+        self, mcp_server: FastMCP, manager: UpstreamManager
+    ) -> None:
+        manager.execute_tool = AsyncMock(side_effect=upstream_status_error(403, _SCOPE_CHALLENGE))  # type: ignore[method-assign]
+
+        data = await _call_execute(mcp_server, "apollo_people_search", {"query": "Jane"})
+
+        assert data["code"] == "upstream_insufficient_scope"
+        assert data["details"]["required_scope"] == "people:read"
+        assert data["details"]["upstream_status"] == 403
+        assert data["details"]["domain"] == "apollo"
+        assert data["details"]["tool"] == "apollo_people_search"
+
+    @pytest.mark.asyncio
+    async def test_scope_denial_without_a_scope_parameter(self, mcp_server: FastMCP, manager: UpstreamManager) -> None:
+        manager.execute_tool = AsyncMock(  # type: ignore[method-assign]
+            side_effect=upstream_status_error(403, 'Bearer realm="mcp", error="insufficient_scope"')
+        )
+
+        data = await _call_execute(mcp_server, "apollo_people_search", {"query": "Jane"})
+
+        assert data["code"] == "upstream_insufficient_scope"
+        assert data["details"]["required_scope"] is None
+        assert data["details"]["upstream_status"] == 403
+
+    @pytest.mark.parametrize(
+        ("status_code", "www_authenticate"),
+        [
+            (401, None),
+            (401, _SCOPE_CHALLENGE),
+            (403, None),
+            (403, 'Bearer realm="mcp", error="invalid_token"'),
+        ],
+        ids=["401", "401-with-scope-challenge", "403-without-challenge", "403-invalid-token"],
+    )
+    @pytest.mark.asyncio
+    async def test_other_refusals_are_unauthorized(
+        self,
+        mcp_server: FastMCP,
+        manager: UpstreamManager,
+        status_code: int,
+        www_authenticate: str | None,
+    ) -> None:
+        manager.execute_tool = AsyncMock(side_effect=upstream_status_error(status_code, www_authenticate))  # type: ignore[method-assign]
+
+        data = await _call_execute(mcp_server, "apollo_people_search", {"query": "Jane"})
+
+        assert data["code"] == "upstream_unauthorized"
+        assert data["details"]["upstream_status"] == status_code
+        assert data["details"]["domain"] == "apollo"
+        assert data["details"]["tool"] == "apollo_people_search"
+
+    @pytest.mark.parametrize("wrap", [_wrapped_by_cause, _wrapped_in_group], ids=["cause", "exception-group"])
+    @pytest.mark.asyncio
+    async def test_wrapped_refusal_is_read_from_the_wrapped_response(
+        self,
+        mcp_server: FastMCP,
+        manager: UpstreamManager,
+        wrap: Callable[[Exception], Exception],
+    ) -> None:
+        """Status and challenge both come from the response of the exception
+        that carries one, not from the wrapper around it."""
+        manager.execute_tool = AsyncMock(side_effect=wrap(upstream_status_error(403, _SCOPE_CHALLENGE)))  # type: ignore[method-assign]
+
+        data = await _call_execute(mcp_server, "apollo_people_search", {"query": "Jane"})
+
+        assert data["code"] == "upstream_insufficient_scope"
+        assert data["details"]["required_scope"] == "people:read"
+        assert data["details"]["upstream_status"] == 403
+
+    @pytest.mark.parametrize(
+        "error",
+        [httpx.ConnectError("connection refused"), upstream_status_error(500)],
+        ids=["connect-error", "http-500"],
+    )
+    @pytest.mark.asyncio
+    async def test_other_upstream_failures_stay_execution_errors(
+        self, mcp_server: FastMCP, manager: UpstreamManager, error: Exception
+    ) -> None:
+        manager.execute_tool = AsyncMock(side_effect=error)  # type: ignore[method-assign]
+
+        data = await _call_execute(mcp_server, "apollo_people_search", {"query": "Jane"})
+
+        assert data["code"] == "execution_error"
+        assert data["details"] == {"tool": "apollo_people_search", "domain": "apollo"}
+
+    @pytest.mark.parametrize(
+        ("refusal", "code"),
+        [
+            (upstream_status_error(403, _SCOPE_CHALLENGE), "upstream_insufficient_scope"),
+            (upstream_status_error(401), "upstream_unauthorized"),
+        ],
+        ids=["insufficient-scope", "unauthorized"],
+    )
+    @pytest.mark.asyncio
+    async def test_refusals_run_on_error_hooks(
+        self,
+        populated_registry: ToolRegistry,
+        manager: UpstreamManager,
+        refusal: Exception,
+        code: str,
+    ) -> None:
+        seen: list[Exception] = []
+
+        class RecordingHook:
+            async def on_error(self, context: ExecutionContext, error: Exception) -> None:
+                seen.append(error)
+
+        manager.execute_tool = AsyncMock(side_effect=refusal)  # type: ignore[method-assign]
+        mcp = FastMCP("test-gateway")
+        register_meta_tools(mcp, populated_registry, manager, HookRunner([RecordingHook()]))
+
+        data = await _call_execute(mcp, "apollo_people_search", {"query": "Jane"})
+
+        assert data["code"] == code
+        assert seen == [refusal]
 
 
 # ---------------------------------------------------------------------------

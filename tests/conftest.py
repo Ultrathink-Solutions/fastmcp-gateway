@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 from fastmcp_gateway.registry import ToolEntry, ToolRegistry
@@ -38,6 +39,16 @@ def result_payload(result: Any) -> dict[str, Any]:
     if isinstance(result.structured_content, dict):
         return result.structured_content
     return cast("dict[str, Any]", json.loads(result_text(result)))
+
+
+def upstream_status_error(status_code: int, www_authenticate: str | None = None) -> httpx.HTTPStatusError:
+    """The exception httpx raises for a non-2xx upstream response, with an optional challenge."""
+    headers = {} if www_authenticate is None else {"WWW-Authenticate": www_authenticate}
+    return httpx.HTTPStatusError(
+        f"upstream answered {status_code}",
+        request=httpx.Request("POST", "http://upstream:8080/mcp"),
+        response=httpx.Response(status_code, headers=headers),
+    )
 
 
 @dataclass
