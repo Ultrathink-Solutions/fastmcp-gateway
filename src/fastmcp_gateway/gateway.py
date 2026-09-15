@@ -16,6 +16,7 @@ from opentelemetry import trace
 
 from fastmcp_gateway.access_policy import AccessPolicy, normalize_upstreams
 from fastmcp_gateway.client_manager import UpstreamManager
+from fastmcp_gateway.errors import _find_upstream_response
 from fastmcp_gateway.hooks import HookRunner
 from fastmcp_gateway.output_guard import OutputGuardConfig, OutputGuardHook
 from fastmcp_gateway.registration_auth import (
@@ -154,19 +155,6 @@ _UPSTREAM_AUTH_ERRORS: tuple[type[BaseException], ...] = (httpx.HTTPStatusError,
 # ``Retry-After`` header value. Matches the registry-controller's default
 # poll interval — a single missed cycle, then back to the normal rhythm.
 _UPSTREAM_RETRY_AFTER_SECONDS = 5
-
-
-def _extract_upstream_status_code(exc: BaseException) -> int | None:
-    """Pull the upstream status code from an exception when one is attached.
-
-    ``httpx.HTTPStatusError`` carries ``exc.response.status_code``;
-    other exception shapes return ``None`` and the caller logs the
-    type-name instead.
-    """
-    response = getattr(exc, "response", None)
-    if response is None:
-        return None
-    return getattr(response, "status_code", None)
 
 
 def _scrub_url_for_diagnostics(url: str) -> str:
@@ -1113,7 +1101,8 @@ class GatewayServer:
                     headers={"Retry-After": str(_UPSTREAM_RETRY_AFTER_SECONDS)},
                 )
             except _UPSTREAM_AUTH_ERRORS as exc:
-                upstream_status = _extract_upstream_status_code(exc)
+                upstream_response = _find_upstream_response(exc)
+                upstream_status = None if upstream_response is None else upstream_response.status_code
                 # Only 401/403 from the upstream maps to a caller-fixable
                 # auth-config error. Other status codes (404 missing
                 # endpoint, 5xx upstream-internal, etc.) are not

@@ -12,7 +12,7 @@ from fastmcp.tools import ToolResult
 from mcp.types import TextContent, ToolAnnotations
 from opentelemetry import trace
 
-from fastmcp_gateway.errors import error_payload, error_response
+from fastmcp_gateway.errors import _find_upstream_response, error_payload, error_response, parse_www_authenticate
 from fastmcp_gateway.hooks import ExecutionContext, ExecutionDenied, HookRunner, ListToolsContext
 from fastmcp_gateway.signatures import extract_params, tool_to_signature
 
@@ -561,22 +561,50 @@ def register_meta_tools(
                     **execute_kwargs,
                 )
             except Exception as exc:  # Broad catch: gateway must not crash from upstream failures
-                span.set_attribute("gateway.error_code", "execution_error")
+                # An upstream that enforces per-tool scopes refuses a call with
+                # 401/403, and a 403 carrying an RFC 6750 ``insufficient_scope``
+                # challenge also names the scope the caller lacks. Neither is an
+                # upstream failure, so each gets its own code. Status and
+                # challenge are read from the same response.
+                # Classification must never raise, or the span, the on_error hook
+                # and the envelope are all lost. Only a ``str`` challenge is parsed
+                # (other header shapes classify by status alone), and a response
+                # that can't be read at all falls back to ``execution_error``.
+                try:
+                    response = _find_upstream_response(exc)
+                    status = None if response is None else response.status_code
+                    get_header = getattr(getattr(response, "headers", None), "get", None)
+                    challenge = get_header("WWW-Authenticate") if callable(get_header) else None
+                    auth_error, required_scope = parse_www_authenticate(
+                        challenge if isinstance(challenge, str) else None
+                    )
+                except Exception:  # Unreadable upstream response: classify as a plain execution error.
+                    status, auth_error, required_scope = None, None, None
+
+                details: dict[str, Any] = {"tool": tool_name, "domain": entry.domain}
+                if status == 403 and auth_error == "insufficient_scope":
+                    code = "upstream_insufficient_scope"
+                    message = f"Tool '{tool_name}' was refused by upstream server '{entry.domain}': insufficient scope."
+                    details.update(upstream_status=status, required_scope=required_scope)
+                elif status in (401, 403):
+                    code = "upstream_unauthorized"
+                    message = f"Tool '{tool_name}' was refused by upstream server '{entry.domain}': not authorized."
+                    details.update(upstream_status=status)
+                else:
+                    code = "execution_error"
+                    message = (
+                        f"Tool '{tool_name}' failed: "
+                        f"upstream server '{entry.domain}' returned an error. "
+                        "Other domains may still be available."
+                    )
+
+                span.set_attribute("gateway.error_code", code)
                 span.record_exception(exc)
 
                 if execution_ctx is not None and hook_runner.has_hooks:
                     await hook_runner.run_on_error(execution_ctx, exc)
 
-                return _error_result(
-                    error_response(
-                        "execution_error",
-                        f"Tool '{tool_name}' failed: "
-                        f"upstream server '{entry.domain}' returned an error. "
-                        "Other domains may still be available.",
-                        tool=tool_name,
-                        domain=entry.domain,
-                    )
-                )
+                return _error_result(error_response(code, message, **details))
 
             # Allow hooks to transform the raw ``CallToolResult`` before
             # any content-block flattening or envelope wrapping.  Hooks

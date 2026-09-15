@@ -364,12 +364,18 @@ All meta-tools return structured JSON errors with a `code` field for programmati
 {"error": "Unknown tool 'crm_contacts'.", "code": "tool_not_found", "details": {"suggestions": ["crm_contacts_search"]}}
 ```
 
-Error codes: `tool_not_found`, `invalid_arguments`, `domain_not_found`, `group_not_found`, `execution_error`, `upstream_error`, `refresh_error`.
+Error codes: `tool_not_found`, `invalid_arguments`, `domain_not_found`, `group_not_found`, `execution_error`, `upstream_unauthorized`, `upstream_insufficient_scope`, `upstream_error`, `refresh_error`.
 
 `invalid_arguments` fires when `execute_tool`'s `arguments` don't match the target tool's declared schema (an unknown key, or a required key missing) -- checked locally before the call ever reaches the upstream server. The error's `details` carry the tool's full expected signature (the same rendering `discover_tools(format="signatures")` produces), so a caller that guessed wrong gets the correction in the first error instead of a second blind guess:
 
 ```json
 {"error": "Invalid arguments for 'apollo_people_search': missing required argument(s) 'query'.", "code": "invalid_arguments", "details": {"tool": "apollo_people_search", "domain": "apollo", "signature": "apollo_people_search(query: str) -> any\n  Search for people by name, title, company, or other criteria"}}
+```
+
+`upstream_unauthorized` and `upstream_insufficient_scope` fire when the upstream server refuses the call rather than failing it -- an upstream that enforces per-tool authorization answers 401 or 403. A 403 carrying an RFC 6750 `insufficient_scope` challenge (`WWW-Authenticate: Bearer error="insufficient_scope", scope="..."`) becomes `upstream_insufficient_scope`, with the challenge's `scope` in `details.required_scope` (`null` when the challenge names none); any other 401 or 403 becomes `upstream_unauthorized`. Both carry `details.upstream_status`. Neither succeeds on retry without a change to the caller's credentials or grants, which is what sets them apart from `execution_error`:
+
+```json
+{"error": "Tool 'apollo_people_search' was refused by upstream server 'apollo': insufficient scope.", "code": "upstream_insufficient_scope", "details": {"tool": "apollo_people_search", "domain": "apollo", "upstream_status": 403, "required_scope": "people:read"}}
 ```
 
 ## Tool Name Collisions

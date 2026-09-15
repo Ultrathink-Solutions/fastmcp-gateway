@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
 if TYPE_CHECKING:
     from collections.abc import Generator
+
+    from fastmcp_gateway.hooks import ExecutionContext
 
 import httpx
 import pytest
@@ -21,8 +24,10 @@ import fastmcp_gateway.meta_tools as mt_mod
 import fastmcp_gateway.registry as reg_mod
 from fastmcp_gateway.client_manager import UpstreamManager
 from fastmcp_gateway.gateway import GatewayServer
+from fastmcp_gateway.hooks import HookRunner
 from fastmcp_gateway.meta_tools import register_meta_tools
 from fastmcp_gateway.registry import ToolRegistry
+from tests.conftest import result_payload, upstream_status_error
 
 
 @pytest.fixture(autouse=True)
@@ -169,6 +174,29 @@ class TestGetToolSchemaSpans:
         assert attrs.get("gateway.error_code") == "tool_not_found"
 
 
+class _ResponseCarryingError(Exception):
+    """A non-httpx exception exposing an HTTP-shaped ``response``."""
+
+    def __init__(self, response: object) -> None:
+        super().__init__("upstream refused the call")
+        self.response = response
+
+
+class _RaisingHeaders:
+    """Headers whose ``get`` is callable but raises."""
+
+    def get(self, name: str) -> str:
+        raise RuntimeError(f"cannot read header {name}")
+
+
+class _ResponsePropertyRaisesError(Exception):
+    """An exception whose ``response`` property raises something other than ``AttributeError``."""
+
+    @property
+    def response(self) -> object:
+        raise RuntimeError("response unavailable")
+
+
 class TestExecuteToolSpans:
     @pytest.mark.asyncio
     async def test_success_creates_span(
@@ -208,6 +236,103 @@ class TestExecuteToolSpans:
         # Should have recorded the exception
         events = spans[0].events
         assert any(e.name == "exception" for e in events)
+
+    @pytest.mark.asyncio
+    async def test_scope_denial_records_its_error_code(
+        self, mcp_server: FastMCP, manager: UpstreamManager, exporter: InMemorySpanExporter
+    ) -> None:
+        """An upstream insufficient_scope refusal records its own error_code and the exception."""
+        denial = upstream_status_error(403, 'Bearer error="insufficient_scope", scope="people:read"')
+        manager.execute_tool = AsyncMock(side_effect=denial)  # type: ignore[method-assign]
+
+        async with Client(mcp_server) as client:
+            await client.call_tool("execute_tool", {"tool_name": "apollo_people_search"})
+
+        spans = _get_spans(exporter, "gateway.execute_tool")
+        assert len(spans) == 1
+        attrs = dict(spans[0].attributes or {})
+        assert attrs.get("gateway.error_code") == "upstream_insufficient_scope"
+        assert any(e.name == "exception" for e in spans[0].events)
+
+    @pytest.mark.parametrize(
+        "headers",
+        [object(), {"WWW-Authenticate": b'Bearer error="insufficient_scope", scope="people:read"'}],
+        ids=["headers-without-get", "bytes-challenge"],
+    )
+    @pytest.mark.asyncio
+    async def test_unreadable_challenge_is_still_classified_recorded_and_hooked(
+        self,
+        populated_registry: ToolRegistry,
+        manager: UpstreamManager,
+        exporter: InMemorySpanExporter,
+        headers: object,
+    ) -> None:
+        """The refusal path never raises: a status-bearing exception whose headers
+        can't yield a ``str`` challenge is classified by status alone, and the
+        exception still reaches the span and the ``on_error`` hook."""
+        seen: list[Exception] = []
+
+        class RecordingHook:
+            async def on_error(self, context: ExecutionContext, error: Exception) -> None:
+                seen.append(error)
+
+        failure = _ResponseCarryingError(SimpleNamespace(status_code=403, headers=headers))
+        manager.execute_tool = AsyncMock(side_effect=failure)  # type: ignore[method-assign]
+        mcp = FastMCP("test-gateway")
+        register_meta_tools(mcp, populated_registry, manager, HookRunner([RecordingHook()]))
+
+        async with Client(mcp) as client:
+            result = await client.call_tool("execute_tool", {"tool_name": "apollo_people_search"}, raise_on_error=False)
+
+        assert result.is_error is False
+        assert result_payload(result)["code"] == "upstream_unauthorized"
+        assert seen == [failure]
+        spans = _get_spans(exporter, "gateway.execute_tool")
+        assert len(spans) == 1
+        assert dict(spans[0].attributes or {}).get("gateway.error_code") == "upstream_unauthorized"
+        assert any(e.name == "exception" for e in spans[0].events)
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            _ResponseCarryingError(SimpleNamespace(status_code=403, headers=_RaisingHeaders())),
+            _ResponsePropertyRaisesError("upstream call failed"),
+        ],
+        ids=["headers-get-raises", "response-property-raises"],
+    )
+    @pytest.mark.asyncio
+    async def test_unreadable_response_falls_back_to_execution_error(
+        self,
+        populated_registry: ToolRegistry,
+        manager: UpstreamManager,
+        exporter: InMemorySpanExporter,
+        failure: Exception,
+    ) -> None:
+        """If reading the response itself raises, the call is reported as the
+        plain execution error it always was, and the exception still reaches the
+        span and the ``on_error`` hook."""
+        seen: list[Exception] = []
+
+        class RecordingHook:
+            async def on_error(self, context: ExecutionContext, error: Exception) -> None:
+                seen.append(error)
+
+        manager.execute_tool = AsyncMock(side_effect=failure)  # type: ignore[method-assign]
+        mcp = FastMCP("test-gateway")
+        register_meta_tools(mcp, populated_registry, manager, HookRunner([RecordingHook()]))
+
+        async with Client(mcp) as client:
+            result = await client.call_tool("execute_tool", {"tool_name": "apollo_people_search"}, raise_on_error=False)
+
+        assert result.is_error is False
+        payload = result_payload(result)
+        assert payload["code"] == "execution_error"
+        assert payload["details"] == {"tool": "apollo_people_search", "domain": "apollo"}
+        assert seen == [failure]
+        spans = _get_spans(exporter, "gateway.execute_tool")
+        assert len(spans) == 1
+        assert dict(spans[0].attributes or {}).get("gateway.error_code") == "execution_error"
+        assert any(e.name == "exception" for e in spans[0].events)
 
 
 # ---------------------------------------------------------------------------

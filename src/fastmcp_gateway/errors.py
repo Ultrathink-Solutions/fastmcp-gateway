@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from pydantic import BaseModel
@@ -75,3 +76,83 @@ def error_response(code: str, message: str, **details: Any) -> str:
         Arbitrary key-value pairs included in the ``details`` dict.
     """
     return json.dumps(error_payload(code, message, **details))
+
+
+# One element of a ``WWW-Authenticate`` challenge list (RFC 9110 section 11.6.1):
+# an auth-param, ``name=token`` or ``name="quoted string"``, or else a bare
+# token, which is the auth-scheme opening the next challenge.
+_CHALLENGE_ITEM = re.compile(r'([^\s,=]+)\s*=\s*(?:"((?:[^"\\]|\\.)*)"|([^\s,]*))|([^\s,]+)')
+_QUOTED_PAIR = re.compile(r"\\(.)")
+
+
+def _find_upstream_response(exc: BaseException) -> Any | None:
+    """Return the HTTP response carried by *exc* or by an exception it wraps.
+
+    ``httpx.HTTPStatusError`` carries the upstream's ``response``. It can
+    reach the gateway bare or wrapped -- chained as an explicit
+    ``__cause__`` (``raise ... from``) or collected in an exception group --
+    so the search is depth-first and returns the first response with an
+    integer ``status_code``:
+
+    * The outermost response wins: *exc*'s own response is returned before
+      anything it wraps is examined.
+    * An exception group's members are searched in order, each through its
+      own chain, before the group's ``__cause__``.
+
+    Handing back the response itself, not just its status, lets a caller
+    read the status and the headers from the same exception.
+
+    Implicit ``__context__`` is deliberately not followed: an exception
+    raised *while handling* an earlier refusal (a connection failure on a
+    retry, say) is its own failure, not that refusal.
+    """
+    pending: list[BaseException] = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        response = getattr(current, "response", None)
+        if isinstance(getattr(response, "status_code", None), int):
+            return response
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(reversed(current.exceptions))
+    return None
+
+
+def parse_www_authenticate(header: str | None) -> tuple[str | None, str | None]:
+    """Read ``error`` and ``scope`` from a ``Bearer`` challenge (RFC 6750 section 3).
+
+    Returns ``(error, scope)``. Either is ``None`` when the challenge omits
+    it, and both are ``None`` when *header* is absent or empty or carries no
+    ``Bearer`` challenge. Scheme and parameter names match
+    case-insensitively, and parameters may appear in any order, as bare
+    tokens or as quoted strings (whose backslash escapes are removed).
+
+    A header the upstream repeats reaches the caller joined into one
+    comma-separated value, so only the first ``Bearer`` challenge is read:
+    its parameters end at the next challenge's scheme, and a second
+    ``Bearer`` challenge is ignored. When the ``insufficient_scope``
+    challenge is not the first ``Bearer`` one, ``execute_tool`` therefore
+    fails safe to ``upstream_unauthorized`` rather than guessing which
+    challenge applies.
+    """
+    if not header:
+        return None, None
+    params: dict[str, str] | None = None
+    for match in _CHALLENGE_ITEM.finditer(header):
+        name, quoted, token, scheme = match.groups()
+        if scheme is not None:
+            if params is not None:
+                break  # the Bearer challenge's parameters have ended
+            if scheme.lower() == "bearer":
+                params = {}
+        elif params is not None:
+            value = _QUOTED_PAIR.sub(r"\1", quoted) if quoted is not None else token
+            params.setdefault(name.lower(), value)
+    if params is None:
+        return None, None
+    return params.get("error"), params.get("scope")
