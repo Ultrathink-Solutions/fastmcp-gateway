@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.31.0] - 2026-09-15
+
+### Added
+
+- **`execute_tool` tells an upstream authorization refusal apart from an execution error.** Some upstreams enforce per-tool scopes and answer HTTP 403 with an RFC 6750 `insufficient_scope` challenge; that refusal now yields `code="upstream_insufficient_scope"`, with `details.required_scope` (the challenge's `scope`, or `null`) and `details.upstream_status`. A 401, or a 403 without that challenge, yields `code="upstream_unauthorized"` with `details.upstream_status`. Every other upstream failure keeps `code="execution_error"`, and its message and details are unchanged. The status and the challenge are always read from the same response. That response is found by walking explicit causes and exception-group members, and the outermost one wins. The span attribute `gateway.error_code` carries the chosen code. `errors.parse_www_authenticate(header)` returns `(error, scope)` from a `Bearer` challenge and never raises on malformed input. (#91)
+
+### Changed
+
+- **`POST /registry/servers` answers `503 upstream_not_ready` for more upstream boot-window failures.** Registration now classifies the raised exception together with its explicit causes and exception-group members, and the first classifiable failure decides. These now answer `503` (with `Retry-After`):
+  - a refused connection wrapped by the client;
+  - a connect or request deadline surfaced as `McpError(408)`;
+  - a `TimeoutError` reached through an explicit cause;
+  - HTTP 404, 502, 503 or 504 on discovery;
+  - the JSON-RPC codes `-32600`, `-32601` and `-32603`.
+
+  This **supersedes the 0.23.0 behaviour**, in which `METHOD_NOT_FOUND` and a peer-reported `INTERNAL_ERROR` fell through to `500`. A wrapped 401/403 now answers `422`, like a bare one. Any other HTTP status or non-transient `McpError` still answers `500`, and so does a genuine upstream 500. (#92)
+
+- **The `503 upstream_not_ready` body adds `upstream_status` and `upstream_error_code`.** Both are integers, present only when the classifying failure carried an HTTP status or a JSON-RPC code, and the registration log line carries the same values. A permanently misconfigured upstream, such as a wrong discovery path or a server with no tools, now answers `503` on every attempt, so callers should use these fields to cap retries or alert. Error messages are still not echoed, because they can contain unscrubbed URLs. (#92)
+
 ## [0.30.0] - 2026-08-26
 
 ### Fixed
