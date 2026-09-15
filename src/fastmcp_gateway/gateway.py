@@ -16,7 +16,7 @@ from opentelemetry import trace
 
 from fastmcp_gateway.access_policy import AccessPolicy, normalize_upstreams
 from fastmcp_gateway.client_manager import UpstreamManager
-from fastmcp_gateway.errors import _find_upstream_response
+from fastmcp_gateway.errors import _find_upstream_response, _walk_wrapped_exceptions
 from fastmcp_gateway.hooks import HookRunner
 from fastmcp_gateway.output_guard import OutputGuardConfig, OutputGuardHook
 from fastmcp_gateway.registration_auth import (
@@ -48,24 +48,25 @@ _tracer = trace.get_tracer("fastmcp_gateway.gateway")
 # ``tools/list``, the probe can fail in three structurally different ways
 # that controller-style callers need to disambiguate:
 #
-#   * Transient network failure  → 503 + Retry-After (caller retries)
+#   * Upstream not ready yet      → 503 + Retry-After (caller retries)
 #   * Upstream auth failure       → 422 (caller-fixable config error)
 #   * Anything else              → 500 (genuine internal error, escalate)
 #
-# The tuples below name the concrete exception classes that map to each
-# class. ``mcp.shared.exceptions.McpError`` is the SDK's unified wrapper
-# for *any* error arriving over an MCP connection — both transport-class
-# failures (``CONNECTION_CLOSED``) and peer-application protocol errors
-# (``METHOD_NOT_FOUND``, ``INVALID_PARAMS``, ``INTERNAL_ERROR``, …).  We
-# therefore do NOT treat it wholesale as transient; instead, the route
-# handler inspects ``McpError.error.code`` per-call via
-# :func:`_is_transient_mcp_error` and only retries on the JSON-RPC codes
-# that unambiguously represent a dropped session.
+# A registry controller registers an upstream as soon as it is scheduled,
+# so the first probe routinely lands while the upstream is still starting.
+# Every shape that probe meets then is "not ready yet": the connection is
+# refused, or times out before it connects or answers (a transient httpx
+# error, the client's 408 deadline code, or a ``TimeoutError`` it chains);
+# the discovery route is not mounted; a proxy in front has no ready
+# backend; or the MCP server answers ``tools/list`` before it can serve
+# it. The constants below name those shapes, and
+# :func:`_find_not_ready_failure` finds one even when the client hands it
+# over wrapped. The 503 body and log line carry ``upstream_status`` /
+# ``upstream_error_code`` so an operator can tell a slow start from a
+# misconfiguration that will never become ready.
 
-# httpx errors raised when the upstream is unreachable or slow. These are
-# the structural "upstream not yet Ready" failure modes a startup-window
-# controller-side caller should retry on. Tuple form so ``except`` can
-# pattern-match the whole class at once.
+# httpx errors raised when the upstream is unreachable or slow. Tuple form
+# so :func:`_find_not_ready_failure` can match the whole class at once.
 _UPSTREAM_TRANSIENT_HTTPX_ERRORS: tuple[type[BaseException], ...] = (
     httpx.ConnectError,
     httpx.ConnectTimeout,
@@ -79,12 +80,11 @@ _UPSTREAM_TRANSIENT_HTTPX_ERRORS: tuple[type[BaseException], ...] = (
 
 
 # Class-import sentinel for ``mcp.shared.exceptions.McpError``. When the
-# MCP SDK is available, the route handler catches McpError to decide
-# transient-vs-fall-through based on the JSON-RPC error code carried in
-# ``McpError.error.code``. When the SDK lays out its exception module
-# differently in a future release, the tuple stays empty and the
-# corresponding ``except`` clause matches nothing — leaving the
-# httpx-only transient classification path load-bearing.
+# MCP SDK is available, the route handler reads the JSON-RPC error code
+# carried in ``McpError.error.code`` to decide not-ready-vs-fall-through.
+# When the SDK lays out its exception module differently in a future
+# release, the tuple stays empty and no ``McpError`` is treated as not
+# ready -- leaving the httpx and HTTP-status classification load-bearing.
 try:
     from mcp.shared.exceptions import McpError as _McpError  # type: ignore[import-not-found]
 
@@ -93,62 +93,127 @@ except ImportError:  # pragma: no cover — defensive fallback
     _MCP_ERROR_TUPLE = ()
 
 
-# JSON-RPC error codes that the route handler treats as transient when
-# wrapped in ``McpError``. ``CONNECTION_CLOSED`` (-32000) is the MCP-
-# defined "session dropped" signal — the only code in the SDK's reserved
-# range that unambiguously represents a transport-class failure. The
-# rest of the JSON-RPC reserved range (-32700..-32600, plus -32603
-# ``INTERNAL_ERROR``) covers protocol / peer-application errors that
-# are NOT retry-actionable: a controller looping on ``METHOD_NOT_FOUND``
-# or ``INVALID_PARAMS`` would never make progress, and ``INTERNAL_ERROR``
-# is a peer-reported "I failed processing your request" that may or may
-# not be transient — defaulting it to "fall through to 500" surfaces it
-# as escalation-worthy rather than masking it as boot-window noise.
-_TRANSIENT_MCP_ERROR_CODES: frozenset[int] = frozenset({-32000})
+# JSON-RPC error codes that mean the upstream is not ready yet when the
+# registration probe receives them in an ``McpError``:
+#
+#   * -32000 ``CONNECTION_CLOSED``: the MCP session dropped mid-probe.
+#   * 408 (``httpx.codes.REQUEST_TIMEOUT`` reused as a JSON-RPC code): only
+#     ever built by a client-side deadline -- the gateway's own, or one a
+#     proxying upstream passes back, since the MCP SDK server returns any
+#     ``McpError`` a handler raises to its client as-is (the 504
+#     equivalent). The fastmcp client turns an ``httpx.ConnectTimeout`` it
+#     collects from its task group into ``McpError(408)`` without chaining
+#     the timeout, and the MCP SDK raises it when a request's read timeout
+#     expires.
+#   * 32600: the MCP Python SDK's streamable-HTTP client reports an HTTP 404
+#     answer to a request as this positive code ("Session terminated")
+#     instead of raising the 404. During startup that is the discovery
+#     route not mounted yet, or a restarted upstream that lost the session.
+#   * -32600 ``INVALID_REQUEST``: the code an MCP server puts in its
+#     "Session not found" error. Included for completeness: the MCP Python
+#     SDK client never delivers it, because it reports that 404 as 32600
+#     above and surfaces a 400 answer as ``httpx.HTTPStatusError``.
+#   * -32601 ``METHOD_NOT_FOUND``: what an MCP server answers when no
+#     handler is registered for ``tools/list`` -- in practice, a server
+#     with no tools.
+#   * -32603 ``INTERNAL_ERROR``: the server, or a proxy whose backend is not
+#     up yet, fails ``tools/list`` while it is still warming up.
+#
+# Codes that describe the gateway's own request (``INVALID_PARAMS``,
+# ``PARSE_ERROR``) are deliberately absent: an upstream that finishes
+# starting rejects the same request the same way, so retrying cannot help.
+_TRANSIENT_MCP_ERROR_CODES: frozenset[int] = frozenset({-32000, 408, 32600, -32600, -32601, -32603})
+
+
+def _mcp_error_code(exc: BaseException) -> int | None:
+    """Return the JSON-RPC error code *exc* carries when it is an ``McpError``, else ``None``."""
+    if not isinstance(exc, _MCP_ERROR_TUPLE):
+        return None
+    code = getattr(getattr(exc, "error", None), "code", None)
+    return code if isinstance(code, int) else None
 
 
 def _is_transient_mcp_error(exc: BaseException) -> bool:
-    """Return ``True`` only for ``McpError`` instances carrying a transport-class code.
+    """Return ``True`` only for an ``McpError`` whose code says the upstream is not ready yet.
 
-    ``mcp.shared.exceptions.McpError`` wraps both transport-class failures
-    (e.g. ``CONNECTION_CLOSED`` when the session drops mid-flight) AND
-    peer-application protocol errors (``METHOD_NOT_FOUND``,
-    ``INVALID_PARAMS``, ``INTERNAL_ERROR``, …).  Only the former should
-    map to 503; the latter are caller-fixable (or peer-fixable) and must
-    fall through to the generic 500 path so a controller-side caller
-    doesn't loop on an unrecoverable error.
+    ``mcp.shared.exceptions.McpError`` wraps both session drops and
+    peer-application protocol errors. Only the codes in
+    ``_TRANSIENT_MCP_ERROR_CODES`` map to 503; any other code falls through
+    to the generic 500 path so a controller-side caller doesn't loop on an
+    error that retrying cannot fix.
 
     Returns ``False`` for any non-``McpError`` exception, or when the
     MCP SDK is unimportable (``_MCP_ERROR_TUPLE`` empty), or when the
     error's ``code`` is missing or not in the transient set.
     """
-    if not isinstance(exc, _MCP_ERROR_TUPLE):
-        return False
-    error_data = getattr(exc, "error", None)
-    if error_data is None:
-        return False
-    code = getattr(error_data, "code", None)
-    return code in _TRANSIENT_MCP_ERROR_CODES
+    code = _mcp_error_code(exc)
+    return code is not None and code in _TRANSIENT_MCP_ERROR_CODES
 
 
-# Combined transient tuple used by the route handler's ``except`` clause.
-# httpx transients are unconditionally transient; McpError needs a
-# per-call code inspection (see :func:`_is_transient_mcp_error`).  When
-# the MCP SDK is absent, ``_MCP_ERROR_TUPLE`` is empty and the combined
-# tuple degenerates to the httpx-only set, preserving the previous
-# behaviour exactly.
-_UPSTREAM_TRANSIENT_OR_MCP_ERRORS: tuple[type[BaseException], ...] = (
-    *_UPSTREAM_TRANSIENT_HTTPX_ERRORS,
-    *_MCP_ERROR_TUPLE,
-)
+# Upstream HTTP statuses that mean the upstream is not ready yet: 404 while
+# its discovery route is not mounted, and 502/503/504 from a proxy or load
+# balancer with no ready backend behind it. A 500 is the upstream itself
+# failing and stays a 500.
+_UPSTREAM_NOT_READY_STATUSES: frozenset[int] = frozenset({404, 502, 503, 504})
+
+# Upstream HTTP statuses that reject the gateway's credentials: a
+# caller-fixable config error that will not succeed on retry (422).
+_UPSTREAM_AUTH_STATUSES: frozenset[int] = frozenset({401, 403})
 
 
-# httpx errors raised when the upstream returned a non-2xx response that
-# carries an upstream-side status code we can inspect. We treat 401/403
-# as caller-fixable config errors (422); other status codes fall through
-# to the generic 500 path. ``httpx.HTTPStatusError`` is the only entry
-# because every other status-carrying exception in httpx is a subclass.
-_UPSTREAM_AUTH_ERRORS: tuple[type[BaseException], ...] = (httpx.HTTPStatusError,)
+def _find_not_ready_failure(exc: BaseException) -> BaseException | None:
+    """Return the "upstream not ready yet" failure *exc* carries, or ``None``.
+
+    Walks *exc* and the exceptions it wraps (explicit ``__cause__`` chains
+    and exception-group members, never implicit ``__context__``). The first
+    exception the walk can classify decides, whatever its kind:
+
+    * a transient httpx error, or a builtin ``TimeoutError`` reached as an
+      explicit ``__cause__`` (the client raises ``RuntimeError`` from it
+      when the ``initialize`` handshake misses its deadline), is not ready;
+    * an ``McpError`` is not ready when its code is in
+      ``_TRANSIENT_MCP_ERROR_CODES``, and otherwise ends the walk;
+    * an HTTP response is not ready when its status is in
+      ``_UPSTREAM_NOT_READY_STATUSES``, and otherwise ends the walk.
+
+    A genuine failure therefore stays one even when it wraps a startup
+    shape, and, as in ``_find_upstream_response``, the outermost HTTP
+    response decides.
+    """
+    explicit_causes: set[int] = set()
+    for current in _walk_wrapped_exceptions(exc):
+        if isinstance(current, _UPSTREAM_TRANSIENT_HTTPX_ERRORS):
+            return current
+        if isinstance(current, TimeoutError) and id(current) in explicit_causes:
+            return current
+        if isinstance(current, _MCP_ERROR_TUPLE):
+            return current if _is_transient_mcp_error(current) else None
+        status = getattr(getattr(current, "response", None), "status_code", None)
+        if isinstance(status, int):
+            return current if status in _UPSTREAM_NOT_READY_STATUSES else None
+        if current.__cause__ is not None:
+            explicit_causes.add(id(current.__cause__))
+    return None
+
+
+def _not_ready_discriminators(failure: BaseException) -> dict[str, int]:
+    """Return the ``upstream_status`` / ``upstream_error_code`` that apply to *failure*.
+
+    A not-ready 503 is expected noise while an upstream starts, but it is
+    also what a misconfiguration that will never become ready answers (a
+    wrong discovery path, a server with no tools). These values let an
+    operator tell the two apart. Only the keys *failure* actually carries
+    are returned: the HTTP status of the response it holds, and the
+    JSON-RPC code of an ``McpError``.
+    """
+    discriminators: dict[str, int] = {}
+    status = getattr(getattr(failure, "response", None), "status_code", None)
+    if isinstance(status, int):
+        discriminators["upstream_status"] = status
+    code = _mcp_error_code(failure)
+    if code is not None:
+        discriminators["upstream_error_code"] = code
+    return discriminators
 
 
 # Recommended retry delay (seconds) returned in the 503 body and as the
@@ -985,12 +1050,15 @@ class GatewayServer:
             # different ways that a controller-style caller needs to
             # disambiguate:
             #
-            #   * Transient network failure (upstream pod still booting,
-            #     intermittent DNS, transport-level timeout).  Caller
-            #     should retry on the next reconcile cycle.  We return
-            #     ``503 Service Unavailable`` + ``Retry-After`` so the
-            #     caller backs off briefly and tries again without
-            #     escalating log severity.
+            #   * Upstream not ready yet (pod still booting: connection
+            #     refused or timed out, discovery route not mounted,
+            #     proxy with no ready backend, ``tools/list`` answered
+            #     before the server can serve it; see
+            #     ``_find_not_ready_failure``).  Caller should retry on
+            #     the next reconcile cycle.  We return ``503 Service
+            #     Unavailable`` + ``Retry-After`` so the caller backs off
+            #     briefly and tries again without escalating log
+            #     severity.
             #   * Upstream authentication / authorization failure (401 /
             #     403 from the discovery probe).  Caller-fixable config
             #     error — retrying won't help until the operator
@@ -1066,50 +1134,57 @@ class GatewayServer:
                         gateway.registry.set_domain_description(domain, description)
                     gateway._apply_domain_descriptions()
                     gateway._update_instructions()
-            except _UPSTREAM_TRANSIENT_OR_MCP_ERRORS as exc:
-                # ``McpError`` is the SDK's unified wrapper for both
-                # transport-class failures and peer-application
-                # protocol errors. Re-raise the non-transient flavour
-                # so it falls through to the generic 500 path — a
-                # controller looping on ``METHOD_NOT_FOUND`` would
-                # never make progress. httpx transients (the rest of
-                # the matched tuple) are unconditionally transient.
-                if isinstance(exc, _MCP_ERROR_TUPLE) and not _is_transient_mcp_error(exc):
-                    raise
-                # Scrub userinfo / query / fragment off the URL before
-                # it lands in logs or in the response body — some URL
-                # shapes carry secrets in those components.
-                safe_url = _scrub_url_for_diagnostics(discovery_url or url)
-                logger.info(
-                    "Upstream '%s' (%s) not yet reachable: %s — returning 503 for retry",
-                    domain,
-                    safe_url,
-                    type(exc).__name__,
-                )
-                return JSONResponse(
-                    {
-                        "error": (
-                            f"Upstream '{domain}' is not yet reachable at "
-                            f"'{safe_url}' ({type(exc).__name__}). "
-                            "This is expected during pod startup; retry shortly."
-                        ),
-                        "code": "upstream_not_ready",
-                        "domain": domain,
-                        "retry_after_seconds": _UPSTREAM_RETRY_AFTER_SECONDS,
-                    },
-                    status_code=503,
-                    headers={"Retry-After": str(_UPSTREAM_RETRY_AFTER_SECONDS)},
-                )
-            except _UPSTREAM_AUTH_ERRORS as exc:
+            except Exception as exc:
+                # The client may hand the probe failure over bare or
+                # wrapped, so classify by what the exception carries, not
+                # by its outermost type.
+                not_ready = _find_not_ready_failure(exc)
+                if not_ready is not None:
+                    # Scrub userinfo / query / fragment off the URL before
+                    # it lands in logs or in the response body — some URL
+                    # shapes carry secrets in those components.
+                    safe_url = _scrub_url_for_diagnostics(discovery_url or url)
+                    discriminators = _not_ready_discriminators(not_ready)
+                    not_ready_status = discriminators.get("upstream_status")
+                    not_ready_error_code = discriminators.get("upstream_error_code")
+                    # The discriminators go in the message for the default
+                    # formatter and via ``extra=`` for structured handlers,
+                    # as the registry auth audit line does; "-" marks an
+                    # absent value in the text form.
+                    logger.info(
+                        "Upstream '%s' (%s) not yet reachable: %s upstream_status=%s upstream_error_code=%s "
+                        "— returning 503 for retry",
+                        domain,
+                        safe_url,
+                        type(not_ready).__name__,
+                        "-" if not_ready_status is None else not_ready_status,
+                        "-" if not_ready_error_code is None else not_ready_error_code,
+                        extra={"upstream_status": not_ready_status, "upstream_error_code": not_ready_error_code},
+                    )
+                    return JSONResponse(
+                        {
+                            "error": (
+                                f"Upstream '{domain}' is not yet reachable at "
+                                f"'{safe_url}' ({type(not_ready).__name__}). "
+                                "This is expected during pod startup; retry shortly."
+                            ),
+                            "code": "upstream_not_ready",
+                            "domain": domain,
+                            "retry_after_seconds": _UPSTREAM_RETRY_AFTER_SECONDS,
+                            **discriminators,
+                        },
+                        status_code=503,
+                        headers={"Retry-After": str(_UPSTREAM_RETRY_AFTER_SECONDS)},
+                    )
                 upstream_response = _find_upstream_response(exc)
                 upstream_status = None if upstream_response is None else upstream_response.status_code
                 # Only 401/403 from the upstream maps to a caller-fixable
-                # auth-config error. Other status codes (404 missing
-                # endpoint, 5xx upstream-internal, etc.) are not
-                # actionable by a controller-side retry policy — fall
-                # through to the generic 500 handler so they surface as
-                # escalation-worthy rather than as "stop hammering this".
-                if upstream_status not in (401, 403):
+                # auth-config error. Anything else (a genuine upstream
+                # 500, a request the upstream rejects, an internal
+                # failure) falls through to the generic 500 handler so it
+                # surfaces as escalation-worthy rather than as "stop
+                # hammering this".
+                if upstream_status not in _UPSTREAM_AUTH_STATUSES:
                     raise
                 safe_url = _scrub_url_for_diagnostics(discovery_url or url)
                 logger.warning(
