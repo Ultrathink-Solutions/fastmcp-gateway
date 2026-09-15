@@ -4,7 +4,7 @@ The endpoint maps add_upstream() failures into three response classes
 so controller-style callers can disambiguate retry-worthy errors from
 caller-fixable config errors from genuine internal failures:
 
-  * 503 + Retry-After  — transient upstream-unreachable (caller retries)
+  * 503 + Retry-After  — upstream unreachable or still starting (caller retries)
   * 422                — upstream auth/authz rejection (caller-fixable)
   * 500                — everything else (escalation-worthy)
 
@@ -15,6 +15,8 @@ to differentiate startup-window noise from real problems.
 from __future__ import annotations
 
 import json
+import logging
+from typing import TYPE_CHECKING
 
 import httpx
 import pytest
@@ -25,6 +27,9 @@ from fastmcp_gateway.gateway import (
     GatewayServer,
     _scrub_url_for_diagnostics,  # pyright: ignore[reportAttributeAccessIssue]
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -122,6 +127,52 @@ def _make_status_error(status_code: int) -> httpx.HTTPStatusError:
     return httpx.HTTPStatusError("upstream rejected", request=request, response=response)
 
 
+def _mcp_error(code: int) -> BaseException:
+    """Build the MCP SDK's ``McpError`` carrying JSON-RPC error *code*."""
+    try:
+        from mcp.shared.exceptions import McpError
+        from mcp.types import ErrorData
+    except ImportError:
+        pytest.skip("mcp SDK exception module layout differs in this env")
+    return McpError(ErrorData(code=code, message="upstream answered with an error"))
+
+
+def _caused_by(outer: BaseException, cause: BaseException) -> BaseException:
+    """Chain *cause* onto *outer* as an explicit ``__cause__`` (``raise outer from cause``)."""
+    outer.__cause__ = cause
+    return outer
+
+
+def _raised_from(cause: BaseException) -> BaseException:
+    """Wrap *cause* the way the fastmcp client reports a failed connection: ``RuntimeError`` raised from it."""
+    return _caused_by(RuntimeError("client failed to connect"), cause)
+
+
+def _assert_upstream_not_ready(
+    response: httpx.Response,
+    *,
+    upstream_status: int | None = None,
+    upstream_error_code: int | None = None,
+) -> None:
+    """Assert the machine-readable 503 contract a retrying caller relies on.
+
+    ``upstream_status`` and ``upstream_error_code`` are the discriminators
+    that tell a slow start from a permanent misconfiguration: each must be
+    present with the given value, or absent when ``None``.
+    """
+    assert response.status_code == 503
+    assert response.headers["Retry-After"] == "5"
+    body = response.json()
+    assert body["code"] == "upstream_not_ready"
+    assert body["domain"] == "widgets"
+    assert body["retry_after_seconds"] == 5
+    for key, expected in (("upstream_status", upstream_status), ("upstream_error_code", upstream_error_code)):
+        if expected is None:
+            assert key not in body
+        else:
+            assert body[key] == expected
+
+
 # ---------------------------------------------------------------------------
 # Transient errors → 503 + Retry-After
 # ---------------------------------------------------------------------------
@@ -156,6 +207,8 @@ class TestTransientErrorsMapTo503:
         assert body["code"] == "upstream_not_ready"
         assert body["domain"] == "widgets"
         assert body["retry_after_seconds"] == 5
+        assert "upstream_status" not in body
+        assert "upstream_error_code" not in body
         # Error message names the exception class so the operator can
         # disambiguate ConnectError from ReadTimeout without leaving
         # the response body.
@@ -163,14 +216,13 @@ class TestTransientErrorsMapTo503:
 
     @pytest.mark.asyncio
     async def test_mcp_error_connection_closed_maps_to_503(self, gateway: GatewayServer) -> None:
-        """``McpError`` carrying ``CONNECTION_CLOSED`` is the only transport-class code.
+        """``McpError`` carrying ``CONNECTION_CLOSED`` (-32000) is a dropped session.
 
         The MCP SDK's ``McpError`` is the unified wrapper for *any* error
-        arriving over an MCP connection — both transport-class drops and
-        peer-application protocol errors. Only the JSON-RPC codes that
-        unambiguously represent a dropped session (``-32000``
-        ``CONNECTION_CLOSED``) are retryable; the other reserved-range
-        codes are tested in :class:`TestUnclassifiedErrorsMapTo500`.
+        arriving over an MCP connection. The other codes an upstream answers
+        with while it is still starting are covered by
+        :class:`TestUpstreamStartupShapesMapTo503`; the codes that still mean
+        a genuine failure by :class:`TestUnclassifiedErrorsMapTo500`.
         """
         try:
             from mcp.shared.exceptions import McpError
@@ -181,8 +233,142 @@ class TestTransientErrorsMapTo503:
         _patch_add_upstream(gateway, McpError(err_data))
 
         response = await _post_register(gateway)
-        assert response.status_code == 503
-        assert response.json()["code"] == "upstream_not_ready"
+
+        _assert_upstream_not_ready(response, upstream_error_code=CONNECTION_CLOSED)
+
+
+# ---------------------------------------------------------------------------
+# Upstream still starting → 503 + Retry-After
+# ---------------------------------------------------------------------------
+
+
+class TestUpstreamStartupShapesMapTo503:
+    """Failures a registration probe meets while the upstream is still starting.
+
+    A registry controller registers an upstream as soon as it is scheduled,
+    so the first probe routinely lands before the upstream can answer
+    ``tools/list``. Each shape here is boot-window noise the controller
+    should retry after ``Retry-After``, not a 500 it escalates.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(-32600, id="invalid-request"),
+            pytest.param(-32601, id="method-not-found"),
+            pytest.param(-32603, id="internal-error"),
+            pytest.param(32600, id="http-404-session-terminated"),
+        ],
+    )
+    async def test_startup_mcp_error_codes_map_to_503(self, gateway: GatewayServer, code: int) -> None:
+        _patch_add_upstream(gateway, _mcp_error(code))
+
+        response = await _post_register(gateway)
+
+        _assert_upstream_not_ready(response, upstream_error_code=code)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status_code", [404, 502, 503, 504])
+    async def test_startup_http_statuses_map_to_503(self, gateway: GatewayServer, status_code: int) -> None:
+        """404: the discovery route is not mounted yet. 502/503/504: nothing ready behind the proxy."""
+        _patch_add_upstream(gateway, _make_status_error(status_code))
+
+        response = await _post_register(gateway)
+
+        _assert_upstream_not_ready(response, upstream_status=status_code)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("make_failure", "discriminators"),
+        [
+            pytest.param(lambda: _raised_from(httpx.ConnectError("connection refused")), {}, id="refused-as-cause"),
+            pytest.param(
+                lambda: ExceptionGroup("probe failed", [httpx.ConnectError("connection refused")]),
+                {},
+                id="refused-in-group",
+            ),
+            pytest.param(
+                lambda: _raised_from(_make_status_error(503)), {"upstream_status": 503}, id="http-503-as-cause"
+            ),
+            pytest.param(
+                lambda: _raised_from(_mcp_error(-32601)),
+                {"upstream_error_code": -32601},
+                id="method-not-found-as-cause",
+            ),
+        ],
+    )
+    async def test_wrapped_startup_failure_maps_to_503(
+        self,
+        gateway: GatewayServer,
+        make_failure: Callable[[], BaseException],
+        discriminators: dict[str, int],
+    ) -> None:
+        """The client can wrap the startup failure; a refused connection arrives as ``RuntimeError`` from it."""
+        _patch_add_upstream(gateway, make_failure())
+
+        response = await _post_register(gateway)
+
+        _assert_upstream_not_ready(response, **discriminators)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("make_failure", "discriminators"),
+        [
+            pytest.param(lambda: _mcp_error(408), {"upstream_error_code": 408}, id="connect-or-read-deadline-408"),
+            pytest.param(lambda: _raised_from(TimeoutError()), {}, id="initialize-deadline-as-cause"),
+        ],
+    )
+    async def test_client_side_timeout_maps_to_503(
+        self,
+        gateway: GatewayServer,
+        make_failure: Callable[[], BaseException],
+        discriminators: dict[str, int],
+    ) -> None:
+        """An upstream too slow to answer during startup is not ready yet.
+
+        The fastmcp client reports a connect timeout collected from its task
+        group as ``McpError(408)`` with no cause, and a missed ``initialize``
+        deadline as ``RuntimeError`` raised from ``TimeoutError``.
+        """
+        _patch_add_upstream(gateway, make_failure())
+
+        response = await _post_register(gateway)
+
+        _assert_upstream_not_ready(response, **discriminators)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("make_failure", "upstream_status", "upstream_error_code"),
+        [
+            pytest.param(lambda: _make_status_error(404), 404, None, id="http-404"),
+            pytest.param(lambda: _mcp_error(-32601), None, -32601, id="method-not-found"),
+            pytest.param(lambda: _raised_from(httpx.ConnectError("connection refused")), None, None, id="refused"),
+        ],
+    )
+    async def test_not_ready_log_record_carries_the_discriminators(
+        self,
+        gateway: GatewayServer,
+        caplog: pytest.LogCaptureFixture,
+        make_failure: Callable[[], BaseException],
+        upstream_status: int | None,
+        upstream_error_code: int | None,
+    ) -> None:
+        """The log line an operator reads carries the same discriminators as the 503 body."""
+        _patch_add_upstream(gateway, make_failure())
+
+        with caplog.at_level(logging.INFO, logger="fastmcp_gateway.gateway"):
+            response = await _post_register(gateway)
+
+        _assert_upstream_not_ready(response, upstream_status=upstream_status, upstream_error_code=upstream_error_code)
+        records = [
+            record
+            for record in caplog.records
+            if record.name == "fastmcp_gateway.gateway" and hasattr(record, "upstream_error_code")
+        ]
+        assert len(records) == 1
+        assert getattr(records[0], "upstream_status") == upstream_status  # noqa: B009
+        assert getattr(records[0], "upstream_error_code") == upstream_error_code  # noqa: B009
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +396,30 @@ class TestUpstreamAuthErrorsMapTo422:
         assert isinstance(body["error"], str)
         assert body["error"]
 
+    @pytest.mark.asyncio
+    async def test_wrapped_auth_rejection_returns_422(self, gateway: GatewayServer) -> None:
+        """An auth rejection the client wraps is still caller-fixable, not a 500."""
+        _patch_add_upstream(gateway, _raised_from(_make_status_error(403)))
+
+        response = await _post_register(gateway)
+
+        assert response.status_code == 422
+        body = response.json()
+        assert body["code"] == "upstream_auth_failed"
+        assert body["upstream_status"] == 403
+
+    @pytest.mark.asyncio
+    async def test_auth_rejection_wrapping_a_startup_shape_returns_422(self, gateway: GatewayServer) -> None:
+        """An auth rejection decides before a startup failure it wraps: still caller-fixable, not a 503."""
+        _patch_add_upstream(gateway, _caused_by(_make_status_error(401), httpx.ConnectError("connection refused")))
+
+        response = await _post_register(gateway)
+
+        assert response.status_code == 422
+        body = response.json()
+        assert body["code"] == "upstream_auth_failed"
+        assert body["upstream_status"] == 401
+
 
 # ---------------------------------------------------------------------------
 # Non-classifiable upstream errors → 500 (reserved for genuine internal failures)
@@ -218,19 +428,62 @@ class TestUpstreamAuthErrorsMapTo422:
 
 class TestUnclassifiedErrorsMapTo500:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("status_code", [404, 500, 502])
+    @pytest.mark.parametrize("status_code", [400, 500])
     async def test_non_auth_upstream_status_falls_through_to_500(
         self, gateway: GatewayServer, status_code: int
     ) -> None:
-        """HTTPStatusError with non-401/403 status is not actionable by retry policy."""
+        """An upstream status that is neither an auth rejection nor a startup shape is a genuine failure."""
         _patch_add_upstream(gateway, _make_status_error(status_code))
 
         response = await _post_register(gateway)
 
-        # 422 is reserved for caller-fixable auth errors. Other upstream
-        # status codes are not actionable by a controller-side retry
-        # policy, so they should surface as a generic 500 — escalation-
-        # worthy rather than "stop hammering this".
+        # 422 is reserved for caller-fixable auth errors and 503 for an
+        # upstream that is still starting. A genuine upstream 500, or a
+        # request the upstream rejects outright, surfaces as a generic
+        # 500: escalation-worthy rather than retried.
+        assert response.status_code == 500
+
+    @pytest.mark.asyncio
+    async def test_failure_raised_while_handling_a_refused_connection_falls_through_to_500(
+        self, gateway: GatewayServer
+    ) -> None:
+        """Only an explicit cause is followed: a failure raised while handling a refused connection is its own."""
+        failure = RuntimeError("registry corruption")
+        failure.__context__ = httpx.ConnectError("connection refused")
+        _patch_add_upstream(gateway, failure)
+
+        response = await _post_register(gateway)
+
+        assert response.status_code == 500
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "make_failure",
+        [
+            pytest.param(lambda: _raised_from(_make_status_error(500)), id="http-500-as-cause"),
+            pytest.param(
+                lambda: _caused_by(_make_status_error(500), httpx.ConnectError("connection refused")),
+                id="http-500-raised-from-refused",
+            ),
+            pytest.param(
+                lambda: _caused_by(_mcp_error(-32602), httpx.ConnectError("connection refused")),
+                id="invalid-params-raised-from-refused",
+            ),
+        ],
+    )
+    async def test_first_classifiable_failure_decides(
+        self, gateway: GatewayServer, make_failure: Callable[[], BaseException]
+    ) -> None:
+        """A genuine failure stays a 500, whether the client wraps it or it wraps a startup shape itself.
+
+        The first exception the walk can classify decides: an HTTP 500 or a
+        request-shape ``McpError`` is not turned into a 503 by a refused
+        connection it was raised from.
+        """
+        _patch_add_upstream(gateway, make_failure())
+
+        response = await _post_register(gateway)
+
         assert response.status_code == 500
 
     @pytest.mark.asyncio
@@ -245,22 +498,19 @@ class TestUnclassifiedErrorsMapTo500:
     @pytest.mark.parametrize(
         ("code_name",),
         [
-            ("METHOD_NOT_FOUND",),  # -32601 — peer doesn't implement tools/list
             ("INVALID_PARAMS",),  # -32602 — request shape mismatch
-            ("INTERNAL_ERROR",),  # -32603 — peer-internal error, NOT transient
             ("PARSE_ERROR",),  # -32700 — peer couldn't parse our JSON
         ],
     )
     async def test_non_transient_mcp_error_codes_fall_through_to_500(
         self, gateway: GatewayServer, code_name: str
     ) -> None:
-        """``McpError`` codes outside the transport-class set are not retryable.
+        """``McpError`` codes that describe the gateway's own request are not retryable.
 
-        A controller looping on ``METHOD_NOT_FOUND`` or ``INVALID_PARAMS``
-        would never make progress — these are peer-application protocol
-        errors, not boot-window noise. They must fall through to the
-        generic 500 path so they surface as escalation-worthy rather
-        than as a stop-hammering 503.
+        A controller looping on ``INVALID_PARAMS`` or ``PARSE_ERROR`` would
+        never make progress: an upstream that finishes starting rejects the
+        same request the same way. They fall through to the generic 500
+        path so they surface as escalation-worthy rather than as a 503.
         """
         try:
             from mcp.shared.exceptions import McpError
@@ -274,8 +524,8 @@ class TestUnclassifiedErrorsMapTo500:
         _patch_add_upstream(gateway, McpError(err_data))
 
         response = await _post_register(gateway)
-        # 503 reserved for transport-class transients; 422 for caller-
-        # fixable auth. Protocol-class McpError falls through to 500.
+        # 503 is reserved for an upstream that is still starting; 422 for
+        # caller-fixable auth. A request-shape McpError falls through to 500.
         assert response.status_code == 500
 
 
