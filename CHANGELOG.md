@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Signatures show a parameter's allowed values and bounds.** A caller reading `discover_tools` signatures (or the `signature` in an `invalid_arguments` error) used to see `top: int = None` and `format: str = None` for a tool that caps `top` at 100 and accepts only two formats, and learned the limits only from a rejection. A scalar `enum`/`const` now renders as `Literal[...]` in place of its type, anywhere in the signature. A top-level parameter's bounds annotate it as `Annotated[<type>, '<bounds>']`. That covers the numeric `minimum`/`maximum`/`exclusiveMinimum`/`exclusiveMaximum`, then `minLength`/`maxLength`, then `minItems`/`maxItems`:
+
+  ```
+  search(format: Literal['concise', 'detailed'] = None, top: Annotated[int, '0 < top <= 100'] = None) -> any
+  ```
+
+  Only what the declared `type` admits is shown. An `enum` value of another type is left out (`{"type": "string", "enum": ["open", 1]}` renders as `Literal['open']`), and so is a bound for another type (`maximum` on a string). A parameter whose `type` admits several bounded types shows each type's bounds, labelled with the type: `Annotated[float | list, 'float: x >= 0; list: len(x) <= 5']`. An `enum` containing a float renders as `Annotated[float, 'one of 1.5, 2.5']`, because `Literal` admits no float. Where both an inclusive and an exclusive limit are declared, the stricter one is shown.
+
+  A parameter without bounds or allowed values renders exactly as before. **Compatibility:** a consumer that parses signature text (instead of reading `inputSchema`) should expect the two new forms.
+
 - **`execute_tool`'s local argument check also rejects a value outside its declared bounds or allowed values.** Before this, the pre-flight check caught only an unknown or missing argument name, so a call like `limit=1000` against `maximum: 100`, or `format="json"` against `enum: ["concise", "detailed"]`, went to the upstream, which either rejected it there or failed in a less readable way. The check now also applies these keywords to each top-level argument, the way a JSON-Schema validator would for a value of that type:
   - `enum` and `const` to a string;
   - `minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum` (numeric form) and a fractional value for `type: integer` to a number;
