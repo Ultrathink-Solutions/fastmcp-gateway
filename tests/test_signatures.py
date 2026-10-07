@@ -251,3 +251,173 @@ class TestToolToSignature:
             }
         )
         assert tool_to_signature(tool) == "crm_search(tags: list[str], owner: str | None = None) -> any"
+
+
+# ---------------------------------------------------------------------------
+# Allowed values and bounds
+# ---------------------------------------------------------------------------
+
+
+class TestFormatSchemaAllowedValues:
+    def test_string_enum_is_a_literal(self) -> None:
+        assert format_schema({"type": "string", "enum": ["concise", "detailed"]}) == "Literal['concise', 'detailed']"
+
+    def test_enum_without_a_type_is_a_literal(self) -> None:
+        assert format_schema({"enum": ["a", "b"]}) == "Literal['a', 'b']"
+
+    def test_mixed_scalar_enum_is_a_literal(self) -> None:
+        assert format_schema({"enum": ["auto", 1, True, None]}) == "Literal['auto', 1, True, None]"
+
+    def test_const_is_a_one_value_literal(self) -> None:
+        assert format_schema({"const": "open"}) == "Literal['open']"
+
+    def test_enum_inside_an_array_is_a_literal(self) -> None:
+        schema = {"type": "array", "items": {"type": "string", "enum": ["x", "y"]}}
+        assert format_schema(schema) == "list[Literal['x', 'y']]"
+
+    def test_nullable_enum_keeps_none(self) -> None:
+        assert format_schema({"type": ["string", "null"], "enum": ["a", "b", None]}) == "Literal['a', 'b', None]"
+
+    def test_enum_of_non_scalars_falls_back_to_the_type(self) -> None:
+        assert format_schema({"type": "object", "enum": [{"a": 1}]}) == "dict"
+
+    def test_empty_enum_falls_back_to_the_type(self) -> None:
+        assert format_schema({"type": "string", "enum": []}) == "str"
+
+
+class TestToolToSignatureBounds:
+    def test_numeric_bounds_annotate_the_parameter(self) -> None:
+        tool = _make_tool(
+            input_schema={
+                "type": "object",
+                "properties": {"top": {"type": "integer", "exclusiveMinimum": 0, "maximum": 100}},
+            }
+        )
+        assert tool_to_signature(tool) == "crm_search(top: Annotated[int, '0 < top <= 100'] = None) -> any"
+
+    def test_one_sided_bounds(self) -> None:
+        tool = _make_tool(
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "min_value": {"type": "number", "minimum": 0},
+                    "ratio": {"type": "number", "exclusiveMaximum": 1},
+                },
+            }
+        )
+        assert tool_to_signature(tool) == (
+            "crm_search(min_value: Annotated[float, 'min_value >= 0'] = None,"
+            " ratio: Annotated[float, 'ratio < 1'] = None) -> any"
+        )
+
+    def test_length_and_item_bounds(self) -> None:
+        tool = _make_tool(
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "minLength": 1, "maxLength": 80},
+                    "ids": {"type": "array", "items": {"type": "string"}, "maxItems": 50},
+                },
+                "required": ["name"],
+            }
+        )
+        assert tool_to_signature(tool) == (
+            "crm_search(name: Annotated[str, '1 <= len(name) <= 80'],"
+            " ids: Annotated[list[str], 'len(ids) <= 50'] = None) -> any"
+        )
+
+    def test_enum_parameter_is_a_literal(self) -> None:
+        tool = _make_tool(
+            input_schema={
+                "type": "object",
+                "properties": {"response_format": {"type": "string", "enum": ["concise", "detailed"]}},
+            }
+        )
+        assert tool_to_signature(tool) == "crm_search(response_format: Literal['concise', 'detailed'] = None) -> any"
+
+    def test_a_parameter_without_bounds_is_unchanged(self) -> None:
+        tool = _make_tool(
+            input_schema={
+                "type": "object",
+                "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}},
+                "required": ["query"],
+            }
+        )
+        assert tool_to_signature(tool) == "crm_search(query: str, limit: int = None) -> any"
+
+    def test_non_numeric_bounds_are_ignored(self) -> None:
+        tool = _make_tool(
+            input_schema={
+                "type": "object",
+                "properties": {"top": {"type": "integer", "maximum": "100", "minimum": True}},
+            }
+        )
+        assert tool_to_signature(tool) == "crm_search(top: int = None) -> any"
+
+
+class TestSignatureReviewCases:
+    def test_a_float_enum_is_annotated_not_a_literal(self) -> None:
+        """``Literal`` admits no float, so the allowed values ride as annotation metadata."""
+        assert format_schema({"type": "number", "enum": [1.5, 2.5]}) == "Annotated[float, 'one of 1.5, 2.5']"
+
+    def test_a_mixed_enum_with_a_float_is_annotated(self) -> None:
+        assert format_schema({"enum": ["auto", 0.5]}) == "Annotated[any, \"one of 'auto', 0.5\"]"
+
+    def test_an_integral_enum_stays_a_literal(self) -> None:
+        assert format_schema({"type": "integer", "enum": [1, 2, 3]}) == "Literal[1, 2, 3]"
+
+    def test_the_stricter_lower_limit_wins(self) -> None:
+        tool = _make_tool(
+            input_schema={
+                "type": "object",
+                "properties": {"top": {"type": "integer", "minimum": 10, "exclusiveMinimum": 0}},
+            }
+        )
+        assert tool_to_signature(tool) == "crm_search(top: Annotated[int, 'top >= 10'] = None) -> any"
+
+    def test_the_stricter_upper_limit_wins(self) -> None:
+        tool = _make_tool(
+            input_schema={
+                "type": "object",
+                "properties": {"top": {"type": "integer", "maximum": 50, "exclusiveMaximum": 100}},
+            }
+        )
+        assert tool_to_signature(tool) == "crm_search(top: Annotated[int, 'top <= 50'] = None) -> any"
+
+    def test_an_exclusive_limit_wins_a_tie(self) -> None:
+        tool = _make_tool(
+            input_schema={
+                "type": "object",
+                "properties": {"top": {"type": "integer", "minimum": 0, "exclusiveMinimum": 0, "maximum": 100}},
+            }
+        )
+        assert tool_to_signature(tool) == "crm_search(top: Annotated[int, '0 < top <= 100'] = None) -> any"
+
+    def test_every_admitted_type_shows_its_bounds(self) -> None:
+        """A union of bounded types keeps each one's limit, labelled with its type."""
+        tool = _make_tool(
+            input_schema={
+                "type": "object",
+                "properties": {"x": {"type": ["number", "array"], "minimum": 0, "maxItems": 5}},
+            }
+        )
+        signature = tool_to_signature(tool)
+        assert "x >= 0" in signature
+        assert "len(x) <= 5" in signature
+
+    def test_a_bound_for_an_undeclared_type_is_not_shown(self) -> None:
+        """``maximum`` bounds only a number, so it says nothing about a string parameter."""
+        tool = _make_tool(input_schema={"type": "object", "properties": {"x": {"type": "string", "maximum": 5}}})
+        assert tool_to_signature(tool) == "crm_search(x: str = None) -> any"
+
+    def test_a_nullable_parameter_keeps_its_bounds_unlabelled(self) -> None:
+        tool = _make_tool(
+            input_schema={"type": "object", "properties": {"x": {"type": ["integer", "null"], "maximum": 9}}}
+        )
+        assert tool_to_signature(tool) == "crm_search(x: Annotated[int | None, 'x <= 9'] = None) -> any"
+
+    def test_enum_values_the_type_rejects_are_not_listed(self) -> None:
+        assert format_schema({"type": "string", "enum": ["open", 1]}) == "Literal['open']"
+
+    def test_an_enum_the_type_rejects_entirely_falls_back_to_the_type(self) -> None:
+        assert format_schema({"type": "string", "enum": [1, 2]}) == "str"
