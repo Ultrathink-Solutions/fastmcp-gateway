@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **`execute_tool` passes an upstream's JSON-RPC error answer through instead of reporting an execution error.** Some MCP server frameworks reject a call whose arguments fail the tool's input schema with a JSON-RPC error response (`-32602`, Invalid params) rather than an `isError` result. That rejection used to become `code="execution_error"` with a fixed "returned an error" message, so a caller could not tell a correctable argument from an outage, and an LLM caller would report the upstream as down and retry the same call. Now:
+  - `-32602` yields `code="invalid_arguments"` with the upstream's message as `error`, plus `details.upstream_error_code` and `details.signature` (the same envelope the local argument check already produces).
+  - Any other JSON-RPC error code yields `code="upstream_error"`, with the upstream's message in `error` and its code in `details.upstream_error_code`.
+  - Only an error response that arrived from the upstream counts. The gateway records each JSON-RPC error read from the call's session as it arrives, so an `McpError` the MCP client raises by itself because no answer arrived (the session dropped with the request pending, a read timeout) stays `execution_error`, whatever its code or message. A server may answer with the same code and text the client uses for a dropped session (`-32000` "Connection closed"), and that answer is passed through. Connection failures and HTTP errors stay `execution_error` too. One exception: the MCP streamable-HTTP client reports an HTTP 404 to a request (the upstream no longer knows the session) as a received error, `32600` "Session terminated", so it surfaces as `upstream_error` with that code.
+
+  An HTTP 401/403 still classifies first. The upstream message is stripped and cut to 2,000 characters. The span attribute `gateway.error_code` carries the chosen code, and `record_exception` plus the `on_error` hook still run on every path.
+
+  **Compatibility:** a caller that treated every `execution_error` as an outage was already right to do so for the cases that remain. A caller that branched on `upstream_error` for `isError` results now also sees it for JSON-RPC error answers; read `details.upstream_error_code` to tell them apart.
+
 ## [0.31.0] - 2026-09-15
 
 ### Added

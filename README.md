@@ -372,6 +372,16 @@ Error codes: `tool_not_found`, `invalid_arguments`, `domain_not_found`, `group_n
 {"error": "Invalid arguments for 'apollo_people_search': missing required argument(s) 'query'.", "code": "invalid_arguments", "details": {"tool": "apollo_people_search", "domain": "apollo", "signature": "apollo_people_search(query: str) -> any\n  Search for people by name, title, company, or other criteria"}}
 ```
 
+`invalid_arguments` also fires when the upstream server itself rejects the arguments with a JSON-RPC `-32602` (Invalid params) error. Some MCP server frameworks report a call that fails the tool's input schema this way instead of as an `isError` result. The envelope then carries the upstream's own message as `error`, `details.upstream_error_code`, and the same `details.signature`:
+
+```json
+{"error": "Tool 'people_search' parameter validation failed: limit: Too big: expected number to be <=100.", "code": "invalid_arguments", "details": {"tool": "apollo_people_search", "domain": "apollo", "upstream_error_code": -32602, "signature": "apollo_people_search(query: str, limit: int = None) -> any\n  Search for people by name, title, company, or other criteria"}}
+```
+
+`upstream_error` fires when the upstream server answers the call with an error: an `isError` tool result (the upstream's text becomes `error`), or a JSON-RPC error response with any other code (its message is in `error`, its code in `details.upstream_error_code`). Either way the upstream received and judged the call.
+
+`execution_error` is reserved for failures where no answer arrived: the upstream could not be reached, the request timed out, the session dropped, or the HTTP exchange failed (for example a 5xx). Whether an error arrived is decided by where it came from, never by its code or text: an upstream that answers with `-32000` "Connection closed" gets `upstream_error`. Its message and `details` (`tool`, `domain`) are fixed; the underlying exception is recorded on the `gateway.execute_tool` span and passed to `on_error` hooks.
+
 `upstream_unauthorized` and `upstream_insufficient_scope` fire when the upstream server refuses the call rather than failing it -- an upstream that enforces per-tool authorization answers 401 or 403. A 403 carrying an RFC 6750 `insufficient_scope` challenge (`WWW-Authenticate: Bearer error="insufficient_scope", scope="..."`) becomes `upstream_insufficient_scope`, with the challenge's `scope` in `details.required_scope` (`null` when the challenge names none); any other 401 or 403 becomes `upstream_unauthorized`. Both carry `details.upstream_status`. Neither succeeds on retry without a change to the caller's credentials or grants, which is what sets them apart from `execution_error`:
 
 ```json

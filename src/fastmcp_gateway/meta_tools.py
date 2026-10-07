@@ -12,7 +12,15 @@ from fastmcp.tools import ToolResult
 from mcp.types import TextContent, ToolAnnotations
 from opentelemetry import trace
 
-from fastmcp_gateway.errors import _find_upstream_response, error_payload, error_response, parse_www_authenticate
+from fastmcp_gateway.errors import (
+    INVALID_PARAMS,
+    _find_jsonrpc_error,
+    _find_upstream_response,
+    bounded_upstream_message,
+    error_payload,
+    error_response,
+    parse_www_authenticate,
+)
 from fastmcp_gateway.hooks import ExecutionContext, ExecutionDenied, HookRunner, ListToolsContext
 from fastmcp_gateway.signatures import extract_params, tool_to_signature
 
@@ -566,6 +574,15 @@ def register_meta_tools(
                 # challenge also names the scope the caller lacks. Neither is an
                 # upstream failure, so each gets its own code. Status and
                 # challenge are read from the same response.
+                # An upstream that answered with a JSON-RPC error response did
+                # receive and judge the call, so its own message reaches the
+                # caller: ``-32602`` (some MCP server frameworks report a call
+                # that fails the tool's input schema this way rather than as an
+                # ``isError`` result) is ``invalid_arguments`` with the tool's
+                # signature, any other answer is ``upstream_error``. Only an
+                # error the upstream sent counts (``UpstreamJsonRpcError``, marked
+                # where it arrived): an ``McpError`` the MCP client raised itself
+                # means no answer arrived.
                 # Classification must never raise, or the span, the on_error hook
                 # and the envelope are all lost. Only a ``str`` challenge is parsed
                 # (other header shapes classify by status alone), and a response
@@ -580,6 +597,10 @@ def register_meta_tools(
                     )
                 except Exception:  # Unreadable upstream response: classify as a plain execution error.
                     status, auth_error, required_scope = None, None, None
+                try:
+                    jsonrpc_error = _find_jsonrpc_error(exc)
+                except Exception:  # Unreadable error chain: classify as a plain execution error.
+                    jsonrpc_error = None
 
                 details: dict[str, Any] = {"tool": tool_name, "domain": entry.domain}
                 if status == 403 and auth_error == "insufficient_scope":
@@ -590,6 +611,20 @@ def register_meta_tools(
                     code = "upstream_unauthorized"
                     message = f"Tool '{tool_name}' was refused by upstream server '{entry.domain}': not authorized."
                     details.update(upstream_status=status)
+                elif status is None and jsonrpc_error is not None and jsonrpc_error[0] == INVALID_PARAMS:
+                    code = "invalid_arguments"
+                    message = bounded_upstream_message(jsonrpc_error[1]) or (
+                        f"Upstream server '{entry.domain}' rejected the arguments for {tool_name!r}."
+                    )
+                    details.update(upstream_error_code=jsonrpc_error[0], signature=tool_to_signature(entry))
+                elif status is None and jsonrpc_error is not None:
+                    # Same shape as the ``upstream_error`` an ``isError`` result
+                    # yields below: the upstream's own words are the message.
+                    code = "upstream_error"
+                    message = bounded_upstream_message(jsonrpc_error[1]) or (
+                        f"Upstream server '{entry.domain}' answered {tool_name!r} with error {jsonrpc_error[0]}."
+                    )
+                    details.update(upstream_error_code=jsonrpc_error[0])
                 else:
                     code = "execution_error"
                     message = (

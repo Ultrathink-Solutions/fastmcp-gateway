@@ -5,12 +5,16 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import anyio
 import pytest
 from fastmcp import Client, FastMCP
+from fastmcp.exceptions import ToolError
+from mcp import types as mcp_types
+from mcp.shared.exceptions import McpError
 
 from fastmcp_gateway.client_manager import UpstreamManager
 from fastmcp_gateway.meta_tools import register_meta_tools
-from fastmcp_gateway.registry import ToolRegistry
+from fastmcp_gateway.registry import ToolEntry, ToolRegistry
 
 # ---------------------------------------------------------------------------
 # Mock upstream MCP servers
@@ -224,3 +228,190 @@ class TestErrorHandling:
         assert "error" in result
         assert "contacts" in result["error"]
         assert "deals" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# Integration: upstream errors over a real MCP session
+# ---------------------------------------------------------------------------
+
+_BAD_WIDGET = "Tool 'widgets_get' parameter validation failed: widget_id: must start with 'w-'."
+
+
+def _create_protocol_error_server() -> FastMCP:
+    """An upstream that answers some calls with a JSON-RPC error response.
+
+    Several MCP server frameworks validate a call's arguments before the tool
+    runs and report a failure as a ``-32602`` JSON-RPC error rather than as an
+    ``isError`` result. This server's ``tools/call`` handler does the same for
+    a rule its declared schema cannot express, so the error reaches the
+    gateway over a real session exactly as such a server sends it.
+    """
+    mcp = FastMCP("widgets-upstream")
+
+    @mcp.tool()
+    def widgets_get(widget_id: str) -> str:
+        """Fetch one widget."""
+        return json.dumps({"id": widget_id})
+
+    @mcp.tool()
+    def widgets_fail() -> str:
+        """Fail inside the tool (reported as an isError result)."""
+        raise ToolError("widget store refused the request")
+
+    @mcp.tool()
+    def widgets_crash() -> str:
+        """Fail in the request handler (reported as a JSON-RPC internal error)."""
+        return "unreachable"
+
+    @mcp.tool()
+    def widgets_busy() -> str:
+        """Fail in the request handler with the implementation-defined server-error code -32000."""
+        return "unreachable"
+
+    @mcp.tool()
+    def widgets_closed() -> str:
+        """Fail in the request handler with the code and text the MCP client uses for a dropped session."""
+        return "unreachable"
+
+    @mcp.tool()
+    def widgets_hang() -> str:
+        """Never answer in time."""
+        return "unreachable"
+
+    lowlevel = mcp._mcp_server
+    default_handler = lowlevel.request_handlers[mcp_types.CallToolRequest]
+
+    async def handler(request: mcp_types.CallToolRequest) -> mcp_types.ServerResult:
+        if request.params.name == "widgets_crash":
+            raise McpError(mcp_types.ErrorData(code=mcp_types.INTERNAL_ERROR, message="widget index is rebuilding"))
+        if request.params.name == "widgets_busy":
+            raise McpError(mcp_types.ErrorData(code=-32000, message="widget quota exhausted for this hour"))
+        if request.params.name == "widgets_closed":
+            raise McpError(mcp_types.ErrorData(code=mcp_types.CONNECTION_CLOSED, message="Connection closed"))
+        if request.params.name == "widgets_hang":
+            await anyio.sleep(30)
+        widget_id = (request.params.arguments or {}).get("widget_id")
+        if request.params.name == "widgets_get" and not str(widget_id).startswith("w-"):
+            raise McpError(mcp_types.ErrorData(code=mcp_types.INVALID_PARAMS, message=_BAD_WIDGET))
+        return await default_handler(request)
+
+    lowlevel.request_handlers[mcp_types.CallToolRequest] = handler
+    return mcp
+
+
+@pytest.fixture
+async def widgets_gateway() -> FastMCP:
+    """A gateway in front of the protocol-error upstream, plus one unreachable upstream."""
+    registry = ToolRegistry()
+    upstream_manager = UpstreamManager(
+        {
+            "widgets": _create_protocol_error_server(),  # type: ignore[dict-item]
+            # Nothing listens on port 9 (discard) here: every call is refused at connect.
+            "offline": "http://127.0.0.1:9/mcp",
+        },
+        registry,
+    )
+    await upstream_manager.populate_domain("widgets")
+    registry.register_tool(
+        ToolEntry(
+            name="offline_ping",
+            domain="offline",
+            group="general",
+            description="Ping a server that is down.",
+            input_schema={"type": "object", "properties": {}},
+            upstream_url="http://127.0.0.1:9/mcp",
+        )
+    )
+    mcp = FastMCP("widgets-gateway")
+    register_meta_tools(mcp, registry, upstream_manager)
+    return mcp
+
+
+@pytest.fixture
+async def timeout_gateway() -> FastMCP:
+    """A gateway whose execution client to the protocol-error upstream gives up after 0.2 seconds."""
+    registry = ToolRegistry()
+    upstream_manager = UpstreamManager({"widgets": _create_protocol_error_server()}, registry)  # type: ignore[dict-item]
+    await upstream_manager.populate_domain("widgets")
+    upstream_manager._execution_clients["widgets"] = Client(_create_protocol_error_server(), timeout=0.2)
+    mcp = FastMCP("widgets-timeout-gateway")
+    register_meta_tools(mcp, registry, upstream_manager)
+    return mcp
+
+
+class TestUpstreamErrorsOverARealSession:
+    """What a caller is told when an upstream answers a call with an error,
+    when it fails inside the tool, and when it does not answer at all."""
+
+    @pytest.mark.asyncio
+    async def test_a_jsonrpc_argument_rejection_reaches_the_caller_as_invalid_arguments(
+        self, widgets_gateway: FastMCP
+    ) -> None:
+        result = await _call_tool(
+            widgets_gateway, "execute_tool", {"tool_name": "widgets_get", "arguments": {"widget_id": "17"}}
+        )
+
+        assert result["code"] == "invalid_arguments"
+        assert result["error"] == _BAD_WIDGET
+        assert result["details"]["upstream_error_code"] == mcp_types.INVALID_PARAMS
+        assert result["details"]["signature"].startswith("widgets_get(widget_id: str)")
+
+    @pytest.mark.asyncio
+    async def test_the_corrected_call_succeeds(self, widgets_gateway: FastMCP) -> None:
+        result = await _call_tool(
+            widgets_gateway, "execute_tool", {"tool_name": "widgets_get", "arguments": {"widget_id": "w-17"}}
+        )
+
+        assert json.loads(result["result"]) == {"id": "w-17"}
+
+    @pytest.mark.asyncio
+    async def test_another_jsonrpc_answer_reaches_the_caller_as_an_upstream_error(
+        self, widgets_gateway: FastMCP
+    ) -> None:
+        result = await _call_tool(widgets_gateway, "execute_tool", {"tool_name": "widgets_crash", "arguments": {}})
+
+        assert result["code"] == "upstream_error"
+        assert result["error"] == "widget index is rebuilding"
+        assert result["details"]["upstream_error_code"] == mcp_types.INTERNAL_ERROR
+
+    @pytest.mark.asyncio
+    async def test_a_server_sent_minus_32000_is_an_answer_not_a_dropped_session(self, widgets_gateway: FastMCP) -> None:
+        """``-32000`` is also the code the MCP client uses for a dropped session,
+        but on the wire it is the upstream's own answer."""
+        result = await _call_tool(widgets_gateway, "execute_tool", {"tool_name": "widgets_busy", "arguments": {}})
+
+        assert result["code"] == "upstream_error"
+        assert result["error"] == "widget quota exhausted for this hour"
+        assert result["details"]["upstream_error_code"] == -32000
+
+    @pytest.mark.asyncio
+    async def test_a_server_sent_connection_closed_is_an_answer(self, widgets_gateway: FastMCP) -> None:
+        """The same code and text as the MCP client's own dropped-session error,
+        but sent by the upstream, so it is the upstream's answer."""
+        result = await _call_tool(widgets_gateway, "execute_tool", {"tool_name": "widgets_closed", "arguments": {}})
+
+        assert result["code"] == "upstream_error"
+        assert result["error"] == "Connection closed"
+        assert result["details"]["upstream_error_code"] == mcp_types.CONNECTION_CLOSED
+
+    @pytest.mark.asyncio
+    async def test_a_read_timeout_is_still_an_execution_error(self, timeout_gateway: FastMCP) -> None:
+        """The MCP client raises its own ``McpError`` when the deadline passes."""
+        result = await _call_tool(timeout_gateway, "execute_tool", {"tool_name": "widgets_hang", "arguments": {}})
+
+        assert result["code"] == "execution_error"
+        assert result["details"] == {"tool": "widgets_hang", "domain": "widgets"}
+
+    @pytest.mark.asyncio
+    async def test_a_tool_failure_is_still_an_upstream_error(self, widgets_gateway: FastMCP) -> None:
+        result = await _call_tool(widgets_gateway, "execute_tool", {"tool_name": "widgets_fail", "arguments": {}})
+
+        assert result["code"] == "upstream_error"
+        assert "widget store refused the request" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_an_unreachable_upstream_is_still_an_execution_error(self, widgets_gateway: FastMCP) -> None:
+        result = await _call_tool(widgets_gateway, "execute_tool", {"tool_name": "offline_ping", "arguments": {}})
+
+        assert result["code"] == "execution_error"
+        assert result["details"] == {"tool": "offline_ping", "domain": "offline"}

@@ -16,7 +16,7 @@ from fastmcp_gateway.client_manager import UpstreamManager
 from fastmcp_gateway.hooks import ExecutionContext, HookRunner
 from fastmcp_gateway.meta_tools import register_meta_tools
 from fastmcp_gateway.registry import ToolEntry
-from tests.conftest import upstream_status_error
+from tests.conftest import client_session_failure, upstream_jsonrpc_error, upstream_status_error
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -321,6 +321,150 @@ class TestExecuteToolUpstreamRefusal:
 
         assert data["code"] == code
         assert seen == [refusal]
+
+
+# ---------------------------------------------------------------------------
+# Error: upstream answered with a JSON-RPC error
+# ---------------------------------------------------------------------------
+
+_TOO_BIG = "Tool 'people_search' parameter validation failed: limit: Too big: expected number to be <=100."
+
+
+class TestExecuteToolUpstreamJsonRpcError:
+    """An upstream that answers ``tools/call`` with a JSON-RPC error response
+    did receive and judge the call, so the caller gets the upstream's own
+    words. Some MCP server frameworks report an argument that fails the tool's
+    input schema this way (``-32602``) instead of as an ``isError`` result; a
+    caller that sees ``invalid_arguments`` plus the signature can correct the
+    call. Only a failure where no answer arrived stays ``execution_error``."""
+
+    @pytest.mark.asyncio
+    async def test_invalid_params_is_an_argument_error_with_the_upstream_message(
+        self, mcp_server: FastMCP, manager: UpstreamManager
+    ) -> None:
+        manager.execute_tool = AsyncMock(side_effect=upstream_jsonrpc_error(-32602, _TOO_BIG))  # type: ignore[method-assign]
+
+        data = await _call_execute(mcp_server, "apollo_people_search", {"query": "Jane"})
+
+        assert data["code"] == "invalid_arguments"
+        assert data["error"] == _TOO_BIG
+        assert data["details"]["tool"] == "apollo_people_search"
+        assert data["details"]["domain"] == "apollo"
+        assert data["details"]["upstream_error_code"] == -32602
+        assert data["details"]["signature"].startswith("apollo_people_search(query: str)")
+
+    @pytest.mark.parametrize(
+        ("code", "message"),
+        [
+            (-32603, "Internal error: the backing service rejected the request"),
+            (-32601, "Method not found"),
+            (-32001, "Resource not available for this caller"),
+            (-32000, "Rate limit exceeded for this tenant"),
+            (-32000, "Connection closed"),
+            (0, "KeyError: 'region'"),
+            (0, "Request cancelled"),
+        ],
+        ids=[
+            "internal-error",
+            "method-not-found",
+            "server-defined",
+            "server-sent-32000",
+            "server-sent-connection-closed",
+            "server-sent-code-0",
+            "server-sent-request-cancelled",
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_other_answers_carry_the_upstream_message(
+        self, mcp_server: FastMCP, manager: UpstreamManager, code: int, message: str
+    ) -> None:
+        manager.execute_tool = AsyncMock(side_effect=upstream_jsonrpc_error(code, message))  # type: ignore[method-assign]
+
+        data = await _call_execute(mcp_server, "apollo_people_search", {"query": "Jane"})
+
+        assert data["code"] == "upstream_error"
+        assert data["error"] == message
+        assert data["details"] == {"tool": "apollo_people_search", "domain": "apollo", "upstream_error_code": code}
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            client_session_failure(-32000, "Connection closed"),
+            client_session_failure(408, "Timed out while waiting for response to CallToolRequest. Waited 30 seconds."),
+            client_session_failure(-32603, "Internal error"),
+        ],
+        ids=["connection-closed", "read-timeout", "any-code"],
+    )
+    @pytest.mark.asyncio
+    async def test_client_side_session_failures_stay_execution_errors(
+        self, mcp_server: FastMCP, manager: UpstreamManager, failure: Exception
+    ) -> None:
+        """An ``McpError`` that did not arrive from the upstream (the session
+        dropped, a deadline passed) says nothing about the call, whatever its code
+        or message, and is reported as the outage it is. The same code and message
+        sent by the upstream is its answer
+        (``test_other_answers_carry_the_upstream_message``)."""
+        manager.execute_tool = AsyncMock(side_effect=failure)  # type: ignore[method-assign]
+
+        data = await _call_execute(mcp_server, "apollo_people_search", {"query": "Jane"})
+
+        assert data["code"] == "execution_error"
+        assert data["details"] == {"tool": "apollo_people_search", "domain": "apollo"}
+
+    @pytest.mark.asyncio
+    async def test_a_wrapped_jsonrpc_error_is_read_from_the_wrapped_exception(
+        self, mcp_server: FastMCP, manager: UpstreamManager
+    ) -> None:
+        manager.execute_tool = AsyncMock(  # type: ignore[method-assign]
+            side_effect=_wrapped_in_group(upstream_jsonrpc_error(-32602, _TOO_BIG))
+        )
+
+        data = await _call_execute(mcp_server, "apollo_people_search", {"query": "Jane"})
+
+        assert data["code"] == "invalid_arguments"
+        assert data["error"] == _TOO_BIG
+
+    @pytest.mark.asyncio
+    async def test_an_http_refusal_outranks_a_jsonrpc_error_it_wraps(
+        self, mcp_server: FastMCP, manager: UpstreamManager
+    ) -> None:
+        refusal = upstream_status_error(403, _SCOPE_CHALLENGE)
+        refusal.__cause__ = upstream_jsonrpc_error(-32602, _TOO_BIG)
+        manager.execute_tool = AsyncMock(side_effect=refusal)  # type: ignore[method-assign]
+
+        data = await _call_execute(mcp_server, "apollo_people_search", {"query": "Jane"})
+
+        assert data["code"] == "upstream_insufficient_scope"
+
+    @pytest.mark.asyncio
+    async def test_an_overlong_upstream_message_is_bounded(self, mcp_server: FastMCP, manager: UpstreamManager) -> None:
+        manager.execute_tool = AsyncMock(side_effect=upstream_jsonrpc_error(-32602, "x" * 50_000))  # type: ignore[method-assign]
+
+        data = await _call_execute(mcp_server, "apollo_people_search", {"query": "Jane"})
+
+        assert data["code"] == "invalid_arguments"
+        assert len(data["error"]) <= 2_000
+        assert data["error"].endswith("…")
+
+    @pytest.mark.asyncio
+    async def test_a_jsonrpc_answer_still_runs_on_error_hooks(
+        self, populated_registry: ToolRegistry, manager: UpstreamManager
+    ) -> None:
+        seen: list[Exception] = []
+
+        class RecordingHook:
+            async def on_error(self, context: ExecutionContext, error: Exception) -> None:
+                seen.append(error)
+
+        failure = upstream_jsonrpc_error(-32602, _TOO_BIG)
+        manager.execute_tool = AsyncMock(side_effect=failure)  # type: ignore[method-assign]
+        mcp = FastMCP("test-gateway")
+        register_meta_tools(mcp, populated_registry, manager, HookRunner([RecordingHook()]))
+
+        data = await _call_execute(mcp, "apollo_people_search", {"query": "Jane"})
+
+        assert data["code"] == "invalid_arguments"
+        assert seen == [failure]
 
 
 # ---------------------------------------------------------------------------

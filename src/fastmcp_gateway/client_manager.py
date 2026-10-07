@@ -21,14 +21,17 @@ from typing import TYPE_CHECKING, Any
 
 from fastmcp import Client
 from fastmcp.server.dependencies import get_http_headers
+from mcp.shared.exceptions import McpError
 from opentelemetry import trace
 
+from fastmcp_gateway.errors import UpstreamJsonRpcError
 from fastmcp_gateway.sanitize import DEFAULT_MAX_SCHEMA_DEPTH, _validate_max_schema_depth
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Mapping
 
     from fastmcp.client.client import CallToolResult
+    from mcp.types import ErrorData, RequestId
 
     from fastmcp_gateway.access_policy import AccessPolicy
     from fastmcp_gateway.registry import RegistryDiff, ToolRegistry
@@ -81,6 +84,32 @@ async def _call_tool_without_metadata_injection(
         raw_result,
         raise_on_error=False,
     )
+
+
+class _ArrivedErrors:
+    """Records the JSON-RPC error responses that arrive on one MCP session.
+
+    Registered as the session's response router, it sees every error response
+    read from the transport before it is delivered to the waiting request, and
+    nothing the client builds itself (the ``"Connection closed"`` it hands each
+    pending request when the session drops, a read timeout). It never claims a
+    response, so delivery is unchanged. The SDK raises the ``McpError`` for a
+    received error with the same ``ErrorData`` object, so an identity match is
+    how ``execute_tool`` knows the error is the upstream's answer.
+    """
+
+    def __init__(self) -> None:
+        self._errors: list[ErrorData] = []
+
+    def route_response(self, request_id: RequestId, response: dict[str, Any]) -> bool:
+        return False
+
+    def route_error(self, request_id: RequestId, error: ErrorData) -> bool:
+        self._errors.append(error)
+        return False
+
+    def arrived(self, error: ErrorData) -> bool:
+        return any(error is seen for seen in self._errors)
 
 
 def _set_transport_headers(client: Client, headers: dict[str, str]) -> None:
@@ -426,7 +455,11 @@ class UpstreamManager:
         request_meta:
             Exact inbound MCP request metadata to forward. ``None`` stays absent.
 
-        Raises ``KeyError`` if *tool_name* is not in the registry.
+        Raises ``KeyError`` if *tool_name* is not in the registry, and
+        :class:`~fastmcp_gateway.errors.UpstreamJsonRpcError` (an ``McpError``)
+        when the upstream answers the call with a JSON-RPC error response. An
+        ``McpError`` the MCP client raises by itself, because no answer arrived,
+        propagates unchanged.
         """
         with _tracer.start_as_current_span("gateway.upstream.execute") as span:
             span.set_attribute("gateway.tool_name", tool_name)
@@ -446,12 +479,19 @@ class UpstreamManager:
             upstream_name = entry.original_name or entry.name
 
             async with fresh_client:
-                return await _call_tool_without_metadata_injection(
-                    fresh_client,
-                    upstream_name,
-                    arguments or {},
-                    request_meta,
-                )
+                arrived = _ArrivedErrors()
+                fresh_client.session.add_response_router(arrived)
+                try:
+                    return await _call_tool_without_metadata_injection(
+                        fresh_client,
+                        upstream_name,
+                        arguments or {},
+                        request_meta,
+                    )
+                except McpError as exc:
+                    if arrived.arrived(exc.error):
+                        raise UpstreamJsonRpcError(exc.error) from exc
+                    raise
 
     def _make_execution_client(
         self,
