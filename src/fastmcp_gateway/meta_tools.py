@@ -22,7 +22,7 @@ from fastmcp_gateway.errors import (
     parse_www_authenticate,
 )
 from fastmcp_gateway.hooks import ExecutionContext, ExecutionDenied, HookRunner, ListToolsContext
-from fastmcp_gateway.signatures import extract_params, tool_to_signature
+from fastmcp_gateway.signatures import declared_types, extract_params, tool_to_signature, type_admits
 
 if TYPE_CHECKING:
     from fastmcp import FastMCP
@@ -145,12 +145,119 @@ def _suggest_tool_names(query: str, all_names: list[str], max_suggestions: int =
     return [name for _, name in scored[:max_suggestions]]
 
 
+def _is_number(value: Any) -> bool:
+    """``True`` for an int or float that is not a bool (JSON has no bool/number overlap)."""
+    return isinstance(value, int | float) and not isinstance(value, bool)
+
+
+def _plural(count: int, noun: str) -> str:
+    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
+
+
+#: The most characters of a caller's rejected string an error message repeats.
+_MAX_ECHOED_VALUE_CHARS = 80
+
+#: The most allowed values an ``enum`` error lists before summarising the rest.
+_MAX_LISTED_ENUM_VALUES = 20
+
+
+def _echo(value: str) -> str:
+    """*value* as the error message repeats it: its repr, cut to a bound with its real length noted."""
+    if len(value) <= _MAX_ECHOED_VALUE_CHARS:
+        return repr(value)
+    return f"{value[:_MAX_ECHOED_VALUE_CHARS]!r}… ({len(value)} characters)"
+
+
+def _allowed(values: list[str]) -> str:
+    """The allowed values of an ``enum`` as the error message lists them, bounded."""
+    shown = ", ".join(_echo(v) for v in values[:_MAX_LISTED_ENUM_VALUES])
+    hidden = len(values) - _MAX_LISTED_ENUM_VALUES
+    return shown if hidden <= 0 else f"{shown}, … ({hidden} more)"
+
+
+def _describe_value_error(name: str, schema: Any, value: Any) -> str | None:
+    """Return why *value* violates *schema*'s value constraints, or ``None``.
+
+    Checks only keywords whose verdict is unambiguous for a value of the type
+    they constrain, the way a JSON-Schema validator applies them:
+
+    * ``enum`` / ``const`` -- for a string value only (a non-string value of a
+      string-typed enum is a type mismatch the upstream may coerce);
+    * ``minimum`` / ``maximum`` / ``exclusiveMinimum`` / ``exclusiveMaximum``
+      (draft-06+ numeric form) -- for a number value only;
+    * ``type: integer`` (alone or with ``null``) -- a number with a fractional part;
+    * ``minLength`` / ``maxLength`` -- for a string value only;
+    * ``minItems`` / ``maxItems`` -- for an array value only.
+
+    A value the declared ``type`` does not admit (the keyword's own type
+    included: a string sent to a ``type: integer`` parameter), ``None``, a
+    nested object's members and a schema built from ``anyOf`` / ``oneOf`` /
+    ``allOf`` are not judged: the upstream owns the final verdict (it may
+    coerce ``"5"`` to ``5``), and this check only spares it a call it would
+    certainly reject.
+    """
+    if not isinstance(schema, dict) or value is None:
+        return None
+    if any(key in schema for key in ("anyOf", "oneOf", "allOf", "not")):
+        return None
+    names = declared_types(schema)
+    if (
+        isinstance(value, float)
+        and not value.is_integer()
+        and names is not None
+        and "integer" in names
+        and "number" not in names
+    ):
+        return f"{name!r} must be an integer (got {value!r})"
+    if not type_admits(schema, value):
+        return None
+
+    if isinstance(value, str):
+        enum = schema.get("enum")
+        if isinstance(enum, list) and enum and all(isinstance(v, str) for v in enum) and value not in enum:
+            return f"{name!r} must be one of {_allowed(enum)} (got {_echo(value)})"
+        const = schema.get("const")
+        if isinstance(const, str) and value != const:
+            return f"{name!r} must be {_echo(const)} (got {_echo(value)})"
+        min_length = schema.get("minLength")
+        if isinstance(min_length, int) and not isinstance(min_length, bool) and len(value) < min_length:
+            return f"{name!r} must be at least {_plural(min_length, 'character')} (got {len(value)})"
+        max_length = schema.get("maxLength")
+        if isinstance(max_length, int) and not isinstance(max_length, bool) and len(value) > max_length:
+            return f"{name!r} must be at most {_plural(max_length, 'character')} (got {len(value)})"
+        return None
+
+    if _is_number(value):
+        bounds = (
+            ("minimum", ">=", lambda limit: value < limit),
+            ("exclusiveMinimum", ">", lambda limit: value <= limit),
+            ("maximum", "<=", lambda limit: value > limit),
+            ("exclusiveMaximum", "<", lambda limit: value >= limit),
+        )
+        for keyword, relation, violates in bounds:
+            limit = schema.get(keyword)
+            if _is_number(limit) and violates(limit):
+                return f"{name!r} must be {relation} {limit!r} (got {value!r})"
+        return None
+
+    if isinstance(value, list):
+        min_items = schema.get("minItems")
+        if isinstance(min_items, int) and not isinstance(min_items, bool) and len(value) < min_items:
+            return f"{name!r} must have at least {_plural(min_items, 'item')} (got {len(value)})"
+        max_items = schema.get("maxItems")
+        if isinstance(max_items, int) and not isinstance(max_items, bool) and len(value) > max_items:
+            return f"{name!r} must have at most {_plural(max_items, 'item')} (got {len(value)})"
+    return None
+
+
 def _describe_argument_errors(entry: ToolEntry, arguments: dict[str, Any]) -> str | None:
     """Return a human-readable argument-validation error, or ``None`` if *arguments* is valid.
 
     Checks *arguments* against *entry*'s declared JSON-Schema ``properties``
-    for two failure modes: a key absent from ``properties`` ("unknown"), and
-    a key in ``required`` absent from *arguments* ("missing"). Reuses
+    for three failure modes: a key absent from ``properties`` ("unknown"), a
+    key in ``required`` absent from *arguments* ("missing"), and a top-level
+    value outside its property's declared bounds or allowed values (see
+    :func:`_describe_value_error`). Reuses
     :func:`~fastmcp_gateway.signatures.extract_params` (the same param
     extraction the signature renderer uses) so this check can never drift
     from what that renderer reports as the tool's shape.
@@ -169,7 +276,12 @@ def _describe_argument_errors(entry: ToolEntry, arguments: dict[str, Any]) -> st
 
     unknown = sorted(name for name in arguments if name not in known_names)
     missing = sorted(required_names - arguments.keys())
-    if not unknown and not missing:
+    value_errors = [
+        error
+        for p in params
+        if p.name in arguments and (error := _describe_value_error(p.name, p.schema, arguments[p.name])) is not None
+    ]
+    if not unknown and not missing and not value_errors:
         return None
 
     parts: list[str] = []
@@ -177,6 +289,7 @@ def _describe_argument_errors(entry: ToolEntry, arguments: dict[str, Any]) -> st
         parts.append(f"unknown argument(s) {', '.join(repr(n) for n in unknown)}")
     if missing:
         parts.append(f"missing required argument(s) {', '.join(repr(n) for n in missing)}")
+    parts.extend(value_errors)
     return f"Invalid arguments for {entry.name!r}: {'; '.join(parts)}."
 
 

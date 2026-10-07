@@ -84,6 +84,70 @@ def extract_params(input_schema: Any) -> list[ParamInfo]:
     return params
 
 
+#: The JSON-Schema ``type`` names that describe a value of each JSON kind.
+#: ``integer`` counts for a number only when the value has no fractional part.
+_TYPE_NAMES_FOR_KIND: dict[str, frozenset[str]] = {
+    "string": frozenset({"string"}),
+    "number": frozenset({"number", "integer"}),
+    "boolean": frozenset({"boolean"}),
+    "null": frozenset({"null"}),
+    "array": frozenset({"array"}),
+    "object": frozenset({"object"}),
+}
+
+
+def declared_types(schema: Any) -> frozenset[str] | None:
+    """The ``type`` names *schema* declares, or ``None`` when it declares none (any type).
+
+    ``"type": "string"`` and ``"type": ["string", "null"]`` both count; names
+    that are not strings are ignored, and a list naming no string at all is
+    treated as declaring none.
+    """
+    if not isinstance(schema, dict):
+        return None
+    raw = schema.get("type")
+    if isinstance(raw, str):
+        return frozenset({raw})
+    if isinstance(raw, list):
+        names = frozenset(item for item in raw if isinstance(item, str))
+        return names or None
+    return None
+
+
+def _json_kind(value: Any) -> str | None:
+    """The JSON kind of a decoded value (``"string"``, ``"number"``, ...), else ``None``."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int | float):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    return None
+
+
+def type_admits(schema: Any, value: Any) -> bool:
+    """Whether *schema*'s declared ``type`` admits *value*; ``True`` when it declares none.
+
+    ``integer`` admits a number without a fractional part, as JSON Schema
+    specifies (``1.0`` is an integer).
+    """
+    names = declared_types(schema)
+    if names is None:
+        return True
+    kind = _json_kind(value)
+    if kind is None:
+        return False
+    if kind == "number" and "number" not in names and "integer" in names:
+        return isinstance(value, int) or float(value).is_integer()
+    return bool(_TYPE_NAMES_FOR_KIND[kind] & names)
+
+
 def format_schema(schema: Any) -> str:
     """Render a JSON Schema fragment as a Python type annotation string.
 
