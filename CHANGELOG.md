@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`execute_tool`'s local argument check also rejects a value outside its declared bounds or allowed values.** Before this, the pre-flight check caught only an unknown or missing argument name, so a call like `limit=1000` against `maximum: 100`, or `format="json"` against `enum: ["concise", "detailed"]`, went to the upstream, which either rejected it there or failed in a less readable way. The check now also applies these keywords to each top-level argument, the way a JSON-Schema validator would for a value of that type:
+  - `enum` and `const` to a string;
+  - `minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum` (numeric form) and a fractional value for `type: integer` to a number;
+  - `minLength`/`maxLength` to a string and `minItems`/`maxItems` to an array.
+
+  Every violation is named in one `invalid_arguments` message, alongside unknown and missing names, with `details.signature` as before (for example, `'limit' must be <= 100 (got 1000)`).
+
+  To stay strictly narrower than the upstream's own validation, the check leaves these alone:
+  - a value the declared `type` does not admit, for every keyword (an upstream may coerce `"5"` to `5`), except a fractional number for an integer parameter;
+  - `null`;
+  - members of a nested object;
+  - a property declared through `anyOf`/`oneOf`/`allOf`/`not`.
+
 ### Changed
 
 - **`execute_tool` passes an upstream's JSON-RPC error answer through instead of reporting an execution error.** Some MCP server frameworks reject a call whose arguments fail the tool's input schema with a JSON-RPC error response (`-32602`, Invalid params) rather than an `isError` result. That rejection used to become `code="execution_error"` with a fixed "returned an error" message, so a caller could not tell a correctable argument from an outage, and an LLM caller would report the upstream as down and retry the same call. Now:

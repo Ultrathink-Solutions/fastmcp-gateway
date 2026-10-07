@@ -472,6 +472,48 @@ class TestExecuteToolUpstreamJsonRpcError:
 # ---------------------------------------------------------------------------
 
 
+_BOUNDED_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "query": {"type": "string"},
+        "limit": {"type": "integer", "exclusiveMinimum": 0, "maximum": 100},
+        "ratio": {"type": "number", "minimum": 0, "maximum": 1},
+        "format": {"type": "string", "enum": ["concise", "detailed"], "default": "concise"},
+        "status": {"const": "open"},
+        "name": {"type": "string", "minLength": 1, "maxLength": 10},
+        "tags": {"type": "array", "items": {"type": "string"}, "maxItems": 3},
+        "filter": {"type": "object", "properties": {"deep": {"type": "object"}}},
+        "window": {"anyOf": [{"type": "integer", "maximum": 30}, {"type": "null"}]},
+        "label": {"type": "string", "maximum": 5},
+        "page": {"type": ["integer", "null"]},
+    },
+    "required": ["query"],
+    "additionalProperties": False,
+}
+
+
+def _bounded_gateway(registry: ToolRegistry) -> tuple[FastMCP, AsyncMock]:
+    """A gateway whose one tool declares value bounds, with a stubbed upstream call."""
+    registry.set_domain_description("svc", "Bounded tools")
+    registry.register_tool(
+        ToolEntry(
+            name="svc_search",
+            domain="svc",
+            group="search",
+            description="Search with bounded arguments.",
+            input_schema=_BOUNDED_SCHEMA,
+            upstream_url="http://svc-mcp:8080/mcp",
+        )
+    )
+    with patch("fastmcp_gateway.client_manager.Client"):
+        manager = UpstreamManager({"svc": "http://svc-mcp:8080/mcp"}, registry)
+    execute = AsyncMock(return_value=_fake_result("ok"))
+    manager.execute_tool = execute  # type: ignore[method-assign]
+    mcp = FastMCP("test-gateway")
+    register_meta_tools(mcp, registry, manager)
+    return mcp, execute
+
+
 class TestExecuteToolArgumentValidation:
     """A call whose arguments don't match the tool's declared schema is
     rejected before it ever reaches the upstream server, with the tool's
@@ -515,6 +557,145 @@ class TestExecuteToolArgumentValidation:
         assert "bogus" in data["error"]
         assert "apollo_people_search(query: str)" in data["details"]["signature"]
         manager.execute_tool.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("arguments", "named"),
+        [
+            ({"limit": 1000}, ("limit", "100", "1000")),
+            ({"limit": 0}, ("limit", "0")),
+            ({"limit": 2.5}, ("limit", "2.5")),
+            ({"page": 1.5}, ("page", "1.5")),
+            ({"ratio": 1.5}, ("ratio", "1", "1.5")),
+            ({"ratio": -0.1}, ("ratio", "0", "-0.1")),
+            ({"format": "json"}, ("format", "concise", "detailed", "json")),
+            ({"status": "pending"}, ("status", "open", "pending")),
+            ({"name": "abcdefghijk"}, ("name", "10", "11")),
+            ({"name": ""}, ("name", "1", "0")),
+            ({"tags": ["a", "b", "c", "d"]}, ("tags", "3", "4")),
+        ],
+        ids=[
+            "above-maximum",
+            "at-exclusive-minimum",
+            "fractional-integer",
+            "fractional-nullable-integer",
+            "number-above-maximum",
+            "number-below-minimum",
+            "outside-enum",
+            "not-the-const",
+            "string-too-long",
+            "string-too-short",
+            "array-too-long",
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_a_value_outside_the_declared_bounds_is_rejected_before_dispatch(
+        self, registry: ToolRegistry, arguments: dict[str, Any], named: tuple[str, ...]
+    ) -> None:
+        """The error names the argument, the limit or allowed values it broke,
+        and what was sent, so a caller can correct the call without a second
+        round trip."""
+        mcp, execute = _bounded_gateway(registry)
+
+        data = await _call_execute(mcp, "svc_search", {"query": "q", **arguments})
+
+        assert data["code"] == "invalid_arguments"
+        for token in named:
+            assert token in data["error"]
+        assert data["details"]["signature"].startswith("svc_search(")
+        execute.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_long_rejected_value_is_not_echoed_in_full(self, registry: ToolRegistry) -> None:
+        mcp, execute = _bounded_gateway(registry)
+        rejected = "x" * 5_000
+
+        data = await _call_execute(mcp, "svc_search", {"query": "q", "format": rejected, "status": rejected})
+
+        assert data["code"] == "invalid_arguments"
+        assert rejected not in data["error"]
+        assert "5000" in data["error"]
+        assert len(data["error"]) < 1_000
+        execute.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_long_enum_is_summarised(self, registry: ToolRegistry) -> None:
+        registry.set_domain_description("svc", "Bounded tools")
+        allowed = [f"value_{i}" for i in range(500)]
+        registry.register_tool(
+            ToolEntry(
+                name="svc_pick",
+                domain="svc",
+                group="pick",
+                description="Pick one.",
+                input_schema={"type": "object", "properties": {"choice": {"type": "string", "enum": allowed}}},
+                upstream_url="http://svc-mcp:8080/mcp",
+            )
+        )
+        with patch("fastmcp_gateway.client_manager.Client"):
+            manager = UpstreamManager({"svc": "http://svc-mcp:8080/mcp"}, registry)
+        manager.execute_tool = AsyncMock(return_value=_fake_result("ok"))  # type: ignore[method-assign]
+        mcp = FastMCP("test-gateway")
+        register_meta_tools(mcp, registry, manager)
+
+        data = await _call_execute(mcp, "svc_pick", {"choice": "nope"})
+
+        assert data["code"] == "invalid_arguments"
+        assert "value_0" in data["error"]
+        assert "value_499" not in data["error"]
+        assert "480 more" in data["error"]
+        manager.execute_tool.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_every_violation_is_named_in_one_error(self, registry: ToolRegistry) -> None:
+        mcp, execute = _bounded_gateway(registry)
+
+        data = await _call_execute(mcp, "svc_search", {"query": "q", "limit": 1000, "format": "json", "bogus": 1})
+
+        assert data["code"] == "invalid_arguments"
+        for name in ("bogus", "format", "limit"):
+            assert name in data["error"]
+        execute.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "arguments",
+        [
+            {"limit": 100, "ratio": 0, "format": "detailed", "status": "open", "name": "a", "tags": ["a", "b", "c"]},
+            {"limit": 1.0},
+            {"limit": None},
+            {"limit": "5"},
+            {"format": 3},
+            {"ratio": True},
+            {"filter": {"deep": {"limit": 10_000}}},
+            {"window": 10_000},
+            {"label": 10},
+        ],
+        ids=[
+            "at-every-bound",
+            "integral-float",
+            "explicit-null",
+            "numeric-string",
+            "non-string-enum-value",
+            "bool-for-a-number",
+            "nested-object-is-not-checked",
+            "combinator-is-not-checked",
+            "value-of-an-undeclared-type",
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_values_the_check_does_not_judge_reach_the_upstream(
+        self, registry: ToolRegistry, arguments: dict[str, Any]
+    ) -> None:
+        """The check rejects only what a JSON-Schema validator would reject on
+        the value's own type, for the keywords it understands. A type mismatch
+        (an upstream may coerce ``"5"`` to ``5``), an explicit ``null``, a
+        nested object, and a property declared through ``anyOf``/``oneOf`` are
+        left to the upstream, which owns the final verdict."""
+        mcp, execute = _bounded_gateway(registry)
+
+        data = await _call_execute(mcp, "svc_search", {"query": "q", **arguments})
+
+        assert data == {"tool": "svc_search", "result": "ok"}
+        execute.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_schema_without_properties_is_not_validated(self, registry: ToolRegistry) -> None:
