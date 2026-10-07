@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.32.0] - 2026-10-07
 
 ### Added
 
@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Only what the declared `type` admits is shown. An `enum` value of another type is left out (`{"type": "string", "enum": ["open", 1]}` renders as `Literal['open']`), and so is a bound for another type (`maximum` on a string). A parameter whose `type` admits several bounded types shows each type's bounds, labelled with the type: `Annotated[float | list, 'float: x >= 0; list: len(x) <= 5']`. An `enum` containing a float renders as `Annotated[float, 'one of 1.5, 2.5']`, because `Literal` admits no float. Where both an inclusive and an exclusive limit are declared, the stricter one is shown.
 
-  A parameter without bounds or allowed values renders exactly as before. **Compatibility:** a consumer that parses signature text (instead of reading `inputSchema`) should expect the two new forms.
+  A parameter without bounds or allowed values renders exactly as before. **Compatibility:** a consumer that parses signature text (instead of reading `inputSchema`) should expect the two new forms. (#97)
 
 - **`execute_tool`'s local argument check also rejects a value outside its declared bounds or allowed values.** Before this, the pre-flight check caught only an unknown or missing argument name, so a call like `limit=1000` against `maximum: 100`, or `format="json"` against `enum: ["concise", "detailed"]`, went to the upstream, which either rejected it there or failed in a less readable way. The check now also applies these keywords to each top-level argument, the way a JSON-Schema validator would for a value of that type:
   - `enum` and `const` to a string;
@@ -30,7 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - a value the declared `type` does not admit, for every keyword (an upstream may coerce `"5"` to `5`), except a fractional number for an integer parameter;
   - `null`;
   - members of a nested object;
-  - a property declared through `anyOf`/`oneOf`/`allOf`/`not`.
+  - a property declared through `anyOf`/`oneOf`/`allOf`/`not`. (#96)
 
 ### Changed
 
@@ -41,7 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   An HTTP 401/403 still classifies first. The upstream message is stripped and cut to 2,000 characters. The span attribute `gateway.error_code` carries the chosen code, and `record_exception` plus the `on_error` hook still run on every path.
 
-  **Compatibility:** a caller that treated every `execution_error` as an outage was already right to do so for the cases that remain. A caller that branched on `upstream_error` for `isError` results now also sees it for JSON-RPC error answers; read `details.upstream_error_code` to tell them apart.
+  **Compatibility:** a caller that treated every `execution_error` as an outage was already right to do so for the cases that remain. A caller that branched on `upstream_error` for `isError` results now also sees it for JSON-RPC error answers; read `details.upstream_error_code` to tell them apart. (#95)
 
 ## [0.31.0] - 2026-09-15
 
