@@ -27,7 +27,7 @@ from fastmcp_gateway.gateway import GatewayServer
 from fastmcp_gateway.hooks import HookRunner
 from fastmcp_gateway.meta_tools import register_meta_tools
 from fastmcp_gateway.registry import ToolRegistry
-from tests.conftest import result_payload, upstream_status_error
+from tests.conftest import client_session_failure, result_payload, upstream_jsonrpc_error, upstream_status_error
 
 
 @pytest.fixture(autouse=True)
@@ -252,6 +252,34 @@ class TestExecuteToolSpans:
         assert len(spans) == 1
         attrs = dict(spans[0].attributes or {})
         assert attrs.get("gateway.error_code") == "upstream_insufficient_scope"
+        assert any(e.name == "exception" for e in spans[0].events)
+
+    @pytest.mark.parametrize(
+        ("failure", "code"),
+        [
+            (upstream_jsonrpc_error(-32602, "limit: Too big"), "invalid_arguments"),
+            (upstream_jsonrpc_error(-32603, "backend refused"), "upstream_error"),
+            (client_session_failure(-32000, "Connection closed"), "execution_error"),
+        ],
+        ids=["invalid-params", "other-answer", "session-dropped"],
+    )
+    @pytest.mark.asyncio
+    async def test_a_jsonrpc_error_records_its_error_code_and_the_exception(
+        self,
+        mcp_server: FastMCP,
+        manager: UpstreamManager,
+        exporter: InMemorySpanExporter,
+        failure: Exception,
+        code: str,
+    ) -> None:
+        manager.execute_tool = AsyncMock(side_effect=failure)  # type: ignore[method-assign]
+
+        async with Client(mcp_server) as client:
+            await client.call_tool("execute_tool", {"tool_name": "apollo_people_search"})
+
+        spans = _get_spans(exporter, "gateway.execute_tool")
+        assert len(spans) == 1
+        assert dict(spans[0].attributes or {}).get("gateway.error_code") == code
         assert any(e.name == "exception" for e in spans[0].events)
 
     @pytest.mark.parametrize(

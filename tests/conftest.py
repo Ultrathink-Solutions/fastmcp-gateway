@@ -9,7 +9,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+from mcp.shared.exceptions import McpError
+from mcp.types import ErrorData
 
+from fastmcp_gateway.errors import UpstreamJsonRpcError
 from fastmcp_gateway.registry import ToolEntry, ToolRegistry
 
 if TYPE_CHECKING:
@@ -49,6 +52,16 @@ def upstream_status_error(status_code: int, www_authenticate: str | None = None)
         request=httpx.Request("POST", "http://upstream:8080/mcp"),
         response=httpx.Response(status_code, headers=headers),
     )
+
+
+def upstream_jsonrpc_error(code: int, message: str) -> UpstreamJsonRpcError:
+    """What ``UpstreamManager.execute_tool`` raises when the upstream answers with a JSON-RPC error."""
+    return UpstreamJsonRpcError(ErrorData(code=code, message=message))
+
+
+def client_session_failure(code: int, message: str) -> McpError:
+    """An ``McpError`` the MCP client raised itself because no answer arrived."""
+    return McpError(ErrorData(code=code, message=message))
 
 
 @dataclass

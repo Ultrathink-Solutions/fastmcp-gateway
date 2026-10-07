@@ -6,6 +6,7 @@ import json
 import re
 from typing import TYPE_CHECKING, Any
 
+from mcp.shared.exceptions import McpError
 from pydantic import BaseModel
 
 if TYPE_CHECKING:
@@ -116,6 +117,52 @@ def _walk_wrapped_exceptions(exc: BaseException) -> Iterator[BaseException]:
             pending.append(current.__cause__)
         if isinstance(current, BaseExceptionGroup):
             pending.extend(reversed(current.exceptions))
+
+
+class UpstreamJsonRpcError(McpError):
+    """The JSON-RPC error response an upstream server sent for a call.
+
+    The MCP client raises ``McpError`` both for an error response the server
+    sent and for failures it builds itself when no answer arrived (the session
+    dropped with the request pending, a read deadline passed), and code and
+    message do not tell them apart: a server may answer with ``-32000`` or with
+    ``"Connection closed"``. ``UpstreamManager.execute_tool`` therefore marks the
+    errors that actually arrived on the call's session by raising this subclass
+    (chained to the original), so a caller can trust its message as the
+    upstream's own words. An ``McpError`` that is not one is not an answer.
+    """
+
+
+#: JSON-RPC 2.0 ``Invalid params``: the code an upstream answers when the
+#: call's arguments fail the tool's input schema.
+INVALID_PARAMS = -32602
+
+#: Upper bound on an upstream error message copied into an envelope. Long
+#: enough for any validation report; short enough that an upstream cannot
+#: flood the caller's context through an error.
+MAX_UPSTREAM_MESSAGE_CHARS = 2_000
+
+
+def _find_jsonrpc_error(exc: BaseException) -> tuple[int, str] | None:
+    """Return ``(code, message)`` of the upstream's JSON-RPC answer *exc* is or wraps, else ``None``.
+
+    Only an :class:`UpstreamJsonRpcError` counts; any other ``McpError`` is a
+    failure the MCP client raised itself. The search visits exceptions in
+    :func:`_walk_wrapped_exceptions` order, so the outermost answer wins, as in
+    :func:`_find_upstream_response`.
+    """
+    for current in _walk_wrapped_exceptions(exc):
+        if isinstance(current, UpstreamJsonRpcError):
+            return current.error.code, current.error.message
+    return None
+
+
+def bounded_upstream_message(message: str) -> str:
+    """*message* stripped and cut to :data:`MAX_UPSTREAM_MESSAGE_CHARS`, ending in ``…`` when cut."""
+    text = message.strip()
+    if len(text) <= MAX_UPSTREAM_MESSAGE_CHARS:
+        return text
+    return text[: MAX_UPSTREAM_MESSAGE_CHARS - 1] + "…"
 
 
 def _find_upstream_response(exc: BaseException) -> Any | None:

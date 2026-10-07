@@ -3,11 +3,20 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import httpx
 
-from fastmcp_gateway.errors import GatewayError, _find_upstream_response, error_response, parse_www_authenticate
-from tests.conftest import upstream_status_error
+from fastmcp_gateway.errors import (
+    MAX_UPSTREAM_MESSAGE_CHARS,
+    GatewayError,
+    _find_jsonrpc_error,
+    _find_upstream_response,
+    bounded_upstream_message,
+    error_response,
+    parse_www_authenticate,
+)
+from tests.conftest import client_session_failure, upstream_jsonrpc_error, upstream_status_error
 
 
 class TestGatewayError:
@@ -190,3 +199,65 @@ class TestFindUpstreamResponse:
         second.__cause__ = first
 
         assert _find_upstream_response(first) is None
+
+
+class TestFindJsonRpcError:
+    def test_bare_jsonrpc_error(self) -> None:
+        assert _find_jsonrpc_error(upstream_jsonrpc_error(-32602, "bad limit")) == (-32602, "bad limit")
+
+    def test_jsonrpc_error_behind_an_explicit_cause(self) -> None:
+        outer = RuntimeError("upstream call failed")
+        outer.__cause__ = upstream_jsonrpc_error(-32603, "boom")
+
+        assert _find_jsonrpc_error(outer) == (-32603, "boom")
+
+    def test_jsonrpc_error_inside_an_exception_group(self) -> None:
+        group = ExceptionGroup("upstream call failed", [ValueError("unrelated"), upstream_jsonrpc_error(-32602, "x")])
+
+        assert _find_jsonrpc_error(group) == (-32602, "x")
+
+    def test_the_outermost_error_wins(self) -> None:
+        outer = upstream_jsonrpc_error(-32603, "outer")
+        outer.__cause__ = upstream_jsonrpc_error(-32602, "inner")
+
+        assert _find_jsonrpc_error(outer) == (-32603, "outer")
+
+    def test_implicit_context_is_not_followed(self) -> None:
+        later = httpx.ConnectError("connection refused")
+        later.__context__ = upstream_jsonrpc_error(-32602, "earlier")
+
+        assert _find_jsonrpc_error(later) is None
+
+    def test_an_mcp_error_the_client_raised_is_not_an_answer(self) -> None:
+        assert _find_jsonrpc_error(client_session_failure(-32000, "Connection closed")) is None
+
+    def test_an_answer_behind_a_client_failure_is_found(self) -> None:
+        outer = client_session_failure(-32603, "outer")
+        outer.__cause__ = upstream_jsonrpc_error(-32602, "inner")
+
+        assert _find_jsonrpc_error(outer) == (-32602, "inner")
+
+    def test_a_duck_typed_error_is_not_an_answer(self) -> None:
+        impostor = RuntimeError("not an MCP error")
+        impostor.error = SimpleNamespace(code=-32602, message="x")  # type: ignore[attr-defined]
+
+        assert _find_jsonrpc_error(impostor) is None
+
+    def test_no_jsonrpc_error(self) -> None:
+        assert _find_jsonrpc_error(ValueError("boom")) is None
+
+
+class TestBoundedUpstreamMessage:
+    def test_short_message_is_stripped_only(self) -> None:
+        assert bounded_upstream_message("  limit: Too big  ") == "limit: Too big"
+
+    def test_message_at_the_bound_is_kept_whole(self) -> None:
+        text = "x" * MAX_UPSTREAM_MESSAGE_CHARS
+
+        assert bounded_upstream_message(text) == text
+
+    def test_long_message_is_cut_to_the_bound_with_an_ellipsis(self) -> None:
+        bounded = bounded_upstream_message("x" * (MAX_UPSTREAM_MESSAGE_CHARS + 1))
+
+        assert len(bounded) == MAX_UPSTREAM_MESSAGE_CHARS
+        assert bounded.endswith("…")
