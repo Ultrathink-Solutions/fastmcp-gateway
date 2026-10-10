@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **The meta-tool descriptions are written for the model that reads them.** An LLM caller sees only each meta-tool's description and its input schema. `execute_tool`'s description described its Python return type, cited a "legacy string envelope", and named internal classes. No parameter of any meta-tool had a description. Each description now says what the tool does, when to use it, what each parameter means, what comes back, and what an error looks like. Every parameter now carries a description in the input schema. What changed per tool:
+  - `execute_tool` lists the success shape `{"tool", "result"}` and each error `code` with what to do about it. It also says that an error comes back as an ordinary result rather than a failed call.
+  - `get_tool_schema` says when a signature is not enough.
+  - `refresh_registry` says that a change to an already-loaded upstream's tools is held back until an operator acknowledges it.
+  - `execute_code` says how a script's value, a tool's error and a sandbox failure come back.
+
+  A new test reads the meta-tools the way a client lists them and fails if any of them names a file path or an internal type, has a description shorter than two sentences, or serves a parameter without a description. Behaviour is unchanged.
+
 ## [0.32.0] - 2026-10-07
 
 ### Added
