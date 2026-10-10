@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.33.0] - 2026-10-10
 
 ### Changed
 
@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `refresh_registry` says that a change to an already-loaded upstream's tools is held back until an operator acknowledges it.
   - `execute_code` says how a script's value, a tool's error and a sandbox failure come back.
 
-  A new test reads the meta-tools the way a client lists them and fails if any of them names a file path or an internal type, has a description shorter than two sentences, or serves a parameter without a description. Behaviour is unchanged.
+  A new test reads the meta-tools the way a client lists them and fails if any of them names a file path or an internal type, has a description shorter than two sentences, or serves a parameter without a description. Behaviour is unchanged. (#99)
 
 ## [0.32.0] - 2026-10-07
 
