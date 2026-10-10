@@ -67,13 +67,13 @@ The gateway starts on `http://0.0.0.0:8080/mcp` and exposes 4 tools to any MCP c
 
 1. **`discover_tools()`** — Call with no arguments to see all domains and tool counts. Call with `domain="apollo"` to see that domain's tools with descriptions. Returns each tool as a Python-style function signature by default (`apollo_search(query: str, limit: int = None) -> any`) — useful when the LLM will subsequently write code against the listed tools. Pass `format="schema"` to receive the JSON summary instead.
 
-2. **`get_tool_schema("apollo_people_search")`** — Returns the full JSON Schema for a tool's parameters. Supports fuzzy matching.
+2. **`get_tool_schema("apollo_people_search")`** — Returns the full JSON Schema for a tool's parameters, for when a signature is not enough (parameter descriptions, nested objects' required fields and bounds). The name must match exactly; an unknown name returns `tool_not_found` with up to three similar names as suggestions.
 
-3. **`execute_tool("apollo_people_search", {"query": "Anthropic"})`** — Routes the call to the correct upstream server and returns the result.
+3. **`execute_tool("apollo_people_search", {"query": "Anthropic"})`** — Routes the call to the correct upstream server and returns `{"tool": ..., "result": ...}`, or a structured error whose `code` says what to do next (see [Error Handling](#error-handling)).
 
-4. **`refresh_registry()`** — Re-query all upstream servers and return a summary of added/removed tools per domain. Useful when upstreams are updated while the gateway is running.
+4. **`refresh_registry()`** — Re-query all upstream servers and return a summary of added/removed tools per domain. Picks up an upstream that was unreachable at startup. A change to an already-loaded upstream's tools (names, descriptions or input schemas) is refused, and the previous tools stay in place, until an operator acknowledges the new schema digest with `POST /registry/servers/refresh?expected_digest=<digest>` (body `{"domain": "..."}`).
 
-LLMs learn the workflow from the gateway's built-in system instructions and only load schemas for tools they actually need.
+LLMs learn the workflow from the gateway's built-in system instructions and only load schemas for tools they actually need. Each meta-tool's description (what it does, when to use it, what each parameter means, what comes back and what an error looks like) is written for the model that reads it; `tests/test_meta_tool_descriptions.py` keeps it free of implementation detail.
 
 ## Configuration
 

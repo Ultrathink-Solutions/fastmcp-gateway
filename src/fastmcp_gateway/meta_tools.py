@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 from copy import deepcopy
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from fastmcp import Context  # noqa: TC002 - FastMCP resolves Context for injection at runtime.
 from fastmcp.tools import ToolResult
 from mcp.types import TextContent, ToolAnnotations
 from opentelemetry import trace
+from pydantic import Field
 
 from fastmcp_gateway.errors import (
     INVALID_PARAMS,
@@ -309,6 +310,12 @@ def register_meta_tools(
     When *code_mode_runner* is provided (see
     :class:`~fastmcp_gateway.code_mode.CodeModeRunner`), additionally
     registers an experimental ``execute_code`` meta-tool.
+
+    Each meta-tool's docstring is served verbatim as its MCP description,
+    and each parameter's ``Field(description=...)`` is served in its input
+    schema. Both are written for the model that calls the tool, so they
+    use Markdown rather than reST and say only what the code does.
+    ``tests/test_meta_tool_descriptions.py`` holds them to that.
     """
     if hook_runner is None:
         hook_runner = HookRunner()
@@ -349,23 +356,65 @@ def register_meta_tools(
         output_schema=None,
     )
     async def discover_tools(
-        domain: str | None = None,
-        group: str | None = None,
-        query: str | None = None,
-        format: Literal["schema", "signatures"] = "signatures",
+        domain: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "A domain name from the no-argument listing, such as `widgets`. Lists that domain's tools. "
+                    "Omit it to list the domains."
+                )
+            ),
+        ] = None,
+        group: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "A group name from the domain's `groups`. Narrows the listing to that group. "
+                    "Ignored unless `domain` is also given."
+                )
+            ),
+        ] = None,
+        query: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Keywords to search for across every domain. A tool matches when every space-separated "
+                    "word appears, ignoring case, in its name or description (or in the name its own server "
+                    "gives it). When given, `domain` and `group` are ignored."
+                )
+            ),
+        ] = None,
+        format: Annotated[
+            Literal["schema", "signatures"],
+            Field(
+                description=(
+                    "`signatures` (the default) returns one callable signature per tool. "
+                    "`schema` returns JSON instead. The no-argument domain listing is always JSON."
+                )
+            ),
+        ] = "signatures",
     ) -> ToolResult:
-        """Browse available tools by domain, group, or keyword.
+        """Find the tools this gateway can run, and learn how to call them.
 
-        Call with no arguments to see all available domains and their tool counts.
-        Call with a domain to see groups and tools within that domain.
-        Call with a domain and group to see tools in that specific group.
-        Call with a query to search across all tools by keyword.
+        Start here when you need a tool you have not used yet in this conversation. Call it with no
+        arguments to list the domains (each a set of related tools from one server). Then pass `domain`
+        to list one domain's tools, add `group` to narrow that list, or pass `query` to search every
+        domain by keyword. Tools the gateway hides from you are not listed.
 
-        Default ``signatures`` renders each tool as ``name(arg: type, ...)``
-        so a caller can call ``execute_tool`` without a second
-        ``get_tool_schema`` round-trip; pass ``format="schema"`` for the
-        JSON summary. The domain summary (no-arguments form) ignores
-        ``format`` and always returns JSON.
+        With no arguments, it returns JSON:
+        `{"domains": [{"name", "description", "tool_count", "groups"}], "total_tools"}`.
+
+        Otherwise it returns one Python-style signature per tool, followed by an indented line with
+        the tool's description when it has one, for example
+        `widgets_list(status: Literal['open', 'closed'], limit: Annotated[int, '1 <= limit <= 100'] = None) -> any`.
+        Required parameters come first, and optional ones end in `= None`. Pass those names and values
+        to `execute_tool` as `arguments`. With `format="schema"`, it returns JSON that lists each tool's
+        `name` and `description`, plus its `domain` and `group` where your request did not already fix
+        them. An empty listing means no tool matched.
+
+        An unknown `domain` or `group` returns `{"error": "...", "code": "domain_not_found"}` (or
+        `"group_not_found"`), with the valid names in `details.available_domains` (or
+        `details.available_groups`).
         """
         with _tracer.start_as_current_span("gateway.discover_tools") as span:
             if domain:
@@ -500,12 +549,24 @@ def register_meta_tools(
         # double-encodes the payload.
         output_schema=None,
     )
-    async def get_tool_schema(tool_name: str) -> ToolResult:
-        """Get the full parameter schema for a specific tool.
+    async def get_tool_schema(
+        tool_name: Annotated[
+            str,
+            Field(description="The tool's exact name, as `discover_tools` lists it, such as `widgets_list`."),
+        ],
+    ) -> ToolResult:
+        """Get one tool's full JSON Schema for its arguments.
 
-        Call this after discover_tools to get the complete input schema
-        before calling execute_tool. Returns the JSON Schema that describes
-        what arguments the tool accepts.
+        Use it only when the signature from `discover_tools` is not enough. A signature shows each
+        parameter's name, type, and top-level allowed values and bounds. It does not show what each
+        parameter means, or which fields of a nested object are required and what values they accept.
+
+        Returns JSON: `{"name", "domain", "group", "description", "parameters"}`, where `parameters`
+        is the tool's input JSON Schema. Build `execute_tool`'s `arguments` to match it.
+
+        The name must match exactly. An unknown name, or a tool hidden from you, returns
+        `{"error": "...", "code": "tool_not_found", "details": {"tool_name", "suggestions"}}`, where
+        `suggestions` lists up to three similar tool names.
         """
         with _tracer.start_as_current_span("gateway.get_tool_schema") as span:
             span.set_attribute("gateway.tool_name", tool_name)
@@ -570,26 +631,60 @@ def register_meta_tools(
         # on the wire is exactly what ``transform_result`` deposited.
         output_schema=None,
     )
+    # Result channels (for maintainers; the docstring below is what the model
+    # reads). Success and an upstream ``isError`` result carry the text block
+    # built below and forward the upstream's ``structured_content`` (as the
+    # upstream sent it, or as a ``transform_result`` hook rewrote it) on MCP's
+    # ``structuredContent``. A failure the gateway itself reports (unknown tool,
+    # hook denial, local argument check, upstream exception) has no upstream
+    # result to source ``structuredContent`` from, so it carries the
+    # ``GatewayError`` JSON text only (see ``_error_result``).
     async def execute_tool(
-        tool_name: str,
-        arguments: dict[str, Any] | None = None,
+        tool_name: Annotated[
+            str,
+            Field(description="The tool's exact name, as `discover_tools` lists it, such as `widgets_list`."),
+        ],
+        arguments: Annotated[
+            dict[str, Any] | None,
+            Field(
+                description=(
+                    "The tool's arguments as a JSON object, keyed by the parameter names in its signature, "
+                    'such as `{"status": "open", "limit": 10}`. Leave out optional parameters you do not '
+                    "need. Omit `arguments` entirely for a tool that takes none."
+                )
+            ),
+        ] = None,
         request_ctx: Context | None = None,
     ) -> ToolResult:
-        """Execute a tool by name with the given arguments.
+        """Run one tool and return its result.
 
-        Use discover_tools to find available tools, then get_tool_schema
-        to see what arguments a tool accepts, then call this to execute it.
+        Call it once you know the tool's name and parameters, from `discover_tools` (or from an earlier
+        call in this conversation). The gateway sends the call to the server that owns the tool, so this
+        can change data there.
 
-        Returns a :class:`fastmcp.tools.tool.ToolResult` on success and on
-        upstream errors -- the result carries the legacy
-        ``{"tool": ..., "result": ...}`` string envelope as a TextContent
-        block (for agents parsing the inner ``result`` field) and forwards
-        the upstream ``CallToolResult.structured_content`` (if a
-        :meth:`Hook.transform_result` hook populated it) on the standard
-        MCP ``structuredContent`` channel.  Gateway-level failures
-        (tool not found, hook denial, upstream exception) return the
-        legacy string envelope only -- there is no upstream
-        ``CallToolResult`` to source ``structured_content`` from.
+        On success the text is JSON, `{"tool": "<name>", "result": "<the tool's own output>"}`. The
+        `result` value is a string, so a tool that returns JSON has its JSON inside that string. When
+        the tool also returns a structured object, it is passed through as the result's structured
+        content.
+
+        On failure the text is JSON, `{"error": "<what went wrong>", "code": "<code>", "details": {...}}`.
+        The error comes back as an ordinary result, not as a failed call, so read `code`:
+        - `tool_not_found`: no tool has that name. `details.suggestions` lists up to three similar
+          names you can use.
+        - `invalid_arguments`: the arguments do not fit the tool. Before sending the call, the gateway
+          checks for unknown names, missing required ones, and values outside a parameter's allowed
+          values or bounds. The tool's server can reject other mistakes with the same code.
+          `details.signature` shows the expected call. Fix the arguments and call again.
+        - `upstream_error`: the tool's server received the call and answered with an error, whose
+          message is in `error`.
+        - `upstream_unauthorized` or `upstream_insufficient_scope`: the tool's server refused you.
+          `details.required_scope` names the missing scope when the server gave one. Retrying will not
+          help until your access changes.
+        - `execution_error`: the call failed before the tool's server answered it (unreachable, timed
+          out, or an HTTP failure). Tools from other domains may still work.
+
+        The gateway can also refuse a call by its own policy, with that policy's code, for example
+        `forbidden`.
         """
         request_meta = _request_meta_snapshot(request_ctx)
         inbound_meta_snapshot = None if request_meta is None else MappingProxyType(request_meta)
@@ -865,11 +960,17 @@ def register_meta_tools(
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, openWorldHint=False))
     async def refresh_registry() -> str:
-        """Refresh the tool registry by re-querying all upstream MCP servers.
+        """Ask every server behind the gateway for its current tool list.
 
-        Returns a summary of changes (tools added/removed per domain).
-        Use this if you suspect the available tools have changed since
-        the gateway started.
+        Use it when `discover_tools` is missing a domain or tool you expected, for example a server
+        that was down when the gateway started. It takes no arguments. A server whose tools were
+        already loaded keeps that list: if its tools have changed since, the gateway keeps the old list
+        until an operator approves the change, and reports no tools added or removed.
+
+        Returns JSON: `{"refreshed": [{"domain", "added", "removed", "tool_count"}]}`, one entry per
+        server that answered, where `added` and `removed` list tool names. A server that could not be
+        reached is left out. If the refresh fails as a whole, it returns
+        `{"error": "...", "code": "refresh_error"}`.
         """
         with _tracer.start_as_current_span("gateway.refresh_registry") as span:
             try:
@@ -904,30 +1005,42 @@ def register_meta_tools(
 
         @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, openWorldHint=True))
         async def execute_code(
-            code: str,
+            code: Annotated[
+                str,
+                Field(
+                    description=(
+                        "A Python script for the sandbox. Call each tool as an async function, by its exact "
+                        'name with keyword arguments, such as `await widgets_list(status="open")`. The value '
+                        "of the script's last line is returned."
+                    )
+                ),
+            ],
             request_ctx: Context | None = None,
         ) -> str:
-            """Run LLM-authored Python that orchestrates multiple tool calls.
+            """Run a short Python script that calls several tools and returns only the result you need.
 
-            Experimental.  Every registered tool is exposed as a named
-            async callable inside a secure Monty sandbox; write code that
-            chains them together and returns a compact result so
-            intermediate payloads do not pass through the agent's
-            context.
+            Experimental. Use it when one step needs several tool calls, or a tool's output feeds the
+            next call, and the intermediate data does not need to come back to you. Call
+            `discover_tools` first for the exact tool names and parameters. Each tool you can see in
+            `discover_tools` is an async function in the sandbox. Call it with `await` and keyword
+            arguments. It returns the tool's structured object when the tool provides one, and its
+            text otherwise. A tool that reports an error returns its error the same way, without
+            raising, so check what it returned. After `import asyncio`, `asyncio.gather` runs several
+            calls at once. The sandbox is meant for small results (dozens of rows), not for analyzing
+            large datasets, and the gateway can limit its run time, memory and number of tool calls.
 
-            Example::
+            Example:
 
-                people = await apollo_search(query="...", limit=5)
-                {
-                    "emails": [p["email"] for p in people["people"]],
-                }
+                widgets = await widgets_list(status="open")
+                {"count": len(widgets["items"])}
 
-            - Call ``discover_tools(domain=..., format="signatures")``
-              first to learn each tool's signature.
-            - Do **not** use this for large analytical datasets; it is
-              sized for small-payload cross-tool chaining.
-            - All access control and audit hooks that apply to
-              ``execute_tool`` also apply per nested call here.
+            Returns the value of the script's last line, converted to text with Python's `str()`, so a
+            dict comes back in Python notation rather than JSON. A script whose last line is not an
+            expression returns empty text. A script that raises an error, calls a function that does
+            not exist, or exceeds a limit fails the call with that error's message. Each tool call
+            inside the script is checked by the same policies as `execute_tool`, and a refused one
+            also fails the call. If you may not run code at all, it returns
+            `{"error": "...", "code": "forbidden"}`.
             """
             request_meta = _request_meta_snapshot(request_ctx)
 
