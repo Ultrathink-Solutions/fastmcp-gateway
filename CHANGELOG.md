@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.34.0] - 2026-10-14
+
+### Added
+
+- **Registration snapshots and safe lifecycle admission.** Replacing or refreshing an upstream's registration could race with a tool call that had already resolved its tool, and a collision alias could move to a different tool when another upstream appeared. Each registration is now an immutable snapshot with its own identity and revision. A call is admitted against the snapshot it resolved, so it stays bound to one registration from lookup to dispatch.
+  - A replacement, or a refresh that changes the served contract, marks the old registration retiring and waits for its admitted calls to drain, then persists and publishes the new snapshot. Only that upstream waits: a slow call on one upstream does not hold up registration, refresh, removal or listing on another.
+  - A revision covers the registration's incarnation and its effective non-secret contract, not display aliases. An unchanged refresh keeps the revision. An acknowledged raw-schema change advances integrity bookkeeping without retiring callers.
+  - Distinct canonical tools keep their identity through alias collisions and later updates.
+  - `UpstreamManager.set_registration_commit_hook()` installs a hook that receives each `RegistrationChange` before it is published, for a consumer that persists registrations. A failed or uncertain commit closes admission for that upstream until it is reconciled, rather than reopening a stale registration.
+  - `GatewayServer` and `UpstreamManager` accept `registration_identities`, a mapping of upstream to `RegistrationIdentity`. The CLI reads it from `GATEWAY_REGISTRATION_IDENTITIES`: a JSON object keyed by configured upstream, each with a UUID `registration_id` and an optional non-secret `configuration_revision`. Stable trusted identities keep revisions across unchanged restarts. An unknown upstream or a malformed identity fails startup.
+
+  **Compatibility:** dispatch by tool name is unchanged. A call that arrives while its upstream's registration is being replaced is now refused before anything reaches the upstream. `execute_tool` reports it as `execution_error`, and an `on_error` hook receives a `RegistrationSelectionError` with code `registration_changed`. Retrying after the replacement publishes is safe. Before this release, the call went to whichever registration was live at that moment. (#101)
+
 ## [0.33.0] - 2026-10-10
 
 ### Changed
