@@ -19,6 +19,7 @@ from fastmcp_gateway.client_manager import UpstreamManager
 from fastmcp_gateway.errors import _find_upstream_response, _walk_wrapped_exceptions
 from fastmcp_gateway.hooks import HookRunner
 from fastmcp_gateway.output_guard import OutputGuardConfig, OutputGuardHook
+from fastmcp_gateway.registration import RegistrationIdentity
 from fastmcp_gateway.registration_auth import (
     RegistrationAuthError,
     RegistrationTokenValidator,
@@ -33,7 +34,7 @@ from fastmcp_gateway.url_guard import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Callable
+    from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 
     from fastmcp.server.auth import AuthProvider
 
@@ -501,6 +502,7 @@ class GatewayServer:
         auth: AuthProvider | None = None,
         trace_health_routes: bool = True,
         max_schema_depth: int = DEFAULT_MAX_SCHEMA_DEPTH,
+        registration_identities: Mapping[str, RegistrationIdentity] | None = None,
     ) -> None:
         # Fail fast at construction rather than deferring to the first
         # populate() call — an operator misconfiguration here should
@@ -642,6 +644,7 @@ class GatewayServer:
             sanitizer_trusted_domains=sanitizer_trusted_domains,
             trusted_output_tools=trusted_output_tools,
             max_schema_depth=max_schema_depth,
+            registration_identities=registration_identities,
         )
         self._trace_health_routes = trace_health_routes
         # ``auth`` plugs an inbound auth provider (TokenVerifier,
@@ -700,8 +703,8 @@ class GatewayServer:
         Call this before serving requests so the registry is populated.
         Returns a mapping of domain -> tool count.
         """
+        results = await self.upstream_manager.populate_all()
         async with self._registry_lock:
-            results = await self.upstream_manager.populate_all()
             self._apply_domain_descriptions()
 
             # Rebuild MCP instructions to include the domain summary so that
@@ -789,8 +792,8 @@ class GatewayServer:
             await asyncio.sleep(self._refresh_interval)
             with _tracer.start_as_current_span("gateway.background_refresh") as span:
                 try:
+                    diffs = await self.upstream_manager.refresh_all()
                     async with self._registry_lock:
-                        diffs = await self.upstream_manager.refresh_all()
                         span.set_attribute("gateway.domains_refreshed", len(diffs))
                         changed = False
                         for diff in diffs:
@@ -1001,6 +1004,14 @@ class GatewayServer:
             description = body.get("description")
             headers = body.get("headers")
             discovery_url = body.get("discovery_url")
+            configuration_revision = body.get("configuration_revision")
+            try:
+                RegistrationIdentity.validate_configuration_revision(configuration_revision)
+            except ValueError:
+                return JSONResponse(
+                    {"error": "Invalid configuration_revision", "code": "bad_request"},
+                    status_code=400,
+                )
             if discovery_url is not None and not isinstance(discovery_url, str):
                 return JSONResponse(
                     {"error": "'discovery_url' must be a string", "code": "bad_request"},
@@ -1073,30 +1084,19 @@ class GatewayServer:
             # treat 5xx-but-503 as escalation-worthy and 503 as expected
             # boot-window noise.
             try:
-                # Probe the upstream OUTSIDE the registry lock. The
-                # ``add_upstream`` call opens an MCP session to
-                # ``discovery_url`` and awaits ``tools/list`` —
-                # holding ``gateway._registry_lock`` across that I/O
-                # would serialize every concurrent registration
-                # against an arbitrarily slow upstream. The asyncio
-                # event loop is single-threaded, and
-                # ``add_upstream`` is documented as an idempotent
-                # upsert for same-domain re-registration; the
-                # manager's per-domain dict mutations and
-                # ``ToolRegistry.populate_domain`` are both
-                # ``await``-free synchronous regions that the event
-                # loop cannot interleave, so this remains safe
-                # without external serialization for the probe.
+                # The manager serializes same-domain transitions and final
+                # publication. Keep probe I/O and admitted-call draining out
+                # of the gateway lock so unrelated routes remain available.
                 diff = await gateway.upstream_manager.add_upstream(
                     domain,
                     url,
                     discovery_url=discovery_url,
                     headers=headers,
                     registry_auth_headers=headers,
+                    configuration_revision=configuration_revision,
                 )
-                # Schema-integrity gate refusal. ``add_upstream``
-                # rolls back its per-domain dict mutations on this
-                # path, so the manager continues to point at the
+                # Schema-integrity gate refusal leaves the candidate
+                # unpublished, so the manager continues to point at the
                 # prior URL/clients and ``execute_tool()`` keeps
                 # routing where it did before this POST. Do NOT
                 # touch description metadata or rebuild instructions
@@ -1232,14 +1232,14 @@ class GatewayServer:
                     status_code=400,
                 )
 
+            try:
+                removed = await gateway.upstream_manager.remove_upstream(domain)
+            except KeyError:
+                return JSONResponse(
+                    {"error": f"Domain '{domain}' is not registered", "code": "not_found"},
+                    status_code=404,
+                )
             async with gateway._registry_lock:
-                try:
-                    removed = await gateway.upstream_manager.remove_upstream(domain)
-                except KeyError:
-                    return JSONResponse(
-                        {"error": f"Domain '{domain}' is not registered", "code": "not_found"},
-                        status_code=404,
-                    )
                 gateway._update_instructions()
 
             return JSONResponse(
@@ -1331,31 +1331,31 @@ class GatewayServer:
                     status_code=400,
                 )
 
+            try:
+                diff = await gateway.upstream_manager.refresh_domain(
+                    domain,
+                    expected_digest=expected_digest,
+                )
+            except KeyError:
+                return JSONResponse(
+                    {"error": f"Domain '{domain}' is not registered", "code": "not_found"},
+                    status_code=404,
+                )
+
+            if diff.refused:
+                computed = diff.schema_digest or ""
+                return JSONResponse(
+                    {
+                        "error": "digest_mismatch",
+                        "code": "conflict",
+                        "expected": expected_digest[:8] + "...",
+                        "computed": (computed[:8] + "...") if computed else "",
+                        "domain": domain,
+                    },
+                    status_code=409,
+                )
+
             async with gateway._registry_lock:
-                try:
-                    diff = await gateway.upstream_manager.refresh_domain(
-                        domain,
-                        expected_digest=expected_digest,
-                    )
-                except KeyError:
-                    return JSONResponse(
-                        {"error": f"Domain '{domain}' is not registered", "code": "not_found"},
-                        status_code=404,
-                    )
-
-                if diff.refused:
-                    computed = diff.schema_digest or ""
-                    return JSONResponse(
-                        {
-                            "error": "digest_mismatch",
-                            "code": "conflict",
-                            "expected": expected_digest[:8] + "...",
-                            "computed": (computed[:8] + "...") if computed else "",
-                            "domain": domain,
-                        },
-                        status_code=409,
-                    )
-
                 gateway._apply_domain_descriptions()
                 gateway._update_instructions()
 

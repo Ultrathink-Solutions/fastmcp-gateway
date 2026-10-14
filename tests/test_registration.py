@@ -617,3 +617,23 @@ class TestRegistrationAuthMutualExclusion:
                 {"sales": sales_server},  # type: ignore[dict-item]
                 registration_token="some-static-token-long-enough",
             )
+
+
+@pytest.mark.parametrize("version", ["", " ", "v1\n", 12, {"version": "v1"}])
+async def test_registration_rejects_invalid_configuration_revision_before_probe(
+    gateway_with_registration: GatewayServer,
+    version: object,
+) -> None:
+    async with await _http_client(gateway_with_registration) as client:
+        response = await client.post(
+            "/registry/servers",
+            headers=_auth_headers(),
+            json={
+                "domain": "svc_a",
+                "url": "https://8.8.8.8/mcp",
+                "configuration_revision": version,
+            },
+        )
+    assert response.status_code == 400
+    assert response.json()["code"] == "bad_request"
+    assert "svc_a" not in gateway_with_registration.upstream_manager.domains

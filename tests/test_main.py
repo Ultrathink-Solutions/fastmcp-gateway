@@ -158,3 +158,22 @@ class TestLoadCodeModeConfig:
         assert limits.max_duration_secs == 10
         assert limits.max_nested_calls == 25
         assert verbatim is False
+
+
+def test_registration_identity_env_validates_uuid_and_unknown_domains() -> None:
+    from fastmcp_gateway.__main__ import _load_registration_identities
+
+    identity = {"registration_id": "079495e7-bf28-41d0-87ad-978a6112bd7d", "configuration_revision": "v1"}
+    with patch.dict("os.environ", {"GATEWAY_REGISTRATION_IDENTITIES": json.dumps({"svc_a": identity})}):
+        assert (
+            str(_load_registration_identities({"svc_a": "http://svc_a/mcp"})["svc_a"].registration_id)
+            == identity["registration_id"]
+        )
+        with pytest.raises(SystemExit):
+            _load_registration_identities({"svc_b": "http://svc_b/mcp"})
+    identity["registration_id"] = "invalid"
+    with (
+        patch.dict("os.environ", {"GATEWAY_REGISTRATION_IDENTITIES": json.dumps({"svc_a": identity})}),
+        pytest.raises(SystemExit),
+    ):
+        _load_registration_identities({"svc_a": "http://svc_a/mcp"})

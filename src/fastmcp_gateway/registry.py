@@ -6,6 +6,8 @@ import fnmatch
 import hashlib
 import json
 import logging
+from collections import Counter
+from copy import deepcopy
 from typing import TYPE_CHECKING, Any
 
 from opentelemetry import trace
@@ -175,6 +177,17 @@ class RegistryDiff(BaseModel):
     refused: bool = False
 
 
+class PreparedDomain(BaseModel):
+    """Validated, detached candidate; preparation never changes served tools."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    domain: str
+    tools: tuple[ToolEntry, ...]
+    diff: RegistryDiff
+    description: str = ""
+    store_digest: bool = False
+
+
 class ToolRegistry:
     """In-memory tool registry with domain/group organization.
 
@@ -223,9 +236,19 @@ class ToolRegistry:
             )
             return
 
+        tool = tool.model_copy(deep=True)
+        registered = self.lookup_registered(tool.domain, tool.original_name or tool.name)
+        if registered is not None:
+            # Canonical updates retain their alias, including numbered fallbacks.
+            self._register_internal(
+                tool.model_copy(update={"name": registered.name, "original_name": registered.original_name})
+            )
+            return
         existing = self._tools.get(tool.name)
 
-        # Same-domain re-registration: always allow (simple update).
+        # Same-domain registration may update a tool or encounter an alias
+        # belonging to a distinct canonical tool. The insertion helper
+        # preserves both in the latter case.
         # Must be checked before collision logic because _collided_names
         # would otherwise auto-prefix, which may fail if the prefixed name
         # is owned by another domain.
@@ -384,6 +407,18 @@ class ToolRegistry:
                 old.domain,
             )
             return
+        if old is not None and (old.original_name or old.name) != (tool.original_name or tool.name):
+            # A valid synthesized alias can be a different tool's literal
+            # canonical name, even within this domain. Keep the occupant and
+            # allocate a bounded, valid alias rather than replacing its route.
+            canonical = tool.original_name or tool.name
+            for index in range(1, len(self._tools) + 2):
+                suffix = f"_{index}"
+                alias = tool.name[: 64 - len(suffix)] + suffix
+                if alias not in self._tools:
+                    tool = tool.model_copy(update={"name": alias, "original_name": canonical})
+                    old = None
+                    break
         if old is not None and old.group != tool.group:
             self._remove_from_index(old.name, old.domain, old.group)
 
@@ -415,7 +450,7 @@ class ToolRegistry:
             if not self._domains[domain]:
                 del self._domains[domain]
 
-    def populate_domain(
+    def prepare_domain(
         self,
         domain: str,
         upstream_url: str,
@@ -428,8 +463,8 @@ class ToolRegistry:
         trusted_domains: set[str] | None = None,
         trusted_output_tool_patterns: list[str] | None = None,
         max_schema_depth: int = DEFAULT_MAX_SCHEMA_DEPTH,
-    ) -> RegistryDiff:
-        """Populate the registry with tools from an upstream server.
+    ) -> PreparedDomain:
+        """Prepare sanitized tools without changing served state.
 
         Each tool dict should have at minimum ``name`` and ``inputSchema`` keys,
         matching the shape returned by MCP ``tools/list``.  An optional
@@ -499,8 +534,8 @@ class ToolRegistry:
         only to output sanitation, never to description sanitation or
         schema validation.
 
-        Returns a :class:`RegistryDiff` describing what changed (or a
-        ``refused=True`` diff when the digest check fails).
+        Returns a detached :class:`PreparedDomain` with the accepted tools
+        and schema-integrity result. Refused candidates cannot be committed.
         """
         # Before the span, and before touching *tools*: a bad
         # max_schema_depth is a caller bug that must surface identically
@@ -509,7 +544,7 @@ class ToolRegistry:
         # payload return a clean diff under a nonsense cap.
         _validate_max_schema_depth(max_schema_depth)
 
-        with _tracer.start_as_current_span("gateway.registry.populate_domain") as span:
+        with _tracer.start_as_current_span("gateway.registry.prepare_domain") as span:
             span.set_attribute("gateway.domain", domain)
 
             # Validate up front and carry forward only the tools that pass
@@ -552,13 +587,14 @@ class ToolRegistry:
             # (name, description, inputSchema) contract only.
             accepted: list[tuple[str, str, dict[str, Any], dict[str, Any], str | None]] = []
             schema_rejected_count = 0
+            counts = Counter(raw.get("name", "") for raw in tools)
             for raw in tools:
                 raw_name = raw.get("name", "")
-                if not raw_name:
+                if not raw_name or counts[raw_name] > 1:
                     continue
                 schema_raw = raw.get("inputSchema", {}) or {}
                 try:
-                    clean_schema = validate_input_schema(schema_raw, max_depth=max_schema_depth)
+                    clean_schema = deepcopy(validate_input_schema(schema_raw, max_depth=max_schema_depth))
                 except SchemaValidationError as exc:
                     logger.warning(
                         "Rejected tool: domain=%s name=%r reason=invalid_schema detail=%s",
@@ -633,27 +669,23 @@ class ToolRegistry:
                     # the pre-refresh state.  ``added``/``removed`` are
                     # deliberately empty — no registry mutation means no
                     # observable delta to report.
-                    return RegistryDiff(
+                    return PreparedDomain(
                         domain=domain,
-                        added=[],
-                        removed=[],
-                        tool_count=len(self.get_tools_by_domain(domain)),
-                        schema_digest=candidate_digest,
-                        schema_digest_changed=False,
-                        refused=True,
+                        tools=(),
+                        diff=RegistryDiff(
+                            domain=domain,
+                            added=[],
+                            removed=[],
+                            tool_count=len(self.get_tools_by_domain(domain)),
+                            schema_digest=candidate_digest,
+                            refused=True,
+                        ),
                     )
                 # expected_digest == candidate_digest → operator signed
                 # off on this specific transition.  Proceed.
                 schema_digest_changed = True
 
-            # Snapshot current tool names for diff calculation.
-            old_names = {t.name for t in self.get_tools_by_domain(domain)}
-
-            self.clear_domain(domain)
-
-            if description:
-                self.set_domain_description(domain, description)
-
+            prepared_tools: list[ToolEntry] = []
             overrides = group_overrides or {}
             filtered_count = 0
             prefix = f"{domain}_"
@@ -710,7 +742,10 @@ class ToolRegistry:
                             raw_output_trusted = True
                             break
 
-                self.register_tool(
+                if validate_tool_name(name) is not None:
+                    logger.warning("Rejected tool registration: domain=%s name=%r", domain, name)
+                    continue
+                prepared_tools.append(
                     ToolEntry(
                         name=name,
                         domain=domain,
@@ -727,28 +762,81 @@ class ToolRegistry:
             if schema_rejected_count > 0:
                 span.set_attribute("gateway.schema_rejected_count", schema_rejected_count)
 
-            # Commit the new baseline only when at least one tool was
-            # accepted.  A populate where every tool was rejected by
-            # schema validation leaves ``accepted`` empty and the stored
-            # registry with zero tools for this domain; storing a
-            # baseline in that state would latently block future
-            # refreshes (``prior_digest != None`` and no way for an
-            # operator to supply a matching ``expected_digest``), so
-            # we explicitly skip the write.  Ordering: after the
-            # populate loop completes, so a failure mid-populate doesn't
-            # leave a stale digest pointing at partial state.
-            if accepted:
-                self._domain_digests[domain] = candidate_digest
-
-            new_names = {t.name for t in self.get_tools_by_domain(domain)}
-            diff = RegistryDiff(
+            return PreparedDomain(
                 domain=domain,
-                added=sorted(new_names - old_names),
-                removed=sorted(old_names - new_names),
-                tool_count=len(new_names),
-                schema_digest=candidate_digest,
-                schema_digest_changed=schema_digest_changed,
-                refused=False,
+                tools=tuple(prepared_tools),
+                description=description,
+                store_digest=bool(accepted),
+                diff=RegistryDiff(
+                    domain=domain,
+                    added=[],
+                    removed=[],
+                    tool_count=len(prepared_tools),
+                    schema_digest=candidate_digest,
+                    schema_digest_changed=schema_digest_changed,
+                ),
+            )
+
+    def commit_domain(self, prepared: PreparedDomain) -> RegistryDiff:
+        """Apply a candidate against current aliases in one synchronous region."""
+        if prepared.diff.refused:
+            return prepared.diff
+        domain = prepared.domain
+        old_names = {t.name for t in self.get_tools_by_domain(domain)}
+        self.clear_domain(domain)
+        if prepared.description:
+            self.set_domain_description(domain, prepared.description)
+        for tool in prepared.tools:
+            self.register_tool(tool.model_copy(deep=True))
+        self.commit_schema_digest(prepared)
+        new_names = {t.name for t in self.get_tools_by_domain(domain)}
+        return prepared.diff.model_copy(
+            update={
+                "added": sorted(new_names - old_names),
+                "removed": sorted(old_names - new_names),
+                "tool_count": len(new_names),
+            }
+        )
+
+    def commit_schema_digest(self, prepared: PreparedDomain) -> None:
+        """Advance accepted raw integrity state without republishing tools."""
+        if prepared.diff.refused:
+            raise ValueError("Cannot commit a refused schema digest")
+        if prepared.store_digest and prepared.diff.schema_digest is not None:
+            self._domain_digests[prepared.domain] = prepared.diff.schema_digest
+        else:
+            self._domain_digests.pop(prepared.domain, None)
+
+    def populate_domain(
+        self,
+        domain: str,
+        upstream_url: str,
+        tools: list[dict[str, Any]],
+        *,
+        description: str = "",
+        group_overrides: dict[str, str] | None = None,
+        policy: AccessPolicy | None = None,
+        expected_digest: str | None = None,
+        trusted_domains: set[str] | None = None,
+        trusted_output_tool_patterns: list[str] | None = None,
+        max_schema_depth: int = DEFAULT_MAX_SCHEMA_DEPTH,
+    ) -> RegistryDiff:
+        """Synchronously prepare and publish a discovered domain."""
+        with _tracer.start_as_current_span("gateway.registry.populate_domain") as span:
+            span.set_attribute("gateway.domain", domain)
+            diff = self.commit_domain(
+                self.prepare_domain(
+                    domain,
+                    upstream_url,
+                    tools,
+                    description=description,
+                    group_overrides=group_overrides,
+                    policy=policy,
+                    expected_digest=expected_digest,
+                    trusted_domains=trusted_domains,
+                    trusted_output_tool_patterns=trusted_output_tool_patterns,
+                    max_schema_depth=max_schema_depth,
+                )
             )
             span.set_attribute("gateway.tool_count", diff.tool_count)
             return diff
@@ -792,7 +880,19 @@ class ToolRegistry:
 
     def lookup(self, tool_name: str) -> ToolEntry | None:
         """Look up a tool by exact name."""
-        return self._tools.get(tool_name)
+        entry = self._tools.get(tool_name)
+        return entry.model_copy(deep=True) if entry is not None else None
+
+    def lookup_registered(self, server_name: str, upstream_tool_name: str) -> ToolEntry | None:
+        """Resolve an exact admitted canonical name, without interpreting prefixes."""
+        matches = [
+            tool
+            for names in self._domains.get(server_name, {}).values()
+            for name in names
+            if (tool := self._tools.get(name)) is not None
+            if (tool.original_name or tool.name) == upstream_tool_name
+        ]
+        return matches[0].model_copy(deep=True) if len(matches) == 1 else None
 
     def get_domain_names(self) -> list[str]:
         """Get all registered domain names."""
@@ -821,14 +921,14 @@ class ToolRegistry:
         tool_names = []
         for group_tools in self._domains[domain].values():
             tool_names.extend(group_tools)
-        return [self._tools[name] for name in sorted(tool_names) if name in self._tools]
+        return [self._tools[name].model_copy(deep=True) for name in sorted(tool_names) if name in self._tools]
 
     def get_tools_by_group(self, domain: str, group: str) -> list[ToolEntry]:
         """Get all tools in a specific domain/group."""
         if domain not in self._domains or group not in self._domains[domain]:
             return []
         tool_names = self._domains[domain][group]
-        return [self._tools[name] for name in sorted(tool_names) if name in self._tools]
+        return [self._tools[name].model_copy(deep=True) for name in sorted(tool_names) if name in self._tools]
 
     def search(self, query: str) -> list[ToolEntry]:
         """Keyword search across tool names, original names, and descriptions.
@@ -845,7 +945,7 @@ class ToolRegistry:
             for tool in self._tools.values():
                 searchable = f"{tool.name} {tool.original_name or ''} {tool.description}".lower()
                 if all(token in searchable for token in tokens):
-                    results.append(tool)
+                    results.append(tool.model_copy(deep=True))
             results = sorted(results, key=lambda t: t.name)
             span.set_attribute("gateway.result_count", len(results))
             return results
