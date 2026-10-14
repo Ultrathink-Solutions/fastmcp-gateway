@@ -686,13 +686,9 @@ class TestDiscoveryUrlSeparation:
 
         # Four total: two from the first add, two from the upsert.
         assert len(constructed) == 4
-        # Both prior clients were entered and exited once for the close
-        # path. The registry client picks up an additional pair (it was
-        # opened a second time by the upsert's own _populate_domain
-        # before the new replacement entered the registry slot, but that
-        # is the *replacement* registry client, not the original).
-        assert first_exec.__aenter__.await_count == 1
-        assert first_exec.__aexit__.await_count == 1
-        # The first registry client's exit count grew by 1 above the
-        # initial baseline (the close-on-upsert pass).
-        assert first_reg.__aexit__.await_count == initial_reg_exits + 1
+        # Closing a template must not reconnect it merely to enter/exit it.
+        assert first_exec.__aenter__.await_count == 0
+        assert first_exec.__aexit__.await_count == 0
+        first_exec.close.assert_awaited_once()
+        first_reg.close.assert_awaited_once()
+        assert first_reg.__aexit__.await_count == initial_reg_exits

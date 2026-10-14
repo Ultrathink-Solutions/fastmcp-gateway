@@ -550,7 +550,7 @@ class TestRegistrationIsTransactional:
 
         Drives the real ``add_upstream`` path (no monkey-patch) so the
         rollback in ``UpstreamManager.add_upstream`` exercises end-to-end.
-        We force the probe to fail by patching ``_populate_domain`` on
+        We force the probe to fail by patching ``_prepare_domain`` on
         the manager instance.
         """
 
@@ -558,7 +558,7 @@ class TestRegistrationIsTransactional:
             raise httpx.ConnectError("upstream not yet reachable")
 
         prior_domains = set(gateway.upstream_manager.list_upstreams().keys())
-        gateway.upstream_manager._populate_domain = _fail_populate  # type: ignore[method-assign]
+        gateway.upstream_manager._prepare_domain = _fail_populate  # type: ignore[method-assign]
 
         response = await _post_register(gateway, domain="brand-new")
         assert response.status_code == 503
@@ -583,7 +583,7 @@ class TestRegistrationIsTransactional:
         async def _fail_populate(*_args: object, **_kwargs: object) -> object:
             raise httpx.ConnectError("v2 not yet reachable")
 
-        gateway.upstream_manager._populate_domain = _fail_populate  # type: ignore[method-assign]
+        gateway.upstream_manager._prepare_domain = _fail_populate  # type: ignore[method-assign]
 
         response = await _post_register(
             gateway,

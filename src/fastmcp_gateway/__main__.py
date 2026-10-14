@@ -21,6 +21,12 @@ Configure via environment variables:
               }
             }
 
+    GATEWAY_REGISTRATION_IDENTITIES
+        Optional JSON object keyed by configured upstream, with UUID
+        ``registration_id`` and optional non-secret ``configuration_revision``.
+        Stable trusted identities preserve revisions across unchanged restarts.
+        Unknown domains and malformed identities fail startup.
+
     GATEWAY_NAME
         Server name (default: "fastmcp-gateway").
 
@@ -252,6 +258,7 @@ from fastmcp_gateway._registry_token_provider_loading import (
 )
 from fastmcp_gateway.code_mode import CodeModeUnavailableError
 from fastmcp_gateway.gateway import CodeModeAuthorizerRequiredError, GatewayServer
+from fastmcp_gateway.registration import RegistrationIdentity
 from fastmcp_gateway.registration_auth import (
     JWTRegistrationValidator,
     RegistrationTokenValidator,
@@ -278,6 +285,22 @@ def _load_json_env(name: str, *, required: bool = False) -> dict[str, Any] | Non
         logger.error("%s must be a JSON object, got %s", name, type(value).__name__)
         sys.exit(1)
     return value
+
+
+def _load_registration_identities(upstreams: dict[str, Any]) -> dict[str, RegistrationIdentity] | None:
+    """Parse trusted static identities; refuse typos and invalid restore data."""
+    raw = _load_json_env("GATEWAY_REGISTRATION_IDENTITIES")
+    if raw is None:
+        return None
+    if set(raw) - set(upstreams):
+        logger.error("GATEWAY_REGISTRATION_IDENTITIES contains unknown upstreams")
+        sys.exit(1)
+    try:
+        return {domain: RegistrationIdentity.model_validate(value) for domain, value in raw.items()}
+    except ValueError:
+        # Do not log raw configuration or validation errors containing its values.
+        logger.error("Invalid GATEWAY_REGISTRATION_IDENTITIES")
+        sys.exit(1)
 
 
 _TRUE_TOKENS = frozenset({"true", "1", "yes", "on"})
@@ -479,6 +502,7 @@ def main() -> None:
         logger.error("Invalid GATEWAY_PORT value: %s (must be an integer)", port_raw)
         sys.exit(1)
     instructions = os.environ.get("GATEWAY_INSTRUCTIONS") or None
+    registration_identities = _load_registration_identities(upstreams)
     domain_descriptions = _load_json_env("GATEWAY_DOMAIN_DESCRIPTIONS")
     upstream_headers = _load_json_env("GATEWAY_UPSTREAM_HEADERS")
 
@@ -590,6 +614,7 @@ def main() -> None:
             registry_token_provider=registry_token_provider,
             trace_health_routes=trace_health_routes,
             max_schema_depth=max_schema_depth,
+            registration_identities=registration_identities,
         )
     except CodeModeUnavailableError as exc:
         # Friendly handling for the one construction-time error with a

@@ -87,7 +87,7 @@ class TestRegistryBasics:
         empty_registry.register_tool(entry)
 
         assert empty_registry.tool_count == 1
-        assert empty_registry.lookup("test_tool") is entry
+        assert empty_registry.lookup("test_tool") == entry
         assert empty_registry.lookup("nonexistent") is None
 
     def test_register_updates_domain_index(self, empty_registry: ToolRegistry) -> None:

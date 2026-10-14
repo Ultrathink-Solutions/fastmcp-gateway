@@ -15,26 +15,40 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import re
+import weakref
 from collections import defaultdict
+from contextlib import asynccontextmanager
 from copy import deepcopy
-from typing import TYPE_CHECKING, Any
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Literal
+from uuid import uuid4
 
 from fastmcp import Client
 from fastmcp.server.dependencies import get_http_headers
 from mcp.shared.exceptions import McpError
 from opentelemetry import trace
+from pydantic import BaseModel, ConfigDict
 
-from fastmcp_gateway.errors import UpstreamJsonRpcError
+from fastmcp_gateway.errors import RegistrationSelectionError, UpstreamJsonRpcError
+from fastmcp_gateway.registration import (
+    RegistrationChange,
+    RegistrationCommitHook,
+    RegistrationIdentity,
+    RegistrationSnapshot,
+    registration_snapshot,
+)
+from fastmcp_gateway.registry import ToolEntry
 from fastmcp_gateway.sanitize import DEFAULT_MAX_SCHEMA_DEPTH, _validate_max_schema_depth
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Mapping
+    from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 
     from fastmcp.client.client import CallToolResult
     from mcp.types import ErrorData, RequestId
 
     from fastmcp_gateway.access_policy import AccessPolicy
-    from fastmcp_gateway.registry import RegistryDiff, ToolRegistry
+    from fastmcp_gateway.registry import PreparedDomain, RegistryDiff, ToolRegistry
 
 logger = logging.getLogger(__name__)
 _tracer = trace.get_tracer("fastmcp_gateway.client_manager")
@@ -128,6 +142,44 @@ def _set_transport_headers(client: Client, headers: dict[str, str]) -> None:
     transport.headers = {**existing, **headers}
 
 
+async def _settle_task(task: asyncio.Task[Any]) -> Any:
+    """Finish an irreversible commit or cleanup before propagating cancellation."""
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+        except Exception:
+            break  # Read and propagate the settled task's exception below.
+    if cancelled:
+        try:
+            task.result()
+        except BaseException as exc:
+            raise asyncio.CancelledError from exc
+        raise asyncio.CancelledError
+    return task.result()
+
+
+class ResolvedTool(BaseModel):
+    """Manager-issued detached tool and registration contract."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    entry: ToolEntry
+    registration: RegistrationSnapshot
+
+
+@dataclass
+class _RegistrationRuntime:
+    snapshot: RegistrationSnapshot
+    retiring: bool = False
+    active: int = 0
+    drained: asyncio.Event = field(default_factory=asyncio.Event)
+
+    def __post_init__(self) -> None:
+        self.drained.set()
+
+
 class UpstreamManager:
     """Manages connections to upstream MCP servers.
 
@@ -207,6 +259,7 @@ class UpstreamManager:
         trusted_output_tools: set[str] | None = None,
         discovery_urls: dict[str, str] | None = None,
         max_schema_depth: int = DEFAULT_MAX_SCHEMA_DEPTH,
+        registration_identities: Mapping[str, RegistrationIdentity] | None = None,
     ) -> None:
         # Fail fast here rather than deferring to the first populate()
         # call -- a caller that constructs UpstreamManager directly
@@ -214,17 +267,30 @@ class UpstreamManager:
         # get the same immediate failure. The upper bound guards against
         # a stack-overflow-prone recursion depth, not just a typo.
         _validate_max_schema_depth(max_schema_depth)
-        self._upstreams = upstreams
+        unknown = set(registration_identities or {}) - set(upstreams)
+        if unknown:
+            raise ValueError("Registration identities contain unknown upstreams")
+        self._identities = dict(registration_identities or {})
+        self._runtimes: dict[str, _RegistrationRuntime] = {}
+        self._issued: dict[int, tuple[weakref.ReferenceType[ResolvedTool], ResolvedTool]] = {}
+        self._commit_hook: RegistrationCommitHook | None = None
+        self._publication_lock = asyncio.Lock()
+        self._blocked_domains: set[str] = set()
+        self._transitions: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self._discovery_urls = dict(discovery_urls or {})
+        self._upstreams: dict[str, Any] = {
+            name: deepcopy(value) if isinstance(value, dict) else value for name, value in upstreams.items()
+        }
         self._registry = registry
-        self._upstream_headers = upstream_headers or {}
-        self._registry_auth_headers = registry_auth_headers
+        self._upstream_headers = deepcopy(upstream_headers or {})
+        self._registry_auth_headers = deepcopy(registry_auth_headers)
         self._registry_token_provider = registry_token_provider
         # Per-domain locks serialize the (token refresh + header set + list_tools)
         # sequence on each persistent registry client, so concurrent same-domain
         # populate/refresh calls can't overwrite Authorization between the header
         # update and the fetch that must use it.
         self._registry_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
-        self._policy = policy
+        self._policy = deepcopy(policy)
         self._max_schema_depth = max_schema_depth
         # Defensive copy so later mutation by the caller doesn't silently
         # change sanitation behaviour mid-flight.
@@ -253,8 +319,8 @@ class UpstreamManager:
         # calls.
         self._registry_clients: dict[str, Client] = {}
         self._execution_clients: dict[str, Client] = {}
-        for domain, url in upstreams.items():
-            disc_url: str = (discovery_urls or {}).get(domain) or url
+        for domain, url in self._upstreams.items():
+            disc_url = self._discovery_urls.get(domain) or url
             reg_client = Client(disc_url)
             if registry_auth_headers:
                 _set_transport_headers(reg_client, registry_auth_headers)
@@ -275,8 +341,9 @@ class UpstreamManager:
         """
         with _tracer.start_as_current_span("gateway.populate_all") as span:
             results: dict[str, int] = {}
-            for domain, client in self._registry_clients.items():
+            for domain in list(self._registry_clients):
                 try:
+                    client = self._registry_clients[domain]
                     diff = await self._populate_domain(domain, client)
                     results[domain] = diff.tool_count
                     logger.info("Populated %d tools from upstream '%s'", diff.tool_count, domain)
@@ -295,15 +362,15 @@ class UpstreamManager:
         diff = await self._populate_domain(domain, client)
         return diff.tool_count
 
-    async def _populate_domain(
+    async def _prepare_domain(
         self,
         domain: str,
         client: Client,
         *,
         expected_digest: str | None = None,
         upstream_url: str | None = None,
-    ) -> RegistryDiff:
-        """Connect to *client*, list its tools, and register them.
+    ) -> PreparedDomain:
+        """Connect to *client* and prepare its tools without publication.
 
         *expected_digest*, when set, is threaded through to
         :meth:`ToolRegistry.populate_domain` to explicitly acknowledge a
@@ -366,10 +433,14 @@ class UpstreamManager:
                         entry["annotations"] = annotations.model_dump(exclude_none=True)
                     elif isinstance(annotations, dict):
                         entry["annotations"] = annotations
+                meta = getattr(t, "meta", None)
+                if isinstance(meta, dict):
+                    entry["_meta"] = dict(meta)
                 raw_tools.append(entry)
 
-            effective_url = str(upstream_url) if upstream_url is not None else str(self._upstreams[domain])
-            diff = self._registry.populate_domain(
+            target = upstream_url if upstream_url is not None else self._upstreams[domain]
+            effective_url = target if isinstance(target, str) else ""
+            prepared = self._registry.prepare_domain(
                 domain=domain,
                 upstream_url=effective_url,
                 tools=raw_tools,
@@ -379,10 +450,244 @@ class UpstreamManager:
                 trusted_output_tool_patterns=self._trusted_output_tool_patterns,
                 max_schema_depth=self._max_schema_depth,
             )
-            span.set_attribute("gateway.tool_count", diff.tool_count)
-            if diff.refused:
+            span.set_attribute("gateway.tool_count", prepared.diff.tool_count)
+            if prepared.diff.refused:
                 span.set_attribute("gateway.schema_refused", True)
-            return diff
+            return prepared
+
+    async def _populate_domain(
+        self,
+        domain: str,
+        client: Client,
+        *,
+        expected_digest: str | None = None,
+        upstream_url: str | None = None,
+    ) -> RegistryDiff:
+        async with self._transitions[domain]:
+            # Refresh the currently published template after obtaining the lock.
+            client = self._registry_clients[domain]
+            prepared = await self._prepare_domain(domain, client, expected_digest=expected_digest)
+            if prepared.diff.refused:
+                return prepared.diff
+            identity = self._identities.get(domain) or RegistrationIdentity(registration_id=uuid4())
+
+            def candidate() -> RegistrationSnapshot:
+                return self._snapshot_candidate(
+                    domain, identity, self._upstreams[domain], self._discovery_urls.get(domain), prepared
+                )
+
+            # No awaits between projection and this no-op check: raw integrity
+            # acknowledgement needs neither retirement nor a persistence callback.
+            current = self._runtimes.get(domain)
+            if current is not None and not current.retiring:
+                projected = candidate()
+                if current.snapshot.registration_revision == projected.registration_revision:
+                    self._registry.commit_schema_digest(prepared)
+                    return prepared.diff.model_copy(update={"tool_count": len(projected.tools)})
+
+            def publish(snapshot: RegistrationSnapshot | None) -> RegistryDiff:
+                assert snapshot is not None
+                diff = self._registry.commit_domain(prepared)
+                self._identities[domain] = identity
+                self._runtimes[domain] = _RegistrationRuntime(snapshot)
+                return diff
+
+            return await self._transition(domain, "refresh" if current is not None else "replace", candidate, publish)
+
+    def _snapshot_candidate(
+        self,
+        domain: str,
+        identity: RegistrationIdentity,
+        url: Any,
+        discovery_url: str | None,
+        prepared: PreparedDomain,
+    ) -> RegistrationSnapshot:
+        # Apply existing collision admission to a detached registry, never to served state.
+        staged = deepcopy(self._registry)
+        staged.commit_domain(prepared)
+        return registration_snapshot(
+            domain,
+            identity,
+            url if isinstance(url, str) else None,
+            discovery_url or (url if isinstance(url, str) else None),
+            tuple(staged.get_tools_by_domain(domain)),
+        )
+
+    def registration_snapshot(self, server_name: str) -> RegistrationSnapshot | None:
+        """Return a detached available contract, or hide a retiring incarnation."""
+        runtime = self._runtimes.get(server_name)
+        if runtime is None or runtime.retiring or server_name in self._blocked_domains:
+            return None
+        # Aliases are display state and may have changed due to another domain.
+        return runtime.snapshot.model_copy(
+            deep=True,
+            update={
+                "tools": tuple(t.model_copy(deep=True) for t in self._registry.get_tools_by_domain(server_name)),
+            },
+        )
+
+    def resolve_tool(
+        self,
+        tool_name: str,
+        *,
+        server_name: str | None = None,
+        registration_revision: str | None = None,
+    ) -> ResolvedTool:
+        """Resolve once; exact server selectors never fall back to global aliases."""
+        selected = server_name is not None or registration_revision is not None
+        if selected and (
+            not isinstance(server_name, str)
+            or not server_name.strip()
+            or not isinstance(registration_revision, str)
+            or re.fullmatch(r"reg-v1:[0-9a-f]{64}", registration_revision) is None
+        ):
+            raise RegistrationSelectionError("invalid_selector", "Invalid registration selector")
+        entry = (
+            self._registry.lookup_registered(server_name, tool_name)
+            if server_name is not None
+            else self._registry.lookup(tool_name)
+        )
+        if server_name is not None:
+            runtime = self._runtimes.get(server_name)
+            if runtime is not None and (
+                runtime.retiring or runtime.snapshot.registration_revision != registration_revision
+            ):
+                raise RegistrationSelectionError("registration_changed", "Registration changed")
+        if (server_name is not None and server_name in self._blocked_domains) or (
+            entry is not None and entry.domain in self._blocked_domains
+        ):
+            raise RegistrationSelectionError("registration_changed", "Registration changed")
+        if entry is None:
+            raise RegistrationSelectionError("tool_not_found", "Tool not found")
+        runtime = self._runtimes.get(entry.domain)
+        if runtime is None:
+            # Programmatic legacy registries may be populated directly before first use.
+            if selected or entry.domain not in self._upstreams:
+                raise RegistrationSelectionError("tool_not_found", "Registration not found")
+            identity = self._identities.get(entry.domain) or RegistrationIdentity(registration_id=uuid4())
+            self._identities[entry.domain] = identity
+            url = self._upstreams[entry.domain]
+            snapshot = registration_snapshot(
+                entry.domain,
+                identity,
+                url if isinstance(url, str) else None,
+                self._discovery_urls.get(entry.domain) or (url if isinstance(url, str) else None),
+                tuple(self._registry.get_tools_by_domain(entry.domain)),
+            )
+            runtime = self._runtimes[entry.domain] = _RegistrationRuntime(snapshot)
+        if runtime.retiring:
+            raise RegistrationSelectionError("registration_changed", "Registration changed")
+        resolved = ResolvedTool(
+            entry=ToolEntry.model_validate(entry.model_dump()), registration=runtime.snapshot.model_copy(deep=True)
+        )
+        key = id(resolved)
+        self._issued[key] = (
+            weakref.ref(resolved, lambda _: self._issued.pop(key, None)),
+            resolved.model_copy(deep=True),
+        )
+        return resolved
+
+    @asynccontextmanager
+    async def pin_registration(self, resolved: ResolvedTool) -> AsyncIterator[None]:
+        """Admit a manager-issued snapshot without serializing concurrent borrowers."""
+        issued = self._issued.get(id(resolved))
+        runtime = self._runtimes.get(resolved.registration.server_name)
+        canonical = resolved.entry.original_name or resolved.entry.name
+        if (
+            issued is None
+            or issued[0]() is not resolved
+            or issued[1] != resolved
+            or runtime is None
+            or runtime.retiring
+            or resolved.entry.domain in self._blocked_domains
+            or runtime.snapshot.registration_revision != resolved.registration.registration_revision
+            or self._registry.lookup_registered(resolved.entry.domain, canonical) is None
+            or not any(
+                (t.original_name or t.name) == canonical and t.domain == resolved.entry.domain
+                for t in runtime.snapshot.tools
+            )
+        ):
+            raise RegistrationSelectionError("registration_changed", "Registration changed")
+        runtime.active += 1
+        runtime.drained.clear()
+        try:
+            yield
+        finally:
+            runtime.active -= 1
+            if not runtime.active:
+                runtime.drained.set()
+
+    def set_registration_commit_hook(self, hook: RegistrationCommitHook) -> None:
+        """Install the durable adapter once, before the first population."""
+        if self._commit_hook is not None or self._runtimes:
+            raise ValueError("Registration commit hook must be installed once before population")
+        self._commit_hook = hook
+
+    async def _transition(
+        self,
+        domain: str,
+        kind: Literal["replace", "refresh", "remove"],
+        candidate: Callable[[], RegistrationSnapshot] | None,
+        publish: Callable[[RegistrationSnapshot | None], Any],
+    ) -> Any:
+        previous = self._runtimes.get(domain)
+        was_retiring = previous.retiring if previous is not None else False
+        was_blocked = domain in self._blocked_domains
+        commit_started = False
+        if previous is not None:
+            previous.retiring = True
+        try:
+            if previous is not None:
+                await previous.drained.wait()
+            # A slow admitted call holds only its domain's transition lock.
+            # Recompute aliases after acquiring publication ownership: another
+            # domain may have published while this registration was draining.
+            async with self._publication_lock:
+                owner = asyncio.current_task()
+                if owner is not None and owner.cancelling():
+                    raise asyncio.CancelledError
+                snapshot = candidate() if candidate is not None else None
+                change = RegistrationChange(
+                    kind=kind,
+                    previous=previous.snapshot.model_copy(deep=True) if previous else None,
+                    current=snapshot.model_copy(deep=True) if snapshot else None,
+                )
+                self._blocked_domains.add(domain)
+
+                async def commit() -> Any:
+                    # Cancellation queued before the callback starts is still pre-commit.
+                    if owner is not None and owner.cancelling():
+                        if previous is not None:
+                            previous.retiring = was_retiring
+                        if not was_blocked:
+                            self._blocked_domains.discard(domain)
+                        raise asyncio.CancelledError
+                    if self._commit_hook is not None:
+                        await self._commit_hook(change)
+                    result = publish(snapshot)
+                    self._blocked_domains.discard(domain)
+                    return result
+
+                commit_started = True
+                return await _settle_task(asyncio.create_task(commit()))
+        except BaseException:
+            if not commit_started and previous is not None:
+                previous.retiring = was_retiring
+            raise
+
+    async def _close_clients(self, *clients: Client | None) -> None:
+        async def close_all() -> None:
+            seen: set[int] = set()
+            for client in clients:
+                if client is None or id(client) in seen:
+                    continue
+                seen.add(id(client))
+                try:
+                    await client.close()
+                except Exception:
+                    logger.warning("Error closing retired registration client", exc_info=True)
+
+        await _settle_task(asyncio.create_task(close_all()))
 
     # ------------------------------------------------------------------
     # Registry refresh
@@ -396,8 +701,9 @@ class UpstreamManager:
         """
         with _tracer.start_as_current_span("gateway.refresh_all") as span:
             diffs: list[RegistryDiff] = []
-            for domain, client in self._registry_clients.items():
+            for domain in list(self._registry_clients):
                 try:
+                    client = self._registry_clients[domain]
                     diff = await self._populate_domain(domain, client)
                     diffs.append(diff)
                 except Exception:
@@ -436,6 +742,7 @@ class UpstreamManager:
         *,
         extra_headers: dict[str, str] | None = None,
         request_meta: Mapping[str, Any] | None = None,
+        resolved_tool: ResolvedTool | None = None,
     ) -> CallToolResult:
         """Execute a tool on its upstream server.
 
@@ -464,34 +771,38 @@ class UpstreamManager:
         with _tracer.start_as_current_span("gateway.upstream.execute") as span:
             span.set_attribute("gateway.tool_name", tool_name)
 
-            entry = self._registry.lookup(tool_name)
-            if entry is None:
-                msg = f"Tool '{tool_name}' not found in registry"
-                raise KeyError(msg)
-
-            span.set_attribute("gateway.domain", entry.domain)
-            fresh_client = self._make_execution_client(entry.domain, extra_headers=extra_headers)
-
-            # Use the original (upstream) tool name when dispatching.
-            # Collision-prefixed names (e.g., "snowflake_get_server_info")
-            # exist only in the gateway registry — the upstream server only
-            # knows the original name ("get_server_info").
-            upstream_name = entry.original_name or entry.name
-
-            async with fresh_client:
-                arrived = _ArrivedErrors()
-                fresh_client.session.add_response_router(arrived)
+            if resolved_tool is None:
                 try:
-                    return await _call_tool_without_metadata_injection(
-                        fresh_client,
-                        upstream_name,
-                        arguments or {},
-                        request_meta,
-                    )
-                except McpError as exc:
-                    if arrived.arrived(exc.error):
-                        raise UpstreamJsonRpcError(exc.error) from exc
+                    resolved_tool = self.resolve_tool(tool_name)
+                except RegistrationSelectionError as exc:
+                    if exc.code == "tool_not_found":
+                        raise KeyError(f"Tool '{tool_name}' not found in registry") from exc
                     raise
+            async with self.pin_registration(resolved_tool):
+                entry = self._issued[id(resolved_tool)][1].entry
+                span.set_attribute("gateway.domain", entry.domain)
+                fresh_client = self._make_execution_client(entry.domain, extra_headers=extra_headers)
+
+                # Use the original (upstream) tool name when dispatching.
+                # Collision-prefixed names (e.g., "snowflake_get_server_info")
+                # exist only in the gateway registry — the upstream server only
+                # knows the original name ("get_server_info").
+                upstream_name = entry.original_name or entry.name
+
+                async with fresh_client:
+                    arrived = _ArrivedErrors()
+                    fresh_client.session.add_response_router(arrived)
+                    try:
+                        return await _call_tool_without_metadata_injection(
+                            fresh_client,
+                            upstream_name,
+                            arguments or {},
+                            request_meta,
+                        )
+                    except McpError as exc:
+                        if arrived.arrived(exc.error):
+                            raise UpstreamJsonRpcError(exc.error) from exc
+                        raise
 
     def _make_execution_client(
         self,
@@ -537,184 +848,94 @@ class UpstreamManager:
         discovery_url: str | None = None,
         headers: dict[str, str] | None = None,
         registry_auth_headers: dict[str, str] | None = None,
+        configuration_revision: str | None = None,
+        registration_identity: RegistrationIdentity | None = None,
     ) -> RegistryDiff:
-        """Add a new upstream at runtime and populate its tools.
-
-        If the domain already exists, its URL and headers are updated and
-        the registry is re-populated (idempotent upsert).
-
-        Transactional semantics
-        -----------------------
-        The probe (:meth:`_populate_domain`) runs against a candidate
-        ``reg_client`` built as a local — none of the per-domain
-        dicts (``_upstreams``, ``_upstream_headers``,
-        ``_registry_clients``, ``_execution_clients``) are mutated
-        until the probe succeeds.  Concurrent observers
-        (:meth:`list_upstreams`, :meth:`upstream_url`,
-        :meth:`execute_tool`) therefore never see a half-staged URL
-        paired with the prior tools, nor an unverified client pair
-        routing traffic before discovery confirmed the upstream is
-        reachable.
-
-        On probe failure or ``diff.refused``, the manager state is
-        unchanged — no rollback is required because no mutation
-        occurred.  On success, the four maps are committed in a
-        single synchronous region (no ``await``), making the
-        transition atomic from the asyncio event loop's perspective;
-        the prior client pair is closed only after that commit so
-        any in-flight :meth:`execute_tool` dispatch lands on the new
-        pair rather than a half-shut-down client.
-
-        Parameters
-        ----------
-        domain:
-            Domain name for the upstream (e.g. ``"apollo"``).
-        url:
-            MCP server URL (e.g. ``"http://apollo:8080/mcp"``) used for
-            ``execute_tool`` dispatch. Carries the inbound user JWT via
-            request-passthrough.
-        discovery_url:
-            Optional MCP URL used for ``list_tools`` discovery only —
-            e.g. an unauth ``/_introspect`` endpoint mounted at host
-            root, network-policy-protected, that speaks the discovery
-            slice of the MCP protocol without requiring a user JWT.
-            When ``None``, discovery uses *url* and the prior single-
-            client behaviour applies.
-        headers:
-            Per-domain headers for tool execution (e.g. auth tokens).
-        registry_auth_headers:
-            Headers for registry population (list_tools calls).
-        """
-        with _tracer.start_as_current_span("gateway.add_upstream") as span:
-            span.set_attribute("gateway.domain", domain)
-            span.set_attribute("gateway.url", url)
-            if discovery_url:
-                span.set_attribute("gateway.discovery_url", discovery_url)
-
-            # Use explicitly provided registry_auth_headers, or fall back
-            # to the default configured at startup (GATEWAY_REGISTRY_AUTH_TOKEN).
-            # None-check (not truthiness) so callers can pass {} to explicitly
-            # disable auth for a specific upstream even when startup auth exists.
-            effective_auth = registry_auth_headers if registry_auth_headers is not None else self._registry_auth_headers
-
-            # Build candidate clients as locals — ``Client(...)`` is
-            # pure construction (no I/O) and no shared-state mutation
-            # yet.  Auth headers stay on the registry side only — see
-            # the comment in __init__ for the Client.new() bleed
-            # rationale.
-            disc_url: str = discovery_url or url
-            reg_client = Client(disc_url)
-            if effective_auth:
-                _set_transport_headers(reg_client, effective_auth)
-            exec_client = Client(url)
-
-            # Probe with the candidate URL passed explicitly so
-            # _populate_domain does NOT read from self._upstreams.
-            # If this raises or returns diff.refused, the per-domain
-            # dicts remain in their pre-call state — concurrent
-            # observers see no transient half-staged URL paired with
-            # the prior tools.
-            # _populate_domain lazily created a per-domain lock for this probe.
-            # If the domain is NEW and the probe fails or is refused it never
-            # enters the manager, so drop the lock to keep _registry_locks from
-            # growing without bound under add/remove churn.
-            new_domain = domain not in self._upstreams
-            try:
-                diff = await self._populate_domain(domain, reg_client, upstream_url=url)
-            except Exception:
-                # Re-check live state: a concurrent successful add_upstream for
-                # this domain may have registered it (making its lock canonical)
-                # while we awaited, so only drop the lock if it's still this
-                # failing attempt's orphan.
-                if new_domain and domain not in self._upstreams:
-                    self._registry_locks.pop(domain, None)
-                raise
-            if diff.refused:
-                # Same re-check as the except path — don't evict a lock a
-                # concurrent successful registration now owns.
-                if new_domain and domain not in self._upstreams:
-                    self._registry_locks.pop(domain, None)
-                # Registry preserved its prior tools on refusal;
-                # manager keeps its prior URL/clients.  No mutations
-                # to undo.  Return the diff so the caller can
-                # surface the schema-mismatch detail in its response.
-                return diff
-
-            # Probe succeeded — commit all four maps in one
-            # synchronous region.  asyncio is single-threaded between
-            # awaits, so the four assignments below are atomic from
-            # any concurrent coroutine's perspective.
-            prior_reg_client = self._registry_clients.get(domain)
-            prior_exec_client = self._execution_clients.get(domain)
-            self._upstreams[domain] = url
-            if headers:
-                self._upstream_headers[domain] = headers
-            else:
-                self._upstream_headers.pop(domain, None)
-            self._registry_clients[domain] = reg_client
-            self._execution_clients[domain] = exec_client
-
-            # Close the prior client pair after commit.  Any concurrent
-            # dispatch that resumes here sees the already-committed
-            # new pair, never a half-shut-down client.
-            for old in (prior_reg_client, prior_exec_client):
-                if old is None:
-                    continue
-                try:
-                    async with old:
-                        pass  # __aexit__ closes the session
-                except Exception:
-                    logger.debug("Error closing prior client for domain '%s'", domain, exc_info=True)
-
-            logger.info(
-                "Registered upstream '%s' (%s, discovery=%s): %d tools",
-                domain,
-                url,
-                disc_url,
-                diff.tool_count,
+        """Prepare, drain, durably commit and publish a new incarnation."""
+        headers = deepcopy(headers)
+        registry_auth_headers = deepcopy(registry_auth_headers)
+        async with self._transitions[domain]:
+            identity = registration_identity or RegistrationIdentity(
+                registration_id=uuid4(), configuration_revision=configuration_revision
             )
-            return diff
+            if registration_identity is not None:
+                if configuration_revision is not None and configuration_revision != identity.configuration_revision:
+                    raise ValueError("Restored identity configuration revision mismatch")
+                current = self._identities.get(domain)
+                if (
+                    domain in self._upstreams
+                    and current is not None
+                    and current.registration_id == identity.registration_id
+                ):
+                    raise ValueError("Cannot restore the same identity over a live registration")
+            effective_auth = registry_auth_headers if registry_auth_headers is not None else self._registry_auth_headers
+            reg_client = Client(discovery_url or url)
+            exec_client = Client(url)
+            if effective_auth:
+                _set_transport_headers(reg_client, dict(effective_auth))
+            published = False
+            old_reg = self._registry_clients.get(domain)
+            old_exec = self._execution_clients.get(domain)
+            try:
+                prepared = await self._prepare_domain(domain, reg_client, upstream_url=url)
+                if prepared.diff.refused:
+                    return prepared.diff
+
+                def candidate() -> RegistrationSnapshot:
+                    return self._snapshot_candidate(domain, identity, url, discovery_url, prepared)
+
+                def publish(snapshot: RegistrationSnapshot | None) -> RegistryDiff:
+                    nonlocal published
+                    assert snapshot is not None
+                    diff = self._registry.commit_domain(prepared)
+                    self._upstreams[domain] = url
+                    self._upstream_headers.pop(domain, None)
+                    if headers:
+                        self._upstream_headers[domain] = dict(headers)
+                    self._registry_clients[domain] = reg_client
+                    self._execution_clients[domain] = exec_client
+                    self._identities[domain] = identity
+                    if discovery_url:
+                        self._discovery_urls[domain] = discovery_url
+                    else:
+                        self._discovery_urls.pop(domain, None)
+                    self._runtimes[domain] = _RegistrationRuntime(snapshot)
+                    published = True
+                    return diff
+
+                return await self._transition(domain, "replace", candidate, publish)
+            finally:
+                # A shielded commit may have published even when its caller was cancelled.
+                await self._close_clients(*((old_reg, old_exec) if published else (reg_client, exec_client)))
 
     async def remove_upstream(self, domain: str) -> list[str]:
-        """Remove an upstream and all its tools from the registry.
-
-        Closes the persistent registry client to free resources.
-        Returns the list of tool names that were removed.
-        Raises ``KeyError`` if the domain is not registered.
-        """
-        with _tracer.start_as_current_span("gateway.remove_upstream") as span:
-            span.set_attribute("gateway.domain", domain)
-
+        """Retire admission and drain calls before committing removal."""
+        async with self._transitions[domain]:
             if domain not in self._upstreams:
-                msg = f"Domain '{domain}' is not a registered upstream"
-                raise KeyError(msg)
+                raise KeyError(f"Domain '{domain}' is not a registered upstream")
+            old_reg = self._registry_clients.get(domain)
+            old_exec = self._execution_clients.get(domain)
+            published = False
 
-            # Collect tool names before clearing.
-            removed = [t.name for t in self._registry.get_tools_by_domain(domain)]
+            def publish(snapshot: RegistrationSnapshot | None) -> list[str]:
+                nonlocal published
+                removed = [t.name for t in self._registry.get_tools_by_domain(domain)]
+                self._registry.clear_domain(domain)
+                self._upstreams.pop(domain, None)
+                self._registry_clients.pop(domain, None)
+                self._execution_clients.pop(domain, None)
+                self._upstream_headers.pop(domain, None)
+                self._discovery_urls.pop(domain, None)
+                self._identities.pop(domain, None)
+                self._runtimes.pop(domain, None)
+                published = True
+                return removed
 
-            self._registry.clear_domain(domain)
-            self._upstreams.pop(domain, None)
-            reg_client = self._registry_clients.pop(domain, None)
-            exec_client = self._execution_clients.pop(domain, None)
-            self._upstream_headers.pop(domain, None)
-            self._registry_locks.pop(domain, None)
-
-            # Close both clients to release connection resources. When
-            # discovery_url == url at add_upstream time, exec_client is a
-            # distinct Client instance pointing at the same URL — closing
-            # both is correct and not a double-close.
-            for c in (reg_client, exec_client):
-                if c is None:
-                    continue
-                try:
-                    async with c:
-                        pass  # __aexit__ closes the session
-                except Exception:
-                    logger.debug("Error closing client for domain '%s'", domain, exc_info=True)
-
-            span.set_attribute("gateway.tools_removed", len(removed))
-            logger.info("Deregistered upstream '%s': removed %d tools", domain, len(removed))
-            return removed
+            try:
+                return await self._transition(domain, "remove", None, publish)
+            finally:
+                if published:
+                    await self._close_clients(old_reg, old_exec)
 
     # ------------------------------------------------------------------
     # Introspection helpers

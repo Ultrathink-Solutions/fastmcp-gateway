@@ -4,13 +4,23 @@ from __future__ import annotations
 
 import json
 import re
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from mcp.shared.exceptions import McpError
 from pydantic import BaseModel
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+
+
+class RegistrationSelectionError(ValueError):
+    """Local registration resolution or admission failure."""
+
+    def __init__(
+        self, code: Literal["invalid_selector", "tool_not_found", "registration_changed"], message: str
+    ) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class OutputGuardError(ValueError):
