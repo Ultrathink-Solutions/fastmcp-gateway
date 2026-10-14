@@ -299,31 +299,45 @@ class TestBackgroundRefresh:
 
     async def test_refresh_loop_calls_refresh_all(self) -> None:
         """Refresh loop calls refresh_all at least twice within the interval."""
+        refreshed_twice = asyncio.Event()
+        call_count = 0
+
+        async def refresh_all() -> list[RegistryDiff]:
+            nonlocal call_count
+            call_count += 1
+            if call_count >= 2:
+                refreshed_twice.set()
+            return []
+
         with patch("fastmcp_gateway.client_manager.Client"):
             gw = GatewayServer(
                 {"svc": "http://svc:8080/mcp"},
                 refresh_interval=0.05,
             )
 
-        gw.upstream_manager.refresh_all = AsyncMock(return_value=[])  # type: ignore[method-assign]
+        gw.upstream_manager.refresh_all = AsyncMock(side_effect=refresh_all)  # type: ignore[method-assign]
 
         task = asyncio.create_task(gw._refresh_loop())
-        await asyncio.sleep(0.15)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        try:
+            await asyncio.wait_for(refreshed_twice.wait(), timeout=5.0)
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
 
         assert gw.upstream_manager.refresh_all.call_count >= 2
 
     async def test_refresh_loop_survives_errors(self) -> None:
         """A failing refresh doesn't kill the loop."""
         call_count = 0
+        succeeded_after_failure = asyncio.Event()
 
         async def failing_then_ok() -> list[RegistryDiff]:
             nonlocal call_count
             call_count += 1
             if call_count == 1:
                 raise ConnectionError("transient failure")
+            succeeded_after_failure.set()
             return []
 
         with patch("fastmcp_gateway.client_manager.Client"):
@@ -335,10 +349,12 @@ class TestBackgroundRefresh:
         gw.upstream_manager.refresh_all = failing_then_ok  # type: ignore[method-assign]
 
         task = asyncio.create_task(gw._refresh_loop())
-        await asyncio.sleep(0.15)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        try:
+            await asyncio.wait_for(succeeded_after_failure.wait(), timeout=5.0)
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
 
         # Should have been called at least twice (one failure + one success).
         assert call_count >= 2
