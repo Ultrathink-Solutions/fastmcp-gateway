@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   **Compatibility:** dispatch by tool name is unchanged. A call that arrives while its upstream's registration is being replaced is now refused before anything reaches the upstream. `execute_tool` reports it as `execution_error`, and an `on_error` hook receives a `RegistrationSelectionError` with code `registration_changed`. Retrying after the replacement publishes is safe. Before this release, the call went to whichever registration was live at that moment. (#101)
 
+### Changed
+
+- **Tool population forwards each upstream tool's `_meta`.** Before this release, population passed only `name`, `description`, `inputSchema` and `annotations` from an upstream's `tools/list` to the registry, so a registry field read from `_meta` was always empty on a population path. The per-tool required scope (`ToolEntry.required_scope`, read from the `_meta` key `axon/requiredScope`) now reaches the registry on every population path. **Compatibility:** a hook or policy that reads `ToolEntry.required_scope` now sees the scope an upstream declares, where it saw `None` before. Review any rule that treated a missing scope as permissive, or as a reason to deny. (#101)
+- **`UpstreamManager.execute_tool` takes a keyword-only `resolved_tool`.** It carries the registration a caller resolved through to dispatch. A consumer that wraps or replaces `execute_tool` must accept the new keyword and forward it unchanged. (#101)
+
 ## [0.33.0] - 2026-10-10
 
 ### Changed
