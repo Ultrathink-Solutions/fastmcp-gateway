@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.34.1] - 2026-10-21
+
+### Security
+
+- **Per-call upstream headers stay on their own call.** `UpstreamManager._make_execution_client` built each execution client with `Client.new()`, which is a shallow copy that shares the transport with the per-domain base client. It then merged the call's headers (static `upstream_headers` and the `extra_headers` an execution hook sets) onto that shared transport. A header set for one call therefore went out on later calls to the same upstream that did not set it. Under concurrency, a call could be sent with the headers another call had just written, including identity headers a hook derives from the caller. Every execution client now gets its own copy of the transport, so a call is sent with exactly the headers merged for it, and the base client's transport is never modified. Deployments whose hooks put caller-specific values in `extra_headers` should upgrade. Affected releases: every release since execution hooks were introduced, up to and including 0.34.0.
+
 ## [0.34.0] - 2026-10-14
 
 ### Added
