@@ -24,14 +24,14 @@ class TestInferGroup:
     def test_no_domain_prefix(self) -> None:
         """Tool name doesn't start with the registered domain, but still
         has an underscore -> falls back to the ``{group}_{action}``
-        convention rather than 'general' (ULT-7361)."""
+        convention rather than 'general'."""
         assert infer_group("apollo", "search_people") == "search"
 
     def test_domain_only_prefix(self) -> None:
         """Tool name is just the domain prefix with no remainder after it
         (empty group segment under the domain-prefix convention) ->
         falls back to the ``{group}_{action}`` convention, splitting the
-        whole name on its first underscore (ULT-7361)."""
+        whole name on its first underscore."""
         assert infer_group("apollo", "apollo_") == "apollo"
 
     def test_exact_domain_name(self) -> None:
@@ -343,7 +343,7 @@ class TestPopulateDomain:
     def test_populate_group_action_fallback(self, empty_registry: ToolRegistry) -> None:
         """Tools without the domain prefix, but still shaped as
         ``{group}_{action}``, get their group from that convention
-        instead of 'general' (ULT-7361)."""
+        instead of 'general'."""
         raw_tools = [
             {"name": "standalone_tool", "inputSchema": {"type": "object"}},
             {"name": "another_one", "inputSchema": {"type": "object"}},
@@ -516,7 +516,7 @@ class TestPopulateDomain:
 
 
 # ---------------------------------------------------------------------------
-# ToolEntry — required_scope (ULT-6012: axon MCP scope-architecture pivot W1)
+# ToolEntry — required_scope (the upstream's declared per-tool scope)
 # ---------------------------------------------------------------------------
 
 
@@ -542,9 +542,9 @@ class TestToolEntryRequiredScope:
             description="",
             input_schema={"type": "object"},
             upstream_url="http://x:8080/mcp",
-            required_scope="mcp:d365:crm_actions:write",
+            required_scope="widgets:write",
         )
-        assert entry.required_scope == "mcp:d365:crm_actions:write"
+        assert entry.required_scope == "widgets:write"
 
         from pydantic import ValidationError
 
@@ -553,19 +553,19 @@ class TestToolEntryRequiredScope:
 
     def test_round_trips_through_register_tool_and_lookup(self, empty_registry: ToolRegistry) -> None:
         entry = ToolEntry(
-            name="crm_add_note",
-            domain="d365_crm",
-            group="crm",
-            description="Add a note",
+            name="widgets_create",
+            domain="widgets",
+            group="widgets",
+            description="Create a widget",
             input_schema={"type": "object"},
-            upstream_url="http://d365-crm:8080/mcp",
-            required_scope="mcp:d365:crm_actions:write",
+            upstream_url="http://widgets:8080/mcp",
+            required_scope="widgets:write",
         )
         empty_registry.register_tool(entry)
 
-        looked_up = empty_registry.lookup("crm_add_note")
+        looked_up = empty_registry.lookup("widgets_create")
         assert looked_up is not None
-        assert looked_up.required_scope == "mcp:d365:crm_actions:write"
+        assert looked_up.required_scope == "widgets:write"
 
 
 # ---------------------------------------------------------------------------
@@ -577,29 +577,29 @@ class TestPopulateDomainRequiredScope:
     def test_populates_required_scope_from_meta(self, empty_registry: ToolRegistry) -> None:
         raw_tools = [
             {
-                "name": "crm_add_note",
-                "description": "Add a note",
+                "name": "widgets_create",
+                "description": "Create a widget",
                 "inputSchema": {"type": "object"},
-                "_meta": {"axon/requiredScope": "mcp:d365:crm_actions:write"},
+                "_meta": {"axon/requiredScope": "widgets:write"},
             },
         ]
-        empty_registry.populate_domain("d365_crm", "http://d365-crm:8080/mcp", raw_tools)
+        empty_registry.populate_domain("widgets", "http://widgets:8080/mcp", raw_tools)
 
-        tool = empty_registry.lookup("crm_add_note")
+        tool = empty_registry.lookup("widgets_create")
         assert tool is not None
-        assert tool.required_scope == "mcp:d365:crm_actions:write"
+        assert tool.required_scope == "widgets:write"
 
     def test_absent_meta_yields_none(self, empty_registry: ToolRegistry) -> None:
         raw_tools = [
             {
-                "name": "crm_get_account_360",
-                "description": "Read an account",
+                "name": "widgets_get",
+                "description": "Read a widget",
                 "inputSchema": {"type": "object"},
             },
         ]
-        empty_registry.populate_domain("d365_crm", "http://d365-crm:8080/mcp", raw_tools)
+        empty_registry.populate_domain("widgets", "http://widgets:8080/mcp", raw_tools)
 
-        tool = empty_registry.lookup("crm_get_account_360")
+        tool = empty_registry.lookup("widgets_get")
         assert tool is not None
         assert tool.required_scope is None
 
@@ -638,20 +638,20 @@ class TestPopulateDomainRequiredScope:
         sibling -- the failure mode a single-tool fixture cannot see."""
         raw_tools = [
             {
-                "name": "crm_add_note",
+                "name": "widgets_create",
                 "inputSchema": {"type": "object"},
-                "_meta": {"axon/requiredScope": "mcp:d365:crm_actions:write"},
+                "_meta": {"axon/requiredScope": "widgets:write"},
             },
             {
-                "name": "crm_get_account_360",
+                "name": "widgets_get",
                 "inputSchema": {"type": "object"},
             },
         ]
-        empty_registry.populate_domain("d365_crm", "http://d365-crm:8080/mcp", raw_tools)
+        empty_registry.populate_domain("widgets", "http://widgets:8080/mcp", raw_tools)
 
-        scoped = empty_registry.lookup("crm_add_note")
-        unscoped = empty_registry.lookup("crm_get_account_360")
-        assert scoped is not None and scoped.required_scope == "mcp:d365:crm_actions:write"
+        scoped = empty_registry.lookup("widgets_create")
+        unscoped = empty_registry.lookup("widgets_get")
+        assert scoped is not None and scoped.required_scope == "widgets:write"
         assert unscoped is not None and unscoped.required_scope is None
 
 
