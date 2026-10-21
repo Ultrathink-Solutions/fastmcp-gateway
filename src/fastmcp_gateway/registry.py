@@ -141,8 +141,7 @@ class ToolEntry(BaseModel):
     # ``_meta`` at list_tools time; operators may additionally override
     # per-tool via ``GatewayServer(trusted_output_tools={...})``.
     raw_output_trusted: bool = False
-    # ULT-6012 (axon MCP scope-architecture pivot, spec P2): the tool's
-    # DECLARED GRANULAR scope, as exported by the upstream chassis in the
+    # The tool's DECLARED GRANULAR scope, as the upstream exports it in the
     # additive MCP ``_meta`` key ``axon/requiredScope``. ``None`` when the
     # upstream declares no scope for this tool. Consumers coarsen at check
     # time; this field is never coarsened at populate time.
@@ -583,7 +582,7 @@ class ToolRegistry:
             # populate boundaries is a load-bearing invariant of the
             # schema-integrity gate.
             # The 5th tuple element carries the tool's declared granular
-            # scope (ULT-6012), read from the raw upstream ``_meta`` key
+            # scope, read from the raw upstream ``_meta`` key
             # ``axon/requiredScope`` here so the second loop below can
             # populate :attr:`ToolEntry.required_scope` without re-indexing
             # ``tools``. Also kept out of the digest for the same reason as
@@ -619,7 +618,7 @@ class ToolRegistry:
                 # description-sanitizer discipline.
                 annotations_raw = raw.get("annotations")
                 annotations = annotations_raw if isinstance(annotations_raw, dict) else {}
-                # ULT-6012: extract the declared granular scope from the raw
+                # Extract the declared granular scope from the raw
                 # upstream ``_meta`` key ``axon/requiredScope``. A malformed
                 # value (non-string, or an empty string) collapses to
                 # ``None`` rather than crashing or registering a falsy

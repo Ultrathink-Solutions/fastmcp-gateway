@@ -741,7 +741,7 @@ class TestExecuteToolRequestMetadata:
     ) -> None:
         original_meta = {
             "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
-            "io.ult.action_execution.v1": "eyJhbGciOiJFZERTQSJ9.payload.signature",
+            "com.acme.action_execution.v1": "eyJhbGciOiJFZERTQSJ9.payload.signature",
             "nested": {"items": [{"attempt": 1}]},
         }
         original_arguments = {"query": "Jane"}
@@ -822,7 +822,7 @@ class TestExecuteCodeRequestMetadata:
             code_mode_runner=code_mode_runner,
         )
         request_meta = {
-            "io.ult.action_execution.v1": "signed-code-mode",
+            "com.acme.action_execution.v1": "signed-code-mode",
             "nested": {"attempts": [1]},
         }
 

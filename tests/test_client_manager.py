@@ -387,12 +387,12 @@ class TestExecuteTool:
         )
         first = {
             "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
-            "io.ult.action_execution.v1": "signed-first",
+            "com.acme.action_execution.v1": "signed-first",
             "nested": {"attempts": [1, 2]},
         }
         second = {
             "traceparent": "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01",
-            "io.ult.action_execution.v1": "signed-second",
+            "com.acme.action_execution.v1": "signed-second",
         }
         tracer = TracerProvider().get_tracer(__name__)
 
