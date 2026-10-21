@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
-from fastmcp import Context, FastMCP
+from fastmcp import Client, Context, FastMCP
+from fastmcp.client.transports import StreamableHttpTransport
+from fastmcp.server.dependencies import get_http_headers
 from opentelemetry.sdk.trace import TracerProvider
 
 from fastmcp_gateway.client_manager import UpstreamManager
@@ -692,3 +696,108 @@ class TestDiscoveryUrlSeparation:
         first_exec.close.assert_awaited_once()
         first_reg.close.assert_awaited_once()
         assert first_reg.__aexit__.await_count == initial_reg_exits
+
+
+# ---------------------------------------------------------------------------
+# Per-call transport isolation
+# ---------------------------------------------------------------------------
+
+
+class TestExecutionClientTransportIsolation:
+    """Each execution client gets its own transport.
+
+    ``Client.new()`` is a shallow copy that shares the transport with the
+    per-domain base client. Headers merged for one call must not reach the
+    base client or any other call, including calls that run concurrently.
+    """
+
+    def _manager(self, registry: ToolRegistry, **kwargs: Any) -> UpstreamManager:
+        return UpstreamManager({"svc": "http://svc:8080/mcp"}, registry, **kwargs)
+
+    def test_each_call_gets_its_own_transport(self, registry: ToolRegistry) -> None:
+        manager = self._manager(registry)
+        base = manager._execution_clients["svc"]
+
+        first = manager._make_execution_client("svc", extra_headers={"x-user-subject": "alice"})
+        second = manager._make_execution_client("svc", extra_headers={"x-user-subject": "bob"})
+
+        assert first.transport is not second.transport
+        assert first.transport is not base.transport
+        assert second.transport is not base.transport
+        assert first.transport.headers == {"x-user-subject": "alice"}
+        assert second.transport.headers == {"x-user-subject": "bob"}
+        assert base.transport.headers == {}
+
+    def test_a_header_set_for_one_call_does_not_reach_the_next(self, registry: ToolRegistry) -> None:
+        manager = self._manager(registry)
+
+        manager._make_execution_client("svc", extra_headers={"x-user-subject": "alice", "x-only-first": "alice-only"})
+        later = manager._make_execution_client("svc", extra_headers={"x-user-subject": "bob"})
+        bare = manager._make_execution_client("svc")
+
+        assert later.transport.headers == {"x-user-subject": "bob"}
+        assert bare.transport.headers == {}
+
+    def test_static_domain_headers_apply_to_every_call(self, registry: ToolRegistry) -> None:
+        manager = self._manager(registry, upstream_headers={"svc": {"Authorization": "Bearer domain-key"}})
+
+        first = manager._make_execution_client("svc", extra_headers={"x-user-subject": "alice"})
+        second = manager._make_execution_client("svc")
+
+        assert first.transport.headers == {"Authorization": "Bearer domain-key", "x-user-subject": "alice"}
+        assert second.transport.headers == {"Authorization": "Bearer domain-key"}
+        assert manager._execution_clients["svc"].transport.headers == {}
+
+    @pytest.mark.asyncio
+    async def test_concurrent_calls_keep_their_own_headers(self, registry: ToolRegistry) -> None:
+        """Interleaved calls each see only their own headers when they connect."""
+        manager = self._manager(registry)
+        subjects = [f"user{i:02d}" for i in range(20)]
+        seen: dict[str, str | None] = {}
+
+        async def one_call(subject: str) -> None:
+            client = manager._make_execution_client("svc", extra_headers={"x-user-subject": subject})
+            # Yield so every other call builds its client before this one
+            # reads its headers, as an awaiting connect would.
+            await asyncio.sleep(0)
+            seen[subject] = client.transport.headers.get("x-user-subject")
+
+        await asyncio.gather(*(one_call(s) for s in subjects))
+
+        assert seen == {s: s for s in subjects}
+
+    @pytest.mark.asyncio
+    async def test_the_upstream_receives_only_each_calls_own_headers(
+        self, registry: ToolRegistry, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """What a real upstream receives over HTTP, sequentially and concurrently."""
+        upstream = FastMCP("svc")
+
+        @upstream.tool
+        def whoami() -> str:
+            headers = get_http_headers(include_all=True)
+            return f"{headers.get('x-user-subject', '-')}|{headers.get('x-only-first', '-')}"
+
+        app = upstream.http_app(transport="streamable-http", stateless_http=True, json_response=True)
+
+        def over_asgi(**kwargs: Any) -> httpx.AsyncClient:
+            return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), **kwargs)
+
+        monkeypatch.setattr(
+            "fastmcp_gateway.client_manager.Client",
+            lambda url: Client(StreamableHttpTransport(url, httpx_client_factory=over_asgi)),
+        )
+        manager = self._manager(registry)
+        subjects = [f"user{i:02d}" for i in range(20)]
+
+        async def whoami_as(headers: dict[str, str]) -> str:
+            result = await manager.execute_tool("whoami", extra_headers=headers)
+            return result.content[0].text  # type: ignore[union-attr]
+
+        async with app.router.lifespan_context(app):
+            await manager.populate_all()
+            first = await whoami_as({"x-user-subject": "first", "x-only-first": "first"})
+            concurrent = await asyncio.gather(*(whoami_as({"x-user-subject": s}) for s in subjects))
+
+        assert first == "first|first"
+        assert concurrent == [f"{s}|-" for s in subjects]

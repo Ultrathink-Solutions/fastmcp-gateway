@@ -19,7 +19,7 @@ import re
 import weakref
 from collections import defaultdict
 from contextlib import asynccontextmanager
-from copy import deepcopy
+from copy import copy, deepcopy
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 from uuid import uuid4
@@ -813,10 +813,13 @@ class UpstreamManager:
         """Create a fresh client for tool execution via ``client.new()``.
 
         Always uses ``client.new()`` to create a shallow copy of the
-        execution-side client, ensuring consistent transport configuration.
-        If *domain* has explicit upstream headers, those are merged onto
-        the new client's transport.  Otherwise the client inherits
-        request-passthrough behaviour via the ContextVar.
+        execution-side client, ensuring consistent transport configuration,
+        and gives the copy its own copy of the transport: ``Client.new()``
+        shares the transport with the base client, so headers merged onto
+        it would otherwise reach every later and concurrent call to the
+        same upstream.  If *domain* has explicit upstream headers, those are
+        merged onto the new client's transport.  Otherwise the client
+        inherits request-passthrough behaviour via the ContextVar.
 
         Header merge priority (highest wins):
         1. *extra_headers* from hooks (e.g. ``X-User-Subject``)
@@ -827,6 +830,9 @@ class UpstreamManager:
         # registry client may target a separate discovery URL (e.g.
         # `/_introspect`) that does not accept `tools/call`.
         client = self._execution_clients[domain].new()
+        # The call's headers (and the per-connection state a transport
+        # records) belong to this call alone.
+        client.transport = copy(client.transport)
         merged: dict[str, str] = {}
         if domain in self._upstream_headers:
             merged.update(self._upstream_headers[domain])
