@@ -172,7 +172,7 @@ def _make_fake_tool(name: str) -> MagicMock:
     tool = MagicMock()
     tool.name = name
     tool.description = f"Tool {name}"
-    tool.inputSchema = {"type": "object"}
+    tool.input_schema = {"type": "object"}
     return tool
 
 
@@ -186,7 +186,7 @@ class TestRefreshMethods:
 
         with patch(
             "fastmcp_gateway.client_manager.Client",
-            side_effect=lambda url: _make_mock_client([fake_tool]),
+            side_effect=lambda url, **_: _make_mock_client([fake_tool]),
         ):
             manager = UpstreamManager({"svc": "http://svc:8080/mcp"}, registry)
             diff = await manager.refresh_domain("svc")
@@ -202,7 +202,7 @@ class TestRefreshMethods:
 
         with patch(
             "fastmcp_gateway.client_manager.Client",
-            side_effect=lambda url: _make_mock_client([fake_tool]),
+            side_effect=lambda url, **_: _make_mock_client([fake_tool]),
         ):
             manager = UpstreamManager({"svc": "http://svc:8080/mcp"}, registry)
             diffs = await manager.refresh_all()

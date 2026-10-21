@@ -27,9 +27,17 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
 ]
 dependencies = [
-    "fastmcp>=3.4.2,<3.5",
+    # FastMCP 4 runs on the MCP Python SDK v2 (``mcp>=2.2``), which
+    # replaced ``httpx`` with ``httpx2``. The gateway imports both the
+    # SDK's protocol types and ``httpx2``'s exception classes directly,
+    # so ``mcp`` and ``httpx2`` are declared here rather than relied on
+    # transitively; the floors match what FastMCP 4.1 itself requires.
+    "fastmcp>=4.1,<5",
+    "httpx2>=2.5",
+    "mcp>=2.2,<3",
     "opentelemetry-api>=1.20",
-    "pydantic>=2.0",
+    "pydantic>=2.12",
+    "starlette>=1.0.1",
     # PyJWT with the [crypto] extra powers ``JWTRegistrationValidator``
     # in ``fastmcp_gateway.registration_auth``. The extra pulls in
     # ``cryptography`` (~7MB wheel), which is why the ``import jwt``

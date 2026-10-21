@@ -314,7 +314,7 @@ class TestGatewayIntegration:
             def __init__(self, name: str, input_schema: dict[str, Any]) -> None:
                 self.name = name
                 self.description = ""
-                self.inputSchema = input_schema
+                self.input_schema = input_schema
 
         class _StubClient:
             def __init__(self, *_args: Any, **_kwargs: Any) -> None: ...

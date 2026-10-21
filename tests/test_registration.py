@@ -8,7 +8,7 @@ from datetime import UTC
 
 import pytest
 from fastmcp import FastMCP
-from httpx import ASGITransport, AsyncClient
+from httpx2 import ASGITransport, AsyncClient
 
 from fastmcp_gateway.client_manager import UpstreamManager
 from fastmcp_gateway.gateway import GatewayServer
@@ -98,7 +98,7 @@ def _auth_headers() -> dict[str, str]:
 
 
 async def _http_client(gateway: GatewayServer) -> AsyncClient:
-    """Create an httpx AsyncClient backed by the gateway's ASGI app."""
+    """Create an httpx2 AsyncClient backed by the gateway's ASGI app."""
     app = gateway.mcp.http_app(transport="streamable-http")
     transport = ASGITransport(app=app)
     return AsyncClient(transport=transport, base_url="http://testserver")

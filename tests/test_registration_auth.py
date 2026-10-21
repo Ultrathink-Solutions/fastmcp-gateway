@@ -16,7 +16,7 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from fastmcp import FastMCP
-from httpx import ASGITransport, AsyncClient
+from httpx2 import ASGITransport, AsyncClient
 
 from fastmcp_gateway.gateway import GatewayServer
 from fastmcp_gateway.registration_auth import (

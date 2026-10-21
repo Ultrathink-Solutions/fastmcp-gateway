@@ -6,7 +6,7 @@ import asyncio
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import httpx
+import httpx2
 import pytest
 from fastmcp import Client, Context, FastMCP
 from fastmcp.client.transports import StreamableHttpTransport
@@ -28,12 +28,12 @@ def _make_fake_tools(domain: str) -> list[FakeTool]:
         FakeTool(
             name=f"{domain}_users_list",
             description="List users",
-            inputSchema={"type": "object", "properties": {"limit": {"type": "integer"}}},
+            input_schema={"type": "object", "properties": {"limit": {"type": "integer"}}},
         ),
         FakeTool(
             name=f"{domain}_users_create",
             description="Create a user",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {"name": {"type": "string"}},
                 "required": ["name"],
@@ -42,25 +42,18 @@ def _make_fake_tools(domain: str) -> list[FakeTool]:
         FakeTool(
             name=f"{domain}_billing_invoice",
             description="Generate invoice",
-            inputSchema={"type": "object"},
+            input_schema={"type": "object"},
         ),
     ]
 
 
 def _make_call_client(result: Any) -> AsyncMock:
-    """Build a client double for the exact-metadata protocol call path."""
+    """Build a client double for the tool-call path (``Client.call_tool``)."""
     client = AsyncMock()
     client.__aenter__ = AsyncMock(return_value=client)
     client.__aexit__ = AsyncMock(return_value=None)
-    client.session = MagicMock()
-    client.session.call_tool = AsyncMock(return_value=result)
-    client._progress_handler = None
-
-    async def await_result(awaitable: Any) -> Any:
-        return await awaitable
-
-    client._await_with_session_monitoring = AsyncMock(side_effect=await_result)
-    client._parse_call_tool_result = AsyncMock(return_value=result)
+    client.protocol_version = "2025-11-25"
+    client.call_tool = AsyncMock(return_value=result)
     return client
 
 
@@ -78,7 +71,7 @@ class TestPopulateAll:
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=None)
 
-        def make_client(url: str) -> MagicMock:
+        def make_client(url: str, **_client_kwargs: Any) -> MagicMock:
             # Resolve domain by URL — UpstreamManager now constructs two
             # Client instances per domain (registry + execution) so any
             # call-order indexing breaks. Mapping by URL is order-independent.
@@ -103,7 +96,7 @@ class TestPopulateAll:
         """One failing upstream should not prevent others from populating."""
         first_domain = next(iter(upstreams.keys()))
 
-        def make_client(url: str) -> MagicMock:
+        def make_client(url: str, **_client_kwargs: Any) -> MagicMock:
             domain = next(d for d, u in upstreams.items() if u == url)
             client = AsyncMock()
             client.__aenter__ = AsyncMock(return_value=client)
@@ -135,7 +128,7 @@ class TestPopulateAll:
 class TestPopulateDomain:
     @pytest.mark.asyncio
     async def test_populates_single_domain(self, registry: ToolRegistry) -> None:
-        def make_client(url: str) -> MagicMock:
+        def make_client(url: str, **_client_kwargs: Any) -> MagicMock:
             client = AsyncMock()
             client.__aenter__ = AsyncMock(return_value=client)
             client.__aexit__ = AsyncMock(return_value=None)
@@ -237,7 +230,7 @@ class TestExecuteTool:
         base_client = MagicMock()
         base_client.new = MagicMock(return_value=fresh_client)
 
-        def make_client(url: str) -> MagicMock:
+        def make_client(url: str, **_client_kwargs: Any) -> MagicMock:
             return base_client
 
         with patch("fastmcp_gateway.client_manager.Client", side_effect=make_client):
@@ -254,9 +247,10 @@ class TestExecuteTool:
 
         assert result is fake_result
         base_client.new.assert_called_once()
-        fresh_client.session.call_tool.assert_awaited_once_with(
+        fresh_client.call_tool.assert_awaited_once_with(
             "svc_users_list",
             {"limit": 10},
+            raise_on_error=False,
             meta=None,
         )
 
@@ -272,7 +266,7 @@ class TestExecuteTool:
         base_client = MagicMock()
         base_client.new = MagicMock(return_value=fresh_client)
 
-        def make_client(url: str) -> MagicMock:
+        def make_client(url: str, **_client_kwargs: Any) -> MagicMock:
             return base_client
 
         with patch("fastmcp_gateway.client_manager.Client", side_effect=make_client):
@@ -304,9 +298,10 @@ class TestExecuteTool:
 
         assert result is fake_result
         # Must call upstream with the ORIGINAL name, not the prefixed one
-        fresh_client.session.call_tool.assert_awaited_once_with(
+        fresh_client.call_tool.assert_awaited_once_with(
             "get_server_info",
             {},
+            raise_on_error=False,
             meta=None,
         )
 
@@ -326,7 +321,7 @@ class TestExecuteTool:
         base_client = MagicMock()
         base_client.new = MagicMock(return_value=fresh_client)
 
-        def make_client(url: str) -> MagicMock:
+        def make_client(url: str, **_client_kwargs: Any) -> MagicMock:
             return base_client
 
         with patch("fastmcp_gateway.client_manager.Client", side_effect=make_client):
@@ -338,35 +333,44 @@ class TestExecuteTool:
 
         await manager.execute_tool("svc_ping")
 
-        fresh_client.session.call_tool.assert_awaited_once_with(
+        fresh_client.call_tool.assert_awaited_once_with(
             "svc_ping",
             {},
+            raise_on_error=False,
             meta=None,
         )
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("client_mode", ["legacy", "2026-07-28"])
     async def test_execute_forwards_exact_metadata_without_trace_injection(
         self,
         registry: ToolRegistry,
+        client_mode: str,
     ) -> None:
+        """The upstream sees exactly the caller's ``_meta``: no injected trace
+        context or progress token, and a caller-supplied ``traceparent`` kept.
+
+        On a 2026-07-28 connection the session also stamps the protocol's
+        reserved ``io.modelcontextprotocol/`` keys on every request, so absent
+        caller metadata arrives as those keys alone.
+        """
         upstream = FastMCP("recording-upstream")
         recorded_meta: list[dict[str, Any] | None] = []
+        recorded_reserved: list[set[str]] = []
 
         @upstream.tool
         async def record(value: str, ctx: Context) -> str:
-            meta_model = ctx.request_context.meta
-            recorded_meta.append(
-                None
-                if meta_model is None
-                else meta_model.model_dump(
-                    mode="python",
-                    by_alias=True,
-                    exclude_unset=True,
-                )
-            )
+            assert ctx.request_context is not None
+            meta = ctx.request_context.meta
+            if meta is None:
+                recorded_meta.append(None)
+                recorded_reserved.append(set())
+            else:
+                recorded_meta.append({k: v for k, v in meta.items() if not k.startswith("io.modelcontextprotocol/")})
+                recorded_reserved.append({k for k in meta if k.startswith("io.modelcontextprotocol/")})
             return value
 
-        manager = UpstreamManager({"svc": upstream}, registry)
+        manager = UpstreamManager({"svc": upstream}, registry, client_mode=client_mode)
         registry.populate_domain(
             "svc",
             "memory://recording-upstream",
@@ -397,7 +401,12 @@ class TestExecuteTool:
             await manager.execute_tool("record", {"value": "second"}, request_meta=second)
             await manager.execute_tool("record", {"value": "absent"}, request_meta=None)
 
-        assert recorded_meta == [first, second, None]
+        if client_mode == "legacy":
+            assert recorded_meta == [first, second, None]
+            assert recorded_reserved == [set(), set(), set()]
+        else:
+            assert recorded_meta == [first, second, {}]
+            assert all("io.modelcontextprotocol/protocolVersion" in keys for keys in recorded_reserved)
 
 
 # ---------------------------------------------------------------------------
@@ -569,7 +578,7 @@ class TestDiscoveryUrlSeparation:
 
         clients_by_url: dict[str, MagicMock] = {}
 
-        def make_client(url: str) -> MagicMock:
+        def make_client(url: str, **_client_kwargs: Any) -> MagicMock:
             client = _make_dual_client_mock("widgets")
             clients_by_url[url] = client
             return client
@@ -588,7 +597,7 @@ class TestDiscoveryUrlSeparation:
         # Canonical URL was cloned via .new() and the fresh client served call_tool.
         assert clients_by_url[exec_url].new.call_count == 1
         exec_fresh = clients_by_url[exec_url].new.return_value
-        exec_fresh.session.call_tool.assert_awaited_once()
+        exec_fresh.call_tool.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_omitting_discovery_url_routes_both_paths_to_url(self, registry: ToolRegistry) -> None:
@@ -601,7 +610,7 @@ class TestDiscoveryUrlSeparation:
         exec_url = "http://legacy:8080/mcp"
         constructed: list[MagicMock] = []
 
-        def make_client(url: str) -> MagicMock:
+        def make_client(url: str, **_client_kwargs: Any) -> MagicMock:
             assert url == exec_url, f"unexpected URL {url!r}"
             client = _make_dual_client_mock("legacy")
             constructed.append(client)
@@ -632,7 +641,7 @@ class TestDiscoveryUrlSeparation:
         """
         constructed: list[MagicMock] = []
 
-        def make_client(url: str) -> MagicMock:
+        def make_client(url: str, **_client_kwargs: Any) -> MagicMock:
             client = MagicMock()
             client.transport = MagicMock()
             client.transport.headers = {}
@@ -669,7 +678,7 @@ class TestDiscoveryUrlSeparation:
         # exactly those instances were closed.
         constructed: list[AsyncMock] = []
 
-        def make_client(url: str) -> AsyncMock:
+        def make_client(url: str, **_client_kwargs: Any) -> AsyncMock:
             client = _make_dual_client_mock("widgets")
             constructed.append(client)
             return client
@@ -780,12 +789,12 @@ class TestExecutionClientTransportIsolation:
 
         app = upstream.http_app(transport="streamable-http", stateless_http=True, json_response=True)
 
-        def over_asgi(**kwargs: Any) -> httpx.AsyncClient:
-            return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), **kwargs)
+        def over_asgi(**kwargs: Any) -> httpx2.AsyncClient:
+            return httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), **kwargs)
 
         monkeypatch.setattr(
             "fastmcp_gateway.client_manager.Client",
-            lambda url: Client(StreamableHttpTransport(url, httpx_client_factory=over_asgi)),
+            lambda url, **kwargs: Client(StreamableHttpTransport(url, httpx_client_factory=over_asgi), **kwargs),
         )
         manager = self._manager(registry)
         subjects = [f"user{i:02d}" for i in range(20)]
@@ -801,3 +810,67 @@ class TestExecutionClientTransportIsolation:
 
         assert first == "first|first"
         assert concurrent == [f"{s}|-" for s in subjects]
+
+
+class TestAuthFlowRejection:
+    """An upstream rejects the credentials an ``httpx2.Auth`` flow sent.
+
+    The flow answers 401/403 challenges itself, so the response hook lets
+    them through; when the flow gives up, the caller still gets the HTTP
+    status, which is what the gateway classifies credentials on.
+    """
+
+    def _rejecting_upstream(self, monkeypatch: pytest.MonkeyPatch) -> tuple[Any, dict[str, bool]]:
+        upstream = FastMCP("svc")
+
+        @upstream.tool
+        def widgets_get() -> str:
+            return "widget"
+
+        app = upstream.http_app(transport="streamable-http", stateless_http=True, json_response=True)
+        state = {"rejecting": False}
+
+        async def gate(scope: Any, receive: Any, send: Any) -> None:
+            if scope["type"] == "http" and state["rejecting"]:
+                challenge = (b"www-authenticate", b'Bearer error="invalid_token"')
+                await send({"type": "http.response.start", "status": 401, "headers": [challenge]})
+                await send({"type": "http.response.body", "body": b""})
+                return
+            await app(scope, receive, send)
+
+        def over_asgi(**kwargs: Any) -> httpx2.AsyncClient:
+            return httpx2.AsyncClient(transport=httpx2.ASGITransport(app=gate), **kwargs)
+
+        monkeypatch.setattr(
+            "fastmcp_gateway.client_manager.Client",
+            lambda url, **kwargs: Client(
+                StreamableHttpTransport(url, auth=httpx2.BasicAuth("svc", "key"), httpx_client_factory=over_asgi),
+                **kwargs,
+            ),
+        )
+        return app, state
+
+    @pytest.mark.asyncio
+    async def test_a_tool_call_the_upstream_rejects_raises_its_status(
+        self, registry: ToolRegistry, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        app, state = self._rejecting_upstream(monkeypatch)
+        manager = UpstreamManager({"svc": "http://svc:8080/mcp"}, registry)
+        async with app.router.lifespan_context(app):
+            await manager.populate_all()
+            state["rejecting"] = True
+            with pytest.raises(httpx2.HTTPStatusError) as raised:
+                await manager.execute_tool("widgets_get")
+        assert raised.value.response.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_a_registration_the_upstream_rejects_raises_its_status(
+        self, registry: ToolRegistry, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        app, state = self._rejecting_upstream(monkeypatch)
+        manager = UpstreamManager({"svc": "http://svc:8080/mcp"}, registry)
+        state["rejecting"] = True
+        async with app.router.lifespan_context(app):
+            with pytest.raises(httpx2.HTTPStatusError) as raised:
+                await manager.populate_domain("svc")
+        assert raised.value.response.status_code == 401

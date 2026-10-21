@@ -13,6 +13,7 @@ from mcp.types import TextContent, ToolAnnotations
 from opentelemetry import trace
 from pydantic import Field
 
+from fastmcp_gateway._upstream_session import RESERVED_META_PREFIX, application_meta
 from fastmcp_gateway.errors import (
     INVALID_PARAMS,
     _find_jsonrpc_error,
@@ -35,19 +36,24 @@ _tracer = trace.get_tracer("fastmcp_gateway.meta_tools")
 
 
 def _request_meta_snapshot(request_ctx: Context | None) -> dict[str, Any] | None:
-    """Copy the exact inbound MCP request metadata, preserving wire aliases."""
+    """Copy the caller's inbound MCP request metadata, exactly as sent on the wire.
+
+    The protocol-reserved ``io.modelcontextprotocol/`` keys are left out: a
+    2026-07-28 client stamps every request with them (its protocol version,
+    client info and capabilities), so they describe the caller's connection
+    to the gateway, not the call. A request whose ``_meta`` holds nothing
+    else carried no metadata of its own, and yields ``None`` like a request
+    without ``_meta``.
+    """
     if request_ctx is None or request_ctx.request_context is None:
         return None
-    meta_model = request_ctx.request_context.meta
-    if meta_model is None:
+    raw = request_ctx.request_context.meta
+    if not isinstance(raw, dict):
         return None
-    return deepcopy(
-        meta_model.model_dump(
-            mode="python",
-            by_alias=True,
-            exclude_unset=True,
-        )
-    )
+    meta = application_meta(raw)
+    if not meta and any(key.startswith(RESERVED_META_PREFIX) for key in raw):
+        return None
+    return deepcopy(meta)
 
 
 def _signatures_block(tools: list[ToolEntry]) -> str:
@@ -348,7 +354,7 @@ def register_meta_tools(
         return sorted(t.name for t in visible)
 
     @mcp.tool(
-        annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
+        annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
         # output_schema=None stops FastMCP deriving an output schema from
         # the return annotation and re-wrapping the result's text as
         # {"result": ...}; see _json_result for why that wrap
@@ -542,7 +548,7 @@ def register_meta_tools(
             )
 
     @mcp.tool(
-        annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
+        annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False),
         # output_schema=None stops FastMCP deriving an output schema from
         # the return annotation and re-wrapping the result's text as
         # {"result": ...}; see _json_result for why that wrap
@@ -619,7 +625,7 @@ def register_meta_tools(
         )
 
     @mcp.tool(
-        annotations=ToolAnnotations(readOnlyHint=False, openWorldHint=True),
+        annotations=ToolAnnotations(read_only_hint=False, open_world_hint=True),
         # output_schema=None disables FastMCP's auto-derivation of an
         # output schema from the ``-> ToolResult`` return annotation.
         # Without this, FastMCP wraps the returned ToolResult's content
@@ -958,7 +964,7 @@ def register_meta_tools(
                 structured_content=upstream_structured,
             )
 
-    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, openWorldHint=False))
+    @mcp.tool(annotations=ToolAnnotations(read_only_hint=False, open_world_hint=False))
     async def refresh_registry() -> str:
         """Ask every server behind the gateway for its current tool list.
 
@@ -1003,7 +1009,7 @@ def register_meta_tools(
     # ------------------------------------------------------------------
     if code_mode_runner is not None:
 
-        @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, openWorldHint=True))
+        @mcp.tool(annotations=ToolAnnotations(read_only_hint=False, open_world_hint=True))
         async def execute_code(
             code: Annotated[
                 str,

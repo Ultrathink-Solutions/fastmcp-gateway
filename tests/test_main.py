@@ -177,3 +177,26 @@ def test_registration_identity_env_validates_uuid_and_unknown_domains() -> None:
         pytest.raises(SystemExit),
     ):
         _load_registration_identities({"svc_a": "http://svc_a/mcp"})
+
+
+class TestUpstreamClientModeEnv:
+    def test_defaults_to_the_handshake(self) -> None:
+        from fastmcp_gateway.__main__ import _load_upstream_client_mode
+
+        with patch.dict("os.environ", {}, clear=False) as env:
+            env.pop("GATEWAY_UPSTREAM_CLIENT_MODE", None)
+            assert _load_upstream_client_mode() == "legacy"
+
+    @pytest.mark.parametrize("mode", ["legacy", "auto", "2026-07-28"])
+    def test_accepts_a_supported_mode(self, mode: str) -> None:
+        from fastmcp_gateway.__main__ import _load_upstream_client_mode
+
+        with patch.dict("os.environ", {"GATEWAY_UPSTREAM_CLIENT_MODE": mode}):
+            assert _load_upstream_client_mode() == mode
+
+    @pytest.mark.parametrize("mode", ["modern", "2025-11-25", "AUTO"])
+    def test_an_unsupported_mode_exits(self, mode: str) -> None:
+        from fastmcp_gateway.__main__ import _load_upstream_client_mode
+
+        with patch.dict("os.environ", {"GATEWAY_UPSTREAM_CLIENT_MODE": mode}), pytest.raises(SystemExit):
+            _load_upstream_client_mode()

@@ -29,12 +29,12 @@ def mcp_server(populated_registry: ToolRegistry) -> FastMCP:
 
 
 async def _get_annotations(mcp: FastMCP, tool_name: str) -> dict[str, Any]:
-    """Fetch tool annotations via list_tools."""
+    """Fetch tool annotations via list_tools, under their MCP wire (camelCase) names."""
     async with Client(mcp) as client:
         tools = await client.list_tools()
     tool = next(t for t in tools if t.name == tool_name)
     assert tool.annotations is not None, f"{tool_name} has no annotations"
-    return tool.annotations.model_dump(exclude_none=True)
+    return tool.annotations.model_dump(by_alias=True, mode="json", exclude_none=True)
 
 
 class TestAnnotations:

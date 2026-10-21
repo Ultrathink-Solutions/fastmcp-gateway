@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
-import httpx
+import httpx2
 
 from fastmcp_gateway.errors import (
     MAX_UPSTREAM_MESSAGE_CHARS,
@@ -135,7 +135,7 @@ class TestParseWwwAuthenticate:
 
     def test_only_the_bearer_challenge_is_read(self) -> None:
         """Repeated ``WWW-Authenticate`` headers reach the caller joined into one value."""
-        response = httpx.Response(
+        response = httpx2.Response(
             403,
             headers=[
                 ("WWW-Authenticate", 'Basic realm="legacy", error="ignored"'),
@@ -184,7 +184,7 @@ class TestFindUpstreamResponse:
 
     def test_implicit_context_is_not_followed(self) -> None:
         """A failure raised while handling an earlier refusal is its own failure."""
-        later = httpx.ConnectError("connection refused")
+        later = httpx2.ConnectError("connection refused")
         later.__context__ = upstream_status_error(401)
 
         assert _find_upstream_response(later) is None
@@ -223,7 +223,7 @@ class TestFindJsonRpcError:
         assert _find_jsonrpc_error(outer) == (-32603, "outer")
 
     def test_implicit_context_is_not_followed(self) -> None:
-        later = httpx.ConnectError("connection refused")
+        later = httpx2.ConnectError("connection refused")
         later.__context__ = upstream_jsonrpc_error(-32602, "earlier")
 
         assert _find_jsonrpc_error(later) is None

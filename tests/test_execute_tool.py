@@ -6,9 +6,9 @@ import json
 from collections.abc import Mapping
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
-import httpx
+import httpx2
 import pytest
 from fastmcp import Client, FastMCP
 
@@ -110,7 +110,8 @@ class TestExecuteToolSuccess:
         manager.execute_tool.assert_called_once_with(
             "apollo_people_search",
             {"query": "Jane"},
-            request_meta={"progressToken": 1},
+            # The in-process client asks for progress on its own request id.
+            request_meta={"progressToken": ANY},
         )
 
     @pytest.mark.asyncio
@@ -123,7 +124,8 @@ class TestExecuteToolSuccess:
         manager.execute_tool.assert_called_once_with(
             "hubspot_contacts_search",
             None,
-            request_meta={"progressToken": 1},
+            # The in-process client asks for progress on its own request id.
+            request_meta={"progressToken": ANY},
         )
 
 
@@ -277,7 +279,7 @@ class TestExecuteToolUpstreamRefusal:
 
     @pytest.mark.parametrize(
         "error",
-        [httpx.ConnectError("connection refused"), upstream_status_error(500)],
+        [httpx2.ConnectError("connection refused"), upstream_status_error(500)],
         ids=["connect-error", "http-500"],
     )
     @pytest.mark.asyncio
@@ -725,7 +727,8 @@ class TestExecuteToolArgumentValidation:
         manager.execute_tool.assert_called_once_with(
             "legacy_passthrough",
             {"anything": "goes"},
-            request_meta={"progressToken": 1},
+            # The in-process client asks for progress on its own request id.
+            request_meta={"progressToken": ANY},
         )
 
 
@@ -830,7 +833,7 @@ class TestExecuteCodeRequestMetadata:
                 meta=request_meta,
             )
 
-        assert result.isError is False
+        assert result.is_error is False
         code_mode_runner.run.assert_awaited_once_with(
             "40 + 2",
             headers={},
@@ -861,7 +864,7 @@ class TestExecuteCodeRequestMetadata:
                 meta=None,
             )
 
-        assert result.isError is False
+        assert result.is_error is False
         code_mode_runner.run.assert_awaited_once_with(
             "40 + 2",
             headers={},

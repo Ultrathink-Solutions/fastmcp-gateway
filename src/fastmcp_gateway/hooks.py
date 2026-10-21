@@ -129,8 +129,8 @@ class Hook(Protocol):
         Called after the upstream returns a :class:`CallToolResult` and
         before the gateway flattens its content blocks into the legacy
         string envelope.  Return a (possibly transformed) ``CallToolResult``
-        -- hooks may rewrite ``content``, replace ``structuredContent``,
-        or change ``isError`` to re-shape the output before downstream
+        -- hooks may rewrite ``content``, replace ``structured_content``,
+        or change ``is_error`` to re-shape the output before downstream
         serialization.  Each hook receives the previous hook's output.
         May raise :class:`ExecutionDenied` (e.g. an output guard that
         inspects the upstream payload and rejects it) -- the meta-tool
@@ -139,7 +139,7 @@ class Hook(Protocol):
         Called after each tool execution, on the already-flattened result
         string.  Return a (possibly transformed) result string.  Each hook
         receives the previous hook's output.  Prefer ``transform_result``
-        for structured envelope rewrites where preserving ``structuredContent``
+        for structured envelope rewrites where preserving ``structured_content``
         matters.
     after_list_tools(tools, context)
         Called after ``discover_tools`` / ``get_tool_schema`` build their
@@ -205,8 +205,8 @@ class HookRunner:
 
         Fires after the upstream returns and before the gateway flattens
         content blocks into the legacy string envelope, so hooks may
-        rewrite ``content``, replace ``structuredContent``, or change
-        ``isError`` while the structured payload is still intact.
+        rewrite ``content``, replace ``structured_content``, or change
+        ``is_error`` while the structured payload is still intact.
         """
         current = result
         for hook in self._hooks:

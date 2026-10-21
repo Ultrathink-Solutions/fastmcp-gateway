@@ -1,13 +1,19 @@
 """Upstream client management with dual connection strategy.
 
 Persistent clients are used for registry population (list_tools at
-startup/refresh).  Fresh-per-request clients are used for execute_tool
-so that each call inherits the current user's HTTP headers via
-FastMCP's ``get_http_headers()`` ContextVar.
+startup/refresh).  Fresh-per-request clients are used for execute_tool,
+each with its own transport, so per-call headers and observations never
+leak from one call into another.
 
 Optionally, per-domain headers can be configured via *upstream_headers*
-to override the ContextVar passthrough for specific domains (e.g. when
-an upstream requires a different auth token).
+for specific domains (e.g. when an upstream requires a different auth
+token).
+
+Every upstream connection negotiates its protocol era with the client
+mode the manager was built with (see :data:`UPSTREAM_CLIENT_MODES`). The
+default, ``"legacy"``, is the ``initialize`` handshake, which every MCP
+server serves: handshake-era servers, and dual-era servers such as
+FastMCP 4.
 """
 
 from __future__ import annotations
@@ -19,17 +25,19 @@ import re
 import weakref
 from collections import defaultdict
 from contextlib import asynccontextmanager
-from copy import copy, deepcopy
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 from uuid import uuid4
 
 from fastmcp import Client
 from fastmcp.server.dependencies import get_http_headers
-from mcp.shared.exceptions import McpError
+from mcp import MCPError
+from mcp.types.version import MODERN_PROTOCOL_VERSIONS
 from opentelemetry import trace
 from pydantic import BaseModel, ConfigDict
 
+from fastmcp_gateway._upstream_session import ObservedTransport, UpstreamExchange, observable
 from fastmcp_gateway.errors import RegistrationSelectionError, UpstreamJsonRpcError
 from fastmcp_gateway.registration import (
     RegistrationChange,
@@ -45,13 +53,34 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 
     from fastmcp.client.client import CallToolResult
-    from mcp.types import ErrorData, RequestId
 
     from fastmcp_gateway.access_policy import AccessPolicy
     from fastmcp_gateway.registry import PreparedDomain, RegistryDiff, ToolRegistry
 
 logger = logging.getLogger(__name__)
 _tracer = trace.get_tracer("fastmcp_gateway.client_manager")
+
+#: The connect modes an upstream ``Client`` may use, besides pinning a
+#: 2026-07-28-era protocol version string:
+#:
+#: * ``"legacy"`` (the default): the ``initialize`` handshake, exactly what
+#:   earlier releases sent. Handshake-era servers (such as FastMCP 3) serve
+#:   it, and so do dual-era servers (such as FastMCP 4).
+#: * ``"auto"``: probe ``server/discover`` and adopt the 2026-07-28 era when
+#:   the upstream offers it, else fall back to the handshake. The fallback
+#:   works against handshake-era servers but costs one extra request on
+#:   every connection to one, and the gateway opens one per tool call.
+#: * a 2026-07-28-era version string such as ``"2026-07-28"``: adopt that
+#:   version without probing, which fails against a handshake-era server.
+DEFAULT_UPSTREAM_CLIENT_MODE = "legacy"
+UPSTREAM_CLIENT_MODES: tuple[str, ...] = ("legacy", "auto", *MODERN_PROTOCOL_VERSIONS)
+
+
+def validate_upstream_client_mode(mode: object) -> str:
+    """Return *mode* when it is a supported upstream connect mode, else raise ``ValueError``."""
+    if not isinstance(mode, str) or mode not in UPSTREAM_CLIENT_MODES:
+        raise ValueError(f"upstream client mode must be one of {list(UPSTREAM_CLIENT_MODES)}; got {mode!r}")
+    return mode
 
 
 def get_user_headers(*, include_all: bool = False) -> dict[str, str]:
@@ -73,59 +102,6 @@ def get_user_headers(*, include_all: bool = False) -> dict[str, str]:
     return get_http_headers(include_all=include_all)
 
 
-async def _call_tool_without_metadata_injection(
-    client: Client,
-    name: str,
-    arguments: dict[str, Any],
-    request_meta: Mapping[str, Any] | None,
-) -> CallToolResult:
-    """Call through the MCP session without FastMCP trace metadata injection.
-
-    FastMCP 3.4.x has no public equivalents for its session monitor or raw
-    protocol-result adapter. Keep both private API dependencies isolated here.
-    """
-
-    dispatch_meta = None if request_meta is None else deepcopy(dict(request_meta))
-    raw_result = await client._await_with_session_monitoring(
-        client.session.call_tool(
-            name,
-            arguments,
-            meta=dispatch_meta,
-        )
-    )
-    return await client._parse_call_tool_result(
-        name,
-        raw_result,
-        raise_on_error=False,
-    )
-
-
-class _ArrivedErrors:
-    """Records the JSON-RPC error responses that arrive on one MCP session.
-
-    Registered as the session's response router, it sees every error response
-    read from the transport before it is delivered to the waiting request, and
-    nothing the client builds itself (the ``"Connection closed"`` it hands each
-    pending request when the session drops, a read timeout). It never claims a
-    response, so delivery is unchanged. The SDK raises the ``McpError`` for a
-    received error with the same ``ErrorData`` object, so an identity match is
-    how ``execute_tool`` knows the error is the upstream's answer.
-    """
-
-    def __init__(self) -> None:
-        self._errors: list[ErrorData] = []
-
-    def route_response(self, request_id: RequestId, response: dict[str, Any]) -> bool:
-        return False
-
-    def route_error(self, request_id: RequestId, error: ErrorData) -> bool:
-        self._errors.append(error)
-        return False
-
-    def arrived(self, error: ErrorData) -> bool:
-        return any(error is seen for seen in self._errors)
-
-
 def _set_transport_headers(client: Client, headers: dict[str, str]) -> None:
     """Merge explicit headers into an HTTP-based client transport.
 
@@ -133,6 +109,8 @@ def _set_transport_headers(client: Client, headers: dict[str, str]) -> None:
     the provided *headers* on top.  FastMCP transports created from URLs
     (SSE / Streamable-HTTP) have a ``headers`` attribute.  In-process
     and stdio transports do not — this function is a no-op for those.
+    The merged mapping is a new dict, so a transport copied from another
+    never changes the original's headers.
     """
     transport: Any = client.transport
     if not hasattr(transport, "headers"):
@@ -140,6 +118,24 @@ def _set_transport_headers(client: Client, headers: dict[str, str]) -> None:
         return
     existing = dict(transport.headers) if transport.headers else {}
     transport.headers = {**existing, **headers}
+
+
+def _observe(client: Client) -> Client:
+    """Wrap *client*'s transport so each connection records an :class:`UpstreamExchange`.
+
+    Streamable HTTP, SSE and in-process transports are wrapped; see
+    :func:`~fastmcp_gateway._upstream_session.observable` for why others are not.
+    """
+    transport: Any = client.transport
+    if observable(transport):
+        client.transport = ObservedTransport(transport)
+    return client
+
+
+def _exchange(client: Client) -> UpstreamExchange | None:
+    """The record of *client*'s latest connection, when its transport is observed."""
+    transport: Any = client.transport
+    return transport.exchange if isinstance(transport, ObservedTransport) else None
 
 
 async def _settle_task(task: asyncio.Task[Any]) -> Any:
@@ -230,8 +226,8 @@ class UpstreamManager:
         whose name matches is flagged
         :attr:`ToolEntry.raw_output_trusted` so the output guard (if
         enabled) bypasses it on each invocation. Complementary to the
-        upstream-declared ``annotations: {"x-raw-output-trusted":
-        true}`` custom extension.
+        upstream-declared ``x-raw-output-trusted: true`` custom key in a
+        tool's ``annotations`` or ``_meta``.
     max_schema_depth:
         Forwarded to :meth:`ToolRegistry.populate_domain` as its
         ``max_schema_depth`` on every populate/refresh/add_upstream
@@ -244,6 +240,14 @@ class UpstreamManager:
         a caller that constructs ``UpstreamManager`` directly --
         bypassing ``GatewayServer`` -- gets the same fail-fast
         guarantee.
+    client_mode:
+        How each upstream connection negotiates its protocol era: one of
+        :data:`UPSTREAM_CLIENT_MODES`. Defaults to ``"legacy"``, the
+        ``initialize`` handshake, which handshake-era and dual-era servers
+        both serve. ``"auto"``
+        probes for the 2026-07-28 era first and falls back to the
+        handshake; see :data:`DEFAULT_UPSTREAM_CLIENT_MODE` for the cost.
+        Validated at construction.
     """
 
     def __init__(
@@ -260,6 +264,7 @@ class UpstreamManager:
         discovery_urls: dict[str, str] | None = None,
         max_schema_depth: int = DEFAULT_MAX_SCHEMA_DEPTH,
         registration_identities: Mapping[str, RegistrationIdentity] | None = None,
+        client_mode: str = DEFAULT_UPSTREAM_CLIENT_MODE,
     ) -> None:
         # Fail fast here rather than deferring to the first populate()
         # call -- a caller that constructs UpstreamManager directly
@@ -267,6 +272,7 @@ class UpstreamManager:
         # get the same immediate failure. The upper bound guards against
         # a stack-overflow-prone recursion depth, not just a typo.
         _validate_max_schema_depth(max_schema_depth)
+        self._client_mode = validate_upstream_client_mode(client_mode)
         unknown = set(registration_identities or {}) - set(upstreams)
         if unknown:
             raise ValueError("Registration identities contain unknown upstreams")
@@ -312,21 +318,29 @@ class UpstreamManager:
         # pre-discovery-url-split behaviour exactly.
         #
         # registry_auth_headers are applied to the registry client only.
-        # The execution base client must stay header-free: `Client.new()`
-        # preserves transport headers, so any header set here would bleed
-        # into every per-request clone made by `_make_execution_client`
-        # and leak service credentials onto user-driven `execute_tool`
-        # calls.
+        # The execution base client must stay header-free: each per-request
+        # clone made by `_make_execution_client` starts from a copy of its
+        # transport, so any header set here would reach every clone and
+        # leak service credentials onto user-driven `execute_tool` calls.
         self._registry_clients: dict[str, Client] = {}
         self._execution_clients: dict[str, Client] = {}
         for domain, url in self._upstreams.items():
             disc_url = self._discovery_urls.get(domain) or url
-            reg_client = Client(disc_url)
+            reg_client = self._new_client(disc_url)
             if registry_auth_headers:
                 _set_transport_headers(reg_client, registry_auth_headers)
             self._registry_clients[domain] = reg_client
 
-            self._execution_clients[domain] = Client(url)
+            self._execution_clients[domain] = self._new_client(url)
+
+    @property
+    def client_mode(self) -> str:
+        """How each upstream connection negotiates its protocol era (see :data:`UPSTREAM_CLIENT_MODES`)."""
+        return self._client_mode
+
+    def _new_client(self, target: Any) -> Client:
+        """A ``Client`` for *target* in this manager's connect mode, with an observed transport."""
+        return _observe(Client(target, mode=self._client_mode))
 
     # ------------------------------------------------------------------
     # Registry population
@@ -410,27 +424,41 @@ class UpstreamManager:
                     token = await result if inspect.isawaitable(result) else result
                     _set_transport_headers(client, {"Authorization": f"Bearer {token}"})
 
-                async with client:
-                    mcp_tools = await client.list_tools()
+                try:
+                    async with client:
+                        mcp_tools = await client.list_tools()
+                except MCPError as exc:
+                    failed = _exchange(client)
+                    auth_failure = failed.auth_failure() if failed is not None else None
+                    if auth_failure is not None:
+                        raise auth_failure from exc
+                    raise
+                # The tools exactly as the upstream listed them, keyed by name.
+                exchange = _exchange(client)
+                listed = exchange.listed_tools() if exchange is not None else {}
 
             raw_tools: list[dict[str, Any]] = []
             for t in mcp_tools:
                 entry: dict[str, Any] = {
                     "name": t.name,
                     "description": t.description or "",
-                    "inputSchema": t.inputSchema,
+                    "inputSchema": t.input_schema,
                 }
-                # MCP tool ``annotations`` (optional) carries custom
-                # extensions like ``x-raw-output-trusted``. Prefer
-                # the attribute — the MCP Python SDK exposes annotations
-                # as a Pydantic model whose ``model_dump`` we want,
-                # but we fall back to whatever shape the SDK hands us
-                # so a newer SDK version that returns a plain dict
-                # still works.
+                # MCP tool ``annotations`` (optional) can carry custom
+                # extension keys like ``x-raw-output-trusted``, which the
+                # MCP SDK v2's ``ToolAnnotations`` model drops on parse.
+                # Take them from the listing as the upstream sent it, in
+                # wire (camelCase) form; fall back to the parsed model,
+                # dumped under its wire names, when no listing was
+                # observed.
+                sent = listed.get(t.name)
+                sent_annotations = sent.get("annotations") if sent is not None else None
                 annotations = getattr(t, "annotations", None)
-                if annotations is not None:
+                if isinstance(sent_annotations, dict):
+                    entry["annotations"] = dict(sent_annotations)
+                elif annotations is not None:
                     if hasattr(annotations, "model_dump"):
-                        entry["annotations"] = annotations.model_dump(exclude_none=True)
+                        entry["annotations"] = annotations.model_dump(by_alias=True, mode="json", exclude_none=True)
                     elif isinstance(annotations, dict):
                         entry["annotations"] = annotations
                 meta = getattr(t, "meta", None)
@@ -746,10 +774,14 @@ class UpstreamManager:
     ) -> CallToolResult:
         """Execute a tool on its upstream server.
 
-        Creates a **fresh** ``Client`` for each call.  For domains with
-        explicit *upstream_headers*, those headers are applied directly.
-        For all other domains, FastMCP's ``get_http_headers()`` ContextVar
-        resolves the *current* user's HTTP headers (request passthrough).
+        Creates a **fresh** ``Client``, with its own transport, for each
+        call.  For domains with explicit *upstream_headers*, those headers
+        are applied directly.
+
+        When the connection negotiates the 2026-07-28 era (a non-default
+        *client_mode*), the client lists the upstream's tools before the
+        call, so it can send the ``Mcp-Param-*`` headers that era requires
+        for arguments a tool's schema marks with ``x-mcp-header``.
 
         Parameters
         ----------
@@ -761,12 +793,16 @@ class UpstreamManager:
             Additional headers from hooks, merged with highest priority.
         request_meta:
             Exact inbound MCP request metadata to forward. ``None`` stays absent.
+            Nothing the client stack adds (trace context, a progress token)
+            reaches the upstream; on a 2026-07-28 connection the
+            protocol-reserved keys the session stamps are added.
 
         Raises ``KeyError`` if *tool_name* is not in the registry, and
-        :class:`~fastmcp_gateway.errors.UpstreamJsonRpcError` (an ``McpError``)
+        :class:`~fastmcp_gateway.errors.UpstreamJsonRpcError` (an ``MCPError``)
         when the upstream answers the call with a JSON-RPC error response. An
-        ``McpError`` the MCP client raises by itself, because no answer arrived,
-        propagates unchanged.
+        ``MCPError`` the MCP client raises by itself, because no answer arrived,
+        propagates unchanged. An HTTP error status the upstream answers
+        without a JSON-RPC body propagates as ``httpx2.HTTPStatusError``.
         """
         with _tracer.start_as_current_span("gateway.upstream.execute") as span:
             span.set_attribute("gateway.tool_name", tool_name)
@@ -781,7 +817,10 @@ class UpstreamManager:
             async with self.pin_registration(resolved_tool):
                 entry = self._issued[id(resolved_tool)][1].entry
                 span.set_attribute("gateway.domain", entry.domain)
-                fresh_client = self._make_execution_client(entry.domain, extra_headers=extra_headers)
+                dispatch_meta = None if request_meta is None else deepcopy(dict(request_meta))
+                fresh_client = self._make_execution_client(
+                    entry.domain, extra_headers=extra_headers, request_meta=dispatch_meta
+                )
 
                 # Use the original (upstream) tool name when dispatching.
                 # Collision-prefixed names (e.g., "snowflake_get_server_info")
@@ -789,26 +828,31 @@ class UpstreamManager:
                 # knows the original name ("get_server_info").
                 upstream_name = entry.original_name or entry.name
 
-                async with fresh_client:
-                    arrived = _ArrivedErrors()
-                    fresh_client.session.add_response_router(arrived)
-                    try:
-                        return await _call_tool_without_metadata_injection(
-                            fresh_client,
+                try:
+                    async with fresh_client:
+                        if fresh_client.protocol_version in MODERN_PROTOCOL_VERSIONS:
+                            await fresh_client.list_tools()
+                        return await fresh_client.call_tool(
                             upstream_name,
                             arguments or {},
-                            request_meta,
+                            raise_on_error=False,
+                            meta=dispatch_meta,
                         )
-                    except McpError as exc:
-                        if arrived.arrived(exc.error):
-                            raise UpstreamJsonRpcError(exc.error) from exc
-                        raise
+                except MCPError as exc:
+                    exchange = _exchange(fresh_client)
+                    if exchange is not None and exchange.answered(exc):
+                        raise UpstreamJsonRpcError.from_error_data(exc.error) from exc
+                    auth_failure = exchange.auth_failure() if exchange is not None else None
+                    if auth_failure is not None:
+                        raise auth_failure from exc
+                    raise
 
     def _make_execution_client(
         self,
         domain: str,
         *,
         extra_headers: dict[str, str] | None = None,
+        request_meta: Mapping[str, Any] | None = None,
     ) -> Client:
         """Create a fresh client for tool execution via ``client.new()``.
 
@@ -817,22 +861,24 @@ class UpstreamManager:
         and gives the copy its own copy of the transport: ``Client.new()``
         shares the transport with the base client, so headers merged onto
         it would otherwise reach every later and concurrent call to the
-        same upstream.  If *domain* has explicit upstream headers, those are
-        merged onto the new client's transport.  Otherwise the client
-        inherits request-passthrough behaviour via the ContextVar.
+        same upstream. Each ``tools/call`` on the copy carries exactly
+        *request_meta* (``None`` keeps it absent). If *domain* has explicit
+        upstream headers, those are merged onto the new client's transport.
 
         Header merge priority (highest wins):
         1. *extra_headers* from hooks (e.g. ``X-User-Subject``)
         2. Static ``upstream_headers[domain]`` (e.g. per-domain API keys)
-        3. Request passthrough via ContextVar (incoming request headers)
         """
         # Clone the execution-side client (not the registry one); the
         # registry client may target a separate discovery URL (e.g.
         # `/_introspect`) that does not accept `tools/call`.
         client = self._execution_clients[domain].new()
         # The call's headers (and the per-connection state a transport
-        # records) belong to this call alone.
-        client.transport = copy(client.transport)
+        # records) belong to this call alone. Every transport that carries
+        # headers is observed; stdio carries none and keeps its one session.
+        transport: Any = client.transport
+        if isinstance(transport, ObservedTransport):
+            client.transport = transport.fork(call_meta=request_meta)
         merged: dict[str, str] = {}
         if domain in self._upstream_headers:
             merged.update(self._upstream_headers[domain])
@@ -875,8 +921,8 @@ class UpstreamManager:
                 ):
                     raise ValueError("Cannot restore the same identity over a live registration")
             effective_auth = registry_auth_headers if registry_auth_headers is not None else self._registry_auth_headers
-            reg_client = Client(discovery_url or url)
-            exec_client = Client(url)
+            reg_client = self._new_client(discovery_url or url)
+            exec_client = self._new_client(url)
             if effective_auth:
                 _set_transport_headers(reg_client, dict(effective_auth))
             published = False

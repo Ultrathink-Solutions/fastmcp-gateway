@@ -28,6 +28,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 _tracer = trace.get_tracer("fastmcp_gateway.registry")
 
+#: Custom key an upstream sets to ``True`` (in a tool's ``annotations`` or
+#: ``_meta``) to exempt the tool's results from the output guard.
+_RAW_OUTPUT_TRUSTED_KEY = "x-raw-output-trusted"
+
 
 def compute_schema_digest(tools: list[ToolEntry]) -> str:
     """Compute a SHA-256 digest over the canonical form of a tool set.
@@ -132,10 +136,10 @@ class ToolEntry(BaseModel):
     # Opt-in flag for tools that legitimately return prompt-like content
     # (e.g., a prompt-rewriting or instruction-generation service). When
     # ``True``, the gateway-level output guard skips scrubbing this tool's
-    # result text. Upstreams declare this via an ``annotations`` custom
-    # extension key ``x-raw-output-trusted: true`` at list_tools time;
-    # operators may additionally override per-tool via
-    # ``GatewayServer(trusted_output_tools={...})``.
+    # result text. Upstreams declare this with the custom key
+    # ``x-raw-output-trusted: true`` in the tool's ``annotations`` or its
+    # ``_meta`` at list_tools time; operators may additionally override
+    # per-tool via ``GatewayServer(trusted_output_tools={...})``.
     raw_output_trusted: bool = False
     # ULT-6012 (axon MCP scope-architecture pivot, spec P2): the tool's
     # DECLARED GRANULAR scope, as exported by the upstream chassis in the
@@ -527,9 +531,9 @@ class ToolRegistry:
         ``fnmatch`` patterns has :attr:`ToolEntry.raw_output_trusted`
         flipped to ``True``, so the gateway-level output guard will skip
         scrubbing its result text. This is an operator override
-        complementary to the upstream-declared ``annotations:
-        {"x-raw-output-trusted": true}`` custom extension read from each
-        tool dict during population; whichever source signals trust
+        complementary to the upstream-declared ``x-raw-output-trusted:
+        true`` custom key, read from each tool dict's ``annotations`` or
+        ``_meta`` during population; whichever source signals trust
         wins. Trust is not transitive: the scrubbing bypass applies
         only to output sanitation, never to description sanitation or
         schema validation.
@@ -567,10 +571,10 @@ class ToolRegistry:
             # (collision renames inside the gateway registry don't alter
             # the digest — the digest fingerprints the upstream contract,
             # not the gateway-side display name).
-            # The 4th tuple element carries the raw upstream ``annotations``
-            # dict (or an empty dict when absent or malformed) so the
-            # second loop below can read the ``x-raw-output-trusted``
-            # custom extension without re-indexing ``tools``.  Keeping
+            # The 4th tuple element records whether the upstream declared
+            # the ``x-raw-output-trusted`` custom key (in ``annotations`` or
+            # ``_meta``) so the second loop below can read it without
+            # re-indexing ``tools``.  Keeping
             # annotations out of the digest call preserves PR #52's
             # digest contract: the fingerprint tracks (name, description,
             # inputSchema) only — the same three fields
@@ -585,7 +589,7 @@ class ToolRegistry:
             # ``tools``. Also kept out of the digest for the same reason as
             # ``annotations`` above — the digest fingerprints the upstream
             # (name, description, inputSchema) contract only.
-            accepted: list[tuple[str, str, dict[str, Any], dict[str, Any], str | None]] = []
+            accepted: list[tuple[str, str, dict[str, Any], bool, str | None]] = []
             schema_rejected_count = 0
             counts = Counter(raw.get("name", "") for raw in tools)
             for raw in tools:
@@ -628,7 +632,15 @@ class ToolRegistry:
                 required_scope = (
                     required_scope_raw if isinstance(required_scope_raw, str) and required_scope_raw else None
                 )
-                accepted.append((raw_name, raw_description, clean_schema, annotations, required_scope))
+                # An upstream declares raw-output trust with a custom key, in
+                # ``annotations`` or in ``_meta``. MCP SDK v2 servers drop
+                # annotation keys the spec does not define, so ``_meta``
+                # (where the spec puts custom data) is where such a server
+                # can still declare it. Only the literal ``True`` counts.
+                upstream_trusted = (
+                    annotations.get(_RAW_OUTPUT_TRUSTED_KEY) is True or meta.get(_RAW_OUTPUT_TRUSTED_KEY) is True
+                )
+                accepted.append((raw_name, raw_description, clean_schema, upstream_trusted, required_scope))
             candidate_digest = _digest_from_triples([(n, d, s) for n, d, s, _, _ in accepted])
 
             prior_digest = self._domain_digests.get(domain)
@@ -691,7 +703,7 @@ class ToolRegistry:
             prefix = f"{domain}_"
             domain_is_trusted = trusted_domains is not None and domain in trusted_domains
             output_patterns = trusted_output_tool_patterns or []
-            for name, raw_description, clean_schema, annotations, required_scope in accepted:
+            for name, raw_description, clean_schema, upstream_trusted, required_scope in accepted:
                 # Collision renaming (see register_tool) may rewrite this tool's
                 # registered name to ``{domain}_{name}``.  Evaluate policy
                 # against both forms so rules written in either shape apply to
@@ -714,15 +726,14 @@ class ToolRegistry:
 
                 # Determine raw_output_trusted from two independent
                 # sources — whichever signals trust wins:
-                #   1. Upstream-declared ``annotations`` custom
-                #      extension ``x-raw-output-trusted: true``.
-                #      ``annotations`` is already normalized to a dict
-                #      in the first-pass validator loop above, so a
-                #      non-dict upstream value has been collapsed to
-                #      ``{}`` and ``.get()`` returns ``None`` — the
-                #      identity comparison with ``True`` ensures a
-                #      non-bool truthy value (e.g., ``"yes"``) does
-                #      not accidentally grant trust.
+                #   1. The upstream-declared custom key
+                #      ``x-raw-output-trusted: true``, read in the
+                #      first-pass validator loop above from
+                #      ``annotations`` or ``_meta`` (each normalized to a
+                #      dict there, so a malformed value cannot crash
+                #      registration). The identity comparison with
+                #      ``True`` ensures a non-bool truthy value (e.g.,
+                #      ``"yes"``) does not accidentally grant trust.
                 #   2. Operator-supplied glob patterns applied here so
                 #      a deployment can opt specific tools out of
                 #      output scrubbing without coordinating with the
@@ -734,7 +745,7 @@ class ToolRegistry:
                 #      ``trusted_output_tools={"crm_*"}`` without
                 #      caring whether a given upstream happens to
                 #      self-prefix its tool names.
-                raw_output_trusted = annotations.get("x-raw-output-trusted") is True
+                raw_output_trusted = upstream_trusted
                 if not raw_output_trusted and output_patterns:
                     prefixed_name = name if name.startswith(prefix) else prefix + name
                     for pattern in output_patterns:

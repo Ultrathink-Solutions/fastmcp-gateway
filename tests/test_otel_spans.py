@@ -11,7 +11,7 @@ if TYPE_CHECKING:
 
     from fastmcp_gateway.hooks import ExecutionContext
 
-import httpx
+import httpx2
 import pytest
 from fastmcp import Client, FastMCP
 from opentelemetry.sdk.trace import TracerProvider
@@ -175,7 +175,7 @@ class TestGetToolSchemaSpans:
 
 
 class _ResponseCarryingError(Exception):
-    """A non-httpx exception exposing an HTTP-shaped ``response``."""
+    """A non-httpx2 exception exposing an HTTP-shaped ``response``."""
 
     def __init__(self, response: object) -> None:
         super().__init__("upstream refused the call")
@@ -398,10 +398,10 @@ class TestRegistrySpans:
 # ---------------------------------------------------------------------------
 
 
-def _health_transport(gateway: GatewayServer) -> httpx.ASGITransport:
+def _health_transport(gateway: GatewayServer) -> httpx2.ASGITransport:
     """Build an ASGI transport for a gateway's health routes."""
     app = gateway.mcp.http_app(transport="streamable-http")
-    return httpx.ASGITransport(app=app)
+    return httpx2.ASGITransport(app=app)
 
 
 class TestHealthRouteSpans:
@@ -417,7 +417,7 @@ class TestHealthRouteSpans:
             gateway = GatewayServer({})
 
         transport = _health_transport(gateway)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        async with httpx2.AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.get("/healthz")
 
         assert response.status_code == 200
@@ -432,7 +432,7 @@ class TestHealthRouteSpans:
             gateway = GatewayServer({})
 
         transport = _health_transport(gateway)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        async with httpx2.AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.get("/readyz")
 
         assert response.status_code == 200
@@ -448,7 +448,7 @@ class TestHealthRouteSpans:
             gateway = GatewayServer({}, trace_health_routes=False)
 
         transport = _health_transport(gateway)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        async with httpx2.AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.get("/healthz")
 
         assert response.status_code == 200
@@ -461,7 +461,7 @@ class TestHealthRouteSpans:
             gateway = GatewayServer({}, trace_health_routes=False)
 
         transport = _health_transport(gateway)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        async with httpx2.AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.get("/readyz")
 
         assert response.status_code == 200
