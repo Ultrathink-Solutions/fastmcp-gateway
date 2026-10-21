@@ -7,7 +7,7 @@ from copy import deepcopy
 
 import pytest
 from fastmcp import Client, FastMCP
-from httpx import ASGITransport, AsyncClient
+from httpx2 import ASGITransport, AsyncClient
 
 from fastmcp_gateway.client_manager import UpstreamManager
 from fastmcp_gateway.gateway import GatewayServer
@@ -144,7 +144,10 @@ async def test_gateway_listing_and_registration_complete_during_drain(path, monk
     # lifecycle and publication all execute their real implementation.
     target = "https://8.8.8.8/mcp"
     svc_b = upstream()
-    monkeypatch.setattr("fastmcp_gateway.client_manager.Client", lambda url: Client(svc_b if url == target else url))
+    monkeypatch.setattr(
+        "fastmcp_gateway.client_manager.Client",
+        lambda url, **kwargs: Client(svc_b if url == target else url, **kwargs),
+    )
     app = gateway.mcp.http_app(transport="streamable-http")
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver", headers=auth) as client:
         call = asyncio.create_task(manager.execute_tool("widgets_create"))

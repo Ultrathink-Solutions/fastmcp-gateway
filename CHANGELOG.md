@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.35.0] - 2026-10-21
+
+### Changed
+
+- **Runs on FastMCP 4 and the MCP Python SDK v2.** The dependency floors are now `fastmcp>=4.1,<5`, `mcp>=2.2,<3`, `httpx2>=2.5` (the SDK's replacement for `httpx`), `pydantic>=2.12` and `starlette>=1.0.1`; Python 3.11 stays the floor. The JSON the gateway puts on the wire keeps MCP's camelCase names (`inputSchema`, `structuredContent`, `isError`, `readOnlyHint`). Upstream HTTPS connections now verify certificates against the operating system's trust store (`SSL_CERT_FILE` and `SSL_CERT_DIR` still apply) rather than the `certifi` bundle `httpx` used, so a container image needs its system CA certificates installed.
+
+  **Compatibility (library users):**
+  - Code the gateway runs in its own process (hooks, a `GATEWAY_AUTH_MODULE` provider, ASGI middleware) now runs against FastMCP 4 and the SDK v2; see FastMCP's 3 to 4 upgrade notes. In particular, read SDK objects, such as the content blocks a `transform_result` hook receives, by their snake_case attributes (`mime_type`, not `mimeType`).
+  - `UpstreamJsonRpcError` now subclasses `mcp.MCPError` (formerly `McpError`). Build one with `UpstreamJsonRpcError.from_error_data(error)` or `UpstreamJsonRpcError(code=..., message=..., data=...)`; passing an `ErrorData` positionally raises `TypeError`. Reading `err.error.code` is unchanged.
+  - An `on_error` hook that inspects an upstream HTTP failure receives `httpx2.HTTPStatusError` where it received `httpx.HTTPStatusError`.
+  - An upstream that answers a call with HTTP 404 now yields `execution_error`, like any other HTTP failure. The MCP SDK v1 client reported that 404 as a received JSON-RPC error (`32600` "Session terminated"), so 0.32.0 through 0.34.0 returned `upstream_error` for it. A registration probe answered with 404 still gets a 503, now carrying `upstream_status: 404` in place of `upstream_error_code: 32600`.
+  - `ExecutionContext.request_meta`, and the `_meta` forwarded upstream, leave out the protocol-reserved `io.modelcontextprotocol/` keys a 2026-07-28 client stamps on every request: they describe the caller's connection, not the call. Such a request with no other metadata counts as carrying none (`None`).
+  - An upstream reached over stdio is not observed below the client (see the next entry), because the stdio transport keeps one session alive across connections: its JSON-RPC error answers classify as `execution_error`, and its forwarded `_meta` gains the client's trace context. HTTP, SSE and in-process upstreams are unaffected.
+
+- **Upstream calls keep their contract under the SDK v2 client.** That client reports an HTTP error without a JSON-RPC body as a JSON-RPC error of its own and drops the status; injects W3C trace context into every request's `_meta`; and builds errors of its own when a streamed answer ends early or cannot be parsed. The gateway now observes each upstream connection below the client, so:
+  - an upstream's 401 or 403 still yields `upstream_unauthorized` or `upstream_insufficient_scope` (with the challenge's scope), including the final 401 or 403 an `httpx2.Auth` flow gave up on, and a registration probe refused with 401 or 403 still gets a 422, with 404, 502, 503 or 504 a 503, and with any other status a 500;
+  - only a JSON-RPC error the upstream itself sent in reply to the call yields `upstream_error` or `invalid_arguments`; an error the client built (the session closed, the call timed out, a stream ended before its answer) stays `execution_error`;
+  - the forwarded `_meta` is exactly the caller's: no trace context or progress token is added, a caller-supplied `traceparent` is kept, and absent metadata stays absent on a handshake connection.
+
+### Added
+
+- **The gateway serves MCP clients of both protocol eras.** FastMCP 4 servers answer both the `2025-11-25` `initialize` handshake and the sessionless `2026-07-28` era, and so does the gateway, on every transport, with no configuration. A handshake client gets a session; a `2026-07-28` client (FastMCP 4's default `auto` client negotiates it) does not. Both see the same meta-tools, the same domain-aware instructions (in the `server/discover` result for the newer era) and the same results.
+- **`upstream_client_mode` chooses the protocol era of the gateway's upstream connections** (`GatewayServer(upstream_client_mode=...)`, `UpstreamManager(client_mode=...)`, or `GATEWAY_UPSTREAM_CLIENT_MODE`).
+  - `legacy`, the default, opens every upstream connection with the `initialize` handshake, as earlier releases did. Handshake-era servers (FastMCP 3) and dual-era ones (FastMCP 4) both serve it.
+  - `auto`, FastMCP 4's own client default, probes `server/discover` first and falls back to the handshake when the upstream rejects the probe. That reaches handshake-era servers too, but spends an extra request on every connection to one, and the gateway opens a connection per tool call.
+  - A `2026-07-28` version string adopts that era without probing, and cannot reach a handshake-era upstream.
+
+  Under `auto` or a pinned version, a call that negotiates the `2026-07-28` era first lists the upstream's tools, so the client sends the `Mcp-Param-*` headers that era requires for an argument a tool marks with `x-mcp-header`. Any other value fails at construction, or at startup for the environment variable.
+- **An upstream can declare `x-raw-output-trusted: true` in a tool's `_meta`.** The key is still read from `annotations`, where MCP SDK v1 servers (FastMCP 3) send it; the gateway takes it from the `tools/list` answer as sent, because the SDK v2 `ToolAnnotations` model drops keys the spec does not define. An SDK v2 server cannot send it in `annotations` at all, so `_meta`, where the spec puts custom data, now works as well.
+
+### Fixed
+
+- **The README no longer claims request-header passthrough.** A domain without `upstream_headers` never received the incoming request's headers (FastMCP 3 and 4 clients do not forward them), although the README said it did. Use a hook's `extra_headers` to pass a caller's identity on.
+
 ## [0.34.1] - 2026-10-21
 
 ### Security

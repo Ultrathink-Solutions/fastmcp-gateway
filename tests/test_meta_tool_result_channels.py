@@ -76,7 +76,7 @@ class TestNoWrappedOutputSchema:
         async with Client(mcp_server) as client:
             tools = {t.name: t for t in await client.list_tools()}
 
-        schema = tools[tool_name].outputSchema
+        schema = tools[tool_name].output_schema
         assert schema is None or "x-fastmcp-wrap-result" not in schema, (
             f"{tool_name} advertises a wrap-result output schema; its payload will be double-encoded"
         )

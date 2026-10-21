@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
-import httpx
+import httpx2
 import pytest
 
 from fastmcp_gateway.gateway import GatewayServer
@@ -34,10 +34,10 @@ def populated_gateway() -> GatewayServer:
     return gw
 
 
-def _http_app(mcp: FastMCP) -> httpx.ASGITransport:
+def _http_app(mcp: FastMCP) -> httpx2.ASGITransport:
     """Create an ASGI transport from a FastMCP server for testing."""
     app = mcp.http_app(transport="streamable-http")
-    return httpx.ASGITransport(app=app)
+    return httpx2.ASGITransport(app=app)
 
 
 # ---------------------------------------------------------------------------
@@ -49,7 +49,7 @@ class TestHealthz:
     @pytest.mark.asyncio
     async def test_always_returns_200(self, empty_gateway: GatewayServer) -> None:
         transport = _http_app(empty_gateway.mcp)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        async with httpx2.AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.get("/healthz")
 
         assert response.status_code == 200
@@ -58,7 +58,7 @@ class TestHealthz:
     @pytest.mark.asyncio
     async def test_returns_200_when_populated(self, populated_gateway: GatewayServer) -> None:
         transport = _http_app(populated_gateway.mcp)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        async with httpx2.AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.get("/healthz")
 
         assert response.status_code == 200
@@ -73,7 +73,7 @@ class TestReadyz:
     @pytest.mark.asyncio
     async def test_returns_200_when_empty(self, empty_gateway: GatewayServer) -> None:
         transport = _http_app(empty_gateway.mcp)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        async with httpx2.AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.get("/readyz")
 
         assert response.status_code == 200
@@ -88,7 +88,7 @@ class TestReadyz:
     @pytest.mark.asyncio
     async def test_returns_200_when_populated(self, populated_gateway: GatewayServer) -> None:
         transport = _http_app(populated_gateway.mcp)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        async with httpx2.AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.get("/readyz")
 
         assert response.status_code == 200

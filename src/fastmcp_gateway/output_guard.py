@@ -12,9 +12,9 @@ Per-tool bypass is provided for tools that legitimately return
 prompt-like content (e.g., a prompt-rewriting service). A tool can be
 trusted via either source:
 
-* Upstream-declared ``annotations: {"x-raw-output-trusted": true}``
-  custom extension (recorded on :class:`~fastmcp_gateway.registry.ToolEntry`
-  at registry-populate time).
+* Upstream-declared ``x-raw-output-trusted: true`` custom key, in the
+  tool's ``annotations`` or its ``_meta`` (recorded on
+  :class:`~fastmcp_gateway.registry.ToolEntry` at registry-populate time).
 * Operator override ``GatewayServer(trusted_output_tools=[...])``
   (``fnmatch`` glob patterns applied at populate time).
 

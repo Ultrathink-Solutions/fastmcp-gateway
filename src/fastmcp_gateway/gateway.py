@@ -10,12 +10,17 @@ import warnings
 from contextlib import asynccontextmanager, suppress
 from typing import TYPE_CHECKING, Any
 
-import httpx
+import httpx2
 from fastmcp import FastMCP
+from mcp import MCPError
 from opentelemetry import trace
 
 from fastmcp_gateway.access_policy import AccessPolicy, normalize_upstreams
-from fastmcp_gateway.client_manager import UpstreamManager
+from fastmcp_gateway.client_manager import (
+    DEFAULT_UPSTREAM_CLIENT_MODE,
+    UpstreamManager,
+    validate_upstream_client_mode,
+)
 from fastmcp_gateway.errors import _find_upstream_response, _walk_wrapped_exceptions
 from fastmcp_gateway.hooks import HookRunner
 from fastmcp_gateway.output_guard import OutputGuardConfig, OutputGuardHook
@@ -56,8 +61,8 @@ _tracer = trace.get_tracer("fastmcp_gateway.gateway")
 # A registry controller registers an upstream as soon as it is scheduled,
 # so the first probe routinely lands while the upstream is still starting.
 # Every shape that probe meets then is "not ready yet": the connection is
-# refused, or times out before it connects or answers (a transient httpx
-# error, the client's 408 deadline code, or a ``TimeoutError`` it chains);
+# refused, or times out before it connects or answers (a transient httpx2
+# error, the client's request-timeout code, or a ``TimeoutError`` it chains);
 # the discovery route is not mounted; a proxy in front has no ready
 # backend; or the MCP server answers ``tools/list`` before it can serve
 # it. The constants below name those shapes, and
@@ -66,54 +71,36 @@ _tracer = trace.get_tracer("fastmcp_gateway.gateway")
 # ``upstream_error_code`` so an operator can tell a slow start from a
 # misconfiguration that will never become ready.
 
-# httpx errors raised when the upstream is unreachable or slow. Tuple form
+# httpx2 errors raised when the upstream is unreachable or slow. Tuple form
 # so :func:`_find_not_ready_failure` can match the whole class at once.
 _UPSTREAM_TRANSIENT_HTTPX_ERRORS: tuple[type[BaseException], ...] = (
-    httpx.ConnectError,
-    httpx.ConnectTimeout,
-    httpx.ReadTimeout,
-    httpx.WriteTimeout,
-    httpx.PoolTimeout,
-    httpx.ReadError,
-    httpx.WriteError,
-    httpx.RemoteProtocolError,
+    httpx2.ConnectError,
+    httpx2.ConnectTimeout,
+    httpx2.ReadTimeout,
+    httpx2.WriteTimeout,
+    httpx2.PoolTimeout,
+    httpx2.ReadError,
+    httpx2.WriteError,
+    httpx2.RemoteProtocolError,
 )
 
 
-# Class-import sentinel for ``mcp.shared.exceptions.McpError``. When the
-# MCP SDK is available, the route handler reads the JSON-RPC error code
-# carried in ``McpError.error.code`` to decide not-ready-vs-fall-through.
-# When the SDK lays out its exception module differently in a future
-# release, the tuple stays empty and no ``McpError`` is treated as not
-# ready -- leaving the httpx and HTTP-status classification load-bearing.
-try:
-    from mcp.shared.exceptions import McpError as _McpError  # type: ignore[import-not-found]
-
-    _MCP_ERROR_TUPLE: tuple[type[BaseException], ...] = (_McpError,)
-except ImportError:  # pragma: no cover — defensive fallback
-    _MCP_ERROR_TUPLE = ()
-
-
 # JSON-RPC error codes that mean the upstream is not ready yet when the
-# registration probe receives them in an ``McpError``:
+# registration probe receives them in an ``MCPError``:
 #
-#   * -32000 ``CONNECTION_CLOSED``: the MCP session dropped mid-probe.
-#   * 408 (``httpx.codes.REQUEST_TIMEOUT`` reused as a JSON-RPC code): only
-#     ever built by a client-side deadline -- the gateway's own, or one a
-#     proxying upstream passes back, since the MCP SDK server returns any
-#     ``McpError`` a handler raises to its client as-is (the 504
-#     equivalent). The fastmcp client turns an ``httpx.ConnectTimeout`` it
-#     collects from its task group into ``McpError(408)`` without chaining
-#     the timeout, and the MCP SDK raises it when a request's read timeout
-#     expires.
-#   * 32600: the MCP Python SDK's streamable-HTTP client reports an HTTP 404
-#     answer to a request as this positive code ("Session terminated")
-#     instead of raising the 404. During startup that is the discovery
-#     route not mounted yet, or a restarted upstream that lost the session.
+#   * -32000 ``CONNECTION_CLOSED``: the MCP session dropped mid-probe, or a
+#     streamed answer ended before it arrived.
+#   * -32001 ``REQUEST_TIMEOUT``: the MCP SDK v2 client's code for a request
+#     whose read timeout expired -- the gateway's own deadline, or one a
+#     proxying upstream passes back (the 504 equivalent).
+#   * 408 (``httpx2.codes.REQUEST_TIMEOUT`` reused as a JSON-RPC code): the
+#     same client-side deadline as built by MCP SDK v1 clients, which a
+#     proxying upstream still on that SDK passes back as-is.
+#   * 32600: the MCP SDK v1 streamable-HTTP client's report of an HTTP 404
+#     ("Session terminated"), likewise passed back by such a proxy. The
+#     gateway's own client surfaces a 404 as ``httpx2.HTTPStatusError``.
 #   * -32600 ``INVALID_REQUEST``: the code an MCP server puts in its
-#     "Session not found" error. Included for completeness: the MCP Python
-#     SDK client never delivers it, because it reports that 404 as 32600
-#     above and surfaces a 400 answer as ``httpx.HTTPStatusError``.
+#     "Session not found" error.
 #   * -32601 ``METHOD_NOT_FOUND``: what an MCP server answers when no
 #     handler is registered for ``tools/list`` -- in practice, a server
 #     with no tools.
@@ -123,28 +110,27 @@ except ImportError:  # pragma: no cover — defensive fallback
 # Codes that describe the gateway's own request (``INVALID_PARAMS``,
 # ``PARSE_ERROR``) are deliberately absent: an upstream that finishes
 # starting rejects the same request the same way, so retrying cannot help.
-_TRANSIENT_MCP_ERROR_CODES: frozenset[int] = frozenset({-32000, 408, 32600, -32600, -32601, -32603})
+_TRANSIENT_MCP_ERROR_CODES: frozenset[int] = frozenset({-32000, -32001, 408, 32600, -32600, -32601, -32603})
 
 
 def _mcp_error_code(exc: BaseException) -> int | None:
-    """Return the JSON-RPC error code *exc* carries when it is an ``McpError``, else ``None``."""
-    if not isinstance(exc, _MCP_ERROR_TUPLE):
+    """Return the JSON-RPC error code *exc* carries when it is an ``MCPError``, else ``None``."""
+    if not isinstance(exc, MCPError):
         return None
     code = getattr(getattr(exc, "error", None), "code", None)
     return code if isinstance(code, int) else None
 
 
 def _is_transient_mcp_error(exc: BaseException) -> bool:
-    """Return ``True`` only for an ``McpError`` whose code says the upstream is not ready yet.
+    """Return ``True`` only for an ``MCPError`` whose code says the upstream is not ready yet.
 
-    ``mcp.shared.exceptions.McpError`` wraps both session drops and
+    ``mcp.MCPError`` wraps both session drops and
     peer-application protocol errors. Only the codes in
     ``_TRANSIENT_MCP_ERROR_CODES`` map to 503; any other code falls through
     to the generic 500 path so a controller-side caller doesn't loop on an
     error that retrying cannot fix.
 
-    Returns ``False`` for any non-``McpError`` exception, or when the
-    MCP SDK is unimportable (``_MCP_ERROR_TUPLE`` empty), or when the
+    Returns ``False`` for any non-``MCPError`` exception, or when the
     error's ``code`` is missing or not in the transient set.
     """
     code = _mcp_error_code(exc)
@@ -169,10 +155,10 @@ def _find_not_ready_failure(exc: BaseException) -> BaseException | None:
     and exception-group members, never implicit ``__context__``). The first
     exception the walk can classify decides, whatever its kind:
 
-    * a transient httpx error, or a builtin ``TimeoutError`` reached as an
+    * a transient httpx2 error, or a builtin ``TimeoutError`` reached as an
       explicit ``__cause__`` (the client raises ``RuntimeError`` from it
       when the ``initialize`` handshake misses its deadline), is not ready;
-    * an ``McpError`` is not ready when its code is in
+    * an ``MCPError`` is not ready when its code is in
       ``_TRANSIENT_MCP_ERROR_CODES``, and otherwise ends the walk;
     * an HTTP response is not ready when its status is in
       ``_UPSTREAM_NOT_READY_STATUSES``, and otherwise ends the walk.
@@ -187,7 +173,7 @@ def _find_not_ready_failure(exc: BaseException) -> BaseException | None:
             return current
         if isinstance(current, TimeoutError) and id(current) in explicit_causes:
             return current
-        if isinstance(current, _MCP_ERROR_TUPLE):
+        if isinstance(current, MCPError):
             return current if _is_transient_mcp_error(current) else None
         status = getattr(getattr(current, "response", None), "status_code", None)
         if isinstance(status, int):
@@ -205,7 +191,7 @@ def _not_ready_discriminators(failure: BaseException) -> dict[str, int]:
     wrong discovery path, a server with no tools). These values let an
     operator tell the two apart. Only the keys *failure* actually carries
     are returned: the HTTP status of the response it holds, and the
-    JSON-RPC code of an ``McpError``.
+    JSON-RPC code of an ``MCPError``.
     """
     discriminators: dict[str, int] = {}
     status = getattr(getattr(failure, "response", None), "status_code", None)
@@ -421,8 +407,10 @@ class GatewayServer:
         that are allowed to return prompt-like content — the output
         guard skips scrubbing for any registered tool whose name
         matches. Complementary to the upstream-declared
-        ``annotations: {"x-raw-output-trusted": true}`` custom
-        extension, which is the preferred signal; this operator-side
+        ``x-raw-output-trusted: true`` custom key in a tool's
+        ``annotations`` or ``_meta`` (an upstream on the MCP SDK v2,
+        which drops unknown annotation keys, can only use ``_meta``),
+        which is the preferred signal; this operator-side
         override exists so a deployment can bypass scrubbing without
         coordinating with the upstream vendor. Patterns are applied
         at registry-populate time and re-applied on every refresh.
@@ -465,6 +453,22 @@ class GatewayServer:
         can't be raised without limit even deliberately. Also settable
         via ``GATEWAY_MAX_SCHEMA_DEPTH`` when running via the CLI entry
         point.
+    upstream_client_mode:
+        How the gateway's connections to its upstreams negotiate the MCP
+        protocol era. ``"legacy"`` (the default) uses the ``initialize``
+        handshake, as earlier releases did; handshake-era upstreams (such
+        as FastMCP 3) serve it, and so do dual-era ones (such as FastMCP
+        4). ``"auto"`` probes for the 2026-07-28 era first and falls back
+        to the handshake, at the cost of one extra request on every
+        connection to a handshake-era upstream (the gateway opens one per
+        tool call). A 2026-07-28-era
+        version string such as ``"2026-07-28"`` adopts that version
+        without probing and fails against a handshake-era upstream. This
+        governs only the gateway's own upstream connections: its server
+        serves clients of both eras regardless. Any other value raises
+        :class:`ValueError` at construction. Also settable via
+        ``GATEWAY_UPSTREAM_CLIENT_MODE`` when running via the CLI entry
+        point.
 
     Usage::
 
@@ -503,6 +507,7 @@ class GatewayServer:
         trace_health_routes: bool = True,
         max_schema_depth: int = DEFAULT_MAX_SCHEMA_DEPTH,
         registration_identities: Mapping[str, RegistrationIdentity] | None = None,
+        upstream_client_mode: str = DEFAULT_UPSTREAM_CLIENT_MODE,
     ) -> None:
         # Fail fast at construction rather than deferring to the first
         # populate() call — an operator misconfiguration here should
@@ -513,6 +518,7 @@ class GatewayServer:
         # unbounded max_schema_depth would let an operator unknowingly
         # re-open that DoS surface.
         _validate_max_schema_depth(max_schema_depth)
+        validate_upstream_client_mode(upstream_client_mode)
 
         # Accept either a plain URL mapping or an object-shaped mapping with
         # per-entry allowed_tools / denied_tools.  The explicit access_policy
@@ -645,6 +651,7 @@ class GatewayServer:
             trusted_output_tools=trusted_output_tools,
             max_schema_depth=max_schema_depth,
             registration_identities=registration_identities,
+            client_mode=upstream_client_mode,
         )
         self._trace_health_routes = trace_health_routes
         # ``auth`` plugs an inbound auth provider (TokenVerifier,

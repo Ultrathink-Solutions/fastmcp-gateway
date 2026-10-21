@@ -62,7 +62,7 @@ async def _served_tools() -> dict[str, Tool]:
 
 def _served_text(tool: Tool) -> str:
     """All the text a model reads for *tool*: its description and its input schema."""
-    return f"{tool.description or ''}\n{json.dumps(tool.inputSchema)}"
+    return f"{tool.description or ''}\n{json.dumps(tool.input_schema)}"
 
 
 def _undescribed_fields(schema: Any, path: str = "") -> Iterator[str]:
@@ -118,5 +118,5 @@ async def test_description_has_at_least_two_sentences(name: str) -> None:
 @pytest.mark.asyncio
 async def test_every_parameter_is_described(name: str) -> None:
     tool = (await _served_tools())[name]
-    missing = list(_undescribed_fields(tool.inputSchema))
+    missing = list(_undescribed_fields(tool.input_schema))
     assert not missing, f"{name} serves parameters without a description: {missing}"

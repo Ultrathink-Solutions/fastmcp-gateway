@@ -29,14 +29,14 @@ if TYPE_CHECKING:
 class _FakeTool:
     name: str
     description: str | None = None
-    inputSchema: dict[str, Any] | None = None
+    input_schema: dict[str, Any] | None = None
 
 
 def _client_factory(upstreams: dict[str, str], seen: dict[str, list[str | None]]) -> Callable[[str], AsyncMock]:
     """Patched ``Client`` factory that records the Authorization header present
     on the transport at the moment ``list_tools`` runs."""
 
-    def make_client(url: str) -> AsyncMock:
+    def make_client(url: str, **_client_kwargs: Any) -> AsyncMock:
         domain = next(d for d, u in upstreams.items() if u == url)
         client = AsyncMock()
         client.__aenter__ = AsyncMock(return_value=client)
@@ -51,7 +51,7 @@ def _client_factory(upstreams: dict[str, str], seen: dict[str, list[str | None]]
                 _FakeTool(
                     name=f"{domain}_t",
                     description="d",
-                    inputSchema={"type": "object"},
+                    input_schema={"type": "object"},
                 )
             ]
 
@@ -152,7 +152,7 @@ class TestRegistryTokenProvider:
 
         captured: list[str | None] = []
 
-        def make_client(url: str) -> AsyncMock:
+        def make_client(url: str, **_client_kwargs: Any) -> AsyncMock:
             domain = next(d for d, u in upstreams.items() if u == url)
             client = AsyncMock()
             client.__aenter__ = AsyncMock(return_value=client)
@@ -164,7 +164,7 @@ class TestRegistryTokenProvider:
                 # that mutated the shared header would be observed right here.
                 await asyncio.sleep(0)
                 captured.append(client.transport.headers.get("Authorization"))
-                return [_FakeTool(name=f"{domain}_t", inputSchema={"type": "object"})]
+                return [_FakeTool(name=f"{domain}_t", input_schema={"type": "object"})]
 
             client.list_tools = _list_tools
             return client

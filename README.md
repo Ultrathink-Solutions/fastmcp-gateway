@@ -31,6 +31,8 @@ When an LLM connects to many MCP servers, it receives all tool schemas at once. 
 pip install fastmcp-gateway
 ```
 
+Requires Python 3.11+. Built on [FastMCP](https://gofastmcp.com) 4 and the MCP Python SDK v2 (`fastmcp>=4.1,<5`).
+
 ## Quick Start
 
 ### Python API
@@ -92,6 +94,7 @@ All configuration is via environment variables:
 | `GATEWAY_REFRESH_INTERVAL` | No | Disabled | Seconds between automatic registry refresh cycles |
 | `GATEWAY_TRACE_HEALTH_ROUTES` | No | `true` | Emit an OTel span per `/healthz` / `/readyz` request (see Health Endpoints) |
 | `GATEWAY_MAX_SCHEMA_DEPTH` | No | `5` | Registry-ingest schema-nesting-depth cap, `1`-`50` (see Schema Validation) |
+| `GATEWAY_UPSTREAM_CLIENT_MODE` | No | `legacy` | Protocol era the gateway's upstream connections negotiate: `legacy`, `auto`, or `2026-07-28` (see Protocol Eras) |
 | `GATEWAY_HOOK_MODULE` | No | — | Python module path for execution hooks: `module.path:factory_function` |
 | `GATEWAY_REGISTRATION_TOKEN` | No | — | Shared secret for dynamic registration endpoints (see below) |
 | `GATEWAY_CODE_MODE` | No | `false` | Enable the experimental `execute_code` meta-tool (see Code Mode) |
@@ -111,7 +114,29 @@ If your upstream servers require different authentication, use `GATEWAY_UPSTREAM
 export GATEWAY_UPSTREAM_HEADERS='{"ahrefs": {"Authorization": "Bearer sk-xxx"}}'
 ```
 
-Domains without overrides use request passthrough (headers from the incoming MCP request are forwarded to the upstream).
+Domains without overrides get no extra headers: the gateway does not forward the incoming MCP request's headers (such as `Authorization`) to upstreams. To pass a caller's identity on, set `extra_headers` from an execution hook (see Execution Hooks).
+
+## Protocol Eras
+
+MCP has two protocol eras: the `initialize` handshake (protocol versions up to `2025-11-25`) and the sessionless `2026-07-28` era, which opens with `server/discover` and carries per-request metadata instead of a session.
+
+**Serving.** The gateway serves clients of both eras on every transport, with no configuration. A `2025-11-25` client gets a session; a `2026-07-28` client does not. Both see the same meta-tools, the same domain-aware instructions, and the same results, with MCP's camelCase names on the wire (`inputSchema`, `structuredContent`, `isError`, `readOnlyHint`).
+
+**Upstream connections.** Each connection the gateway opens to an upstream (one per registry fetch, one per tool call) negotiates its era by `upstream_client_mode` (`GATEWAY_UPSTREAM_CLIENT_MODE`):
+
+| Mode | Opens with | Reaches |
+|------|-----------|---------|
+| `legacy` (default) | the `initialize` handshake, as earlier releases did | every server that serves the handshake: handshake-era servers (such as FastMCP 3) and dual-era servers (such as FastMCP 4) |
+| `auto` | a `server/discover` probe; adopts `2026-07-28` when offered, else falls back to the handshake | servers of either era, at the cost of one extra request on each connection to a handshake-era server |
+| `2026-07-28` | that version, without probing | only servers that serve the `2026-07-28` era |
+
+```python
+gateway = GatewayServer(upstreams, upstream_client_mode="auto")
+```
+
+The default stays `legacy` because a handshake-era upstream (for example one on FastMCP 3) rejects the probe, so `auto` spends an extra request on every tool call to it, and because a dual-era upstream serves the handshake exactly as before. Under `auto` or `2026-07-28`, the gateway lists an upstream's tools before each call that negotiates the `2026-07-28` era, so it can send the `Mcp-Param-*` headers that era requires for a tool argument marked `x-mcp-header`.
+
+The upstream sees exactly the caller's `_meta` on every forwarded call: the client stack's own trace context and progress token are not added, and a caller-supplied `traceparent` is kept. The protocol-reserved `io.modelcontextprotocol/` keys describe a single connection, so the gateway does not forward a caller's; a `2026-07-28` upstream connection adds its own.
 
 ## Dynamic Upstream Registration
 
@@ -264,7 +289,7 @@ For each `execute_tool` call:
 
 1. **`on_authenticate(headers)`** — Extract user identity from request headers. Last non-None result wins across multiple hooks.
 2. **`before_execute(context)`** — Validate permissions, inspect the isolated read-only `request_meta`, mutate arguments, or set `extra_headers`. Raise `ExecutionDenied` to block.
-3. **Upstream call** — The untouched inbound MCP metadata is forwarded exactly; absent metadata remains absent. `extra_headers` merge with highest priority over static `upstream_headers`.
+3. **Upstream call** — The untouched inbound MCP metadata is forwarded exactly; absent metadata remains absent. The protocol-reserved `io.modelcontextprotocol/` keys describe the caller's own connection, so they are left out of `request_meta` and of what is forwarded (see Protocol Eras). `extra_headers` merge with highest priority over static `upstream_headers`.
 4. **`after_execute(context, result, is_error)`** — Transform or log the result. Each hook receives the previous hook's output.
 5. **`on_error(context, error)`** — Observability only (exceptions in hooks are logged, not raised).
 
@@ -401,7 +426,7 @@ The original names remain searchable via `discover_tools(query="search")`.
 
 ## MCP Handshake Instructions
 
-After `populate()`, the gateway automatically builds domain-aware instructions that are included in the MCP `InitializeResult` handshake. MCP clients immediately know what tool domains are available without calling `discover_tools()` first:
+After `populate()`, the gateway automatically builds domain-aware instructions that are included in the MCP `InitializeResult` handshake (and, for `2026-07-28` clients, in the `server/discover` result). MCP clients immediately know what tool domains are available without calling `discover_tools()` first:
 
 ```text
 You have access to a tool discovery gateway with tools across these domains:

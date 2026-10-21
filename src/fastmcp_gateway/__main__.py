@@ -94,6 +94,17 @@ Configure via environment variables:
         recursion itself becomes a stack-overflow risk well before
         four-figure depths.
 
+    GATEWAY_UPSTREAM_CLIENT_MODE
+        How the gateway's connections to its upstreams negotiate the MCP
+        protocol era.  ``legacy`` (the default) uses the ``initialize``
+        handshake, which handshake-era and dual-era servers both serve.
+        ``auto`` probes for the 2026-07-28 era first and falls back to the
+        handshake, at the cost of one extra request on every connection to
+        a handshake-era upstream.  A 2026-07-28-era version string
+        (``2026-07-28``) adopts that version without probing and cannot
+        reach a handshake-era upstream.  Any other value fails startup.
+        The gateway itself serves clients of both eras regardless.
+
     GATEWAY_HOOK_MODULE
         Python dotted path to a factory function that returns a list of hook
         instances.  Format: ``module.path:function_name``.
@@ -256,6 +267,7 @@ from fastmcp_gateway._middleware_loading import _load_middleware
 from fastmcp_gateway._registry_token_provider_loading import (
     _load_registry_token_provider,
 )
+from fastmcp_gateway.client_manager import DEFAULT_UPSTREAM_CLIENT_MODE, validate_upstream_client_mode
 from fastmcp_gateway.code_mode import CodeModeUnavailableError
 from fastmcp_gateway.gateway import CodeModeAuthorizerRequiredError, GatewayServer
 from fastmcp_gateway.registration import RegistrationIdentity
@@ -330,6 +342,21 @@ def _bool_env(name: str, default: bool = False) -> bool:
         ", ".join(sorted(_TRUE_TOKENS | _FALSE_TOKENS)),
     )
     sys.exit(1)
+
+
+def _load_upstream_client_mode() -> str:
+    """Read ``GATEWAY_UPSTREAM_CLIENT_MODE`` (default ``legacy``).
+
+    Validated here, with the check ``GatewayServer`` applies, so a typo
+    fails startup with an operator-facing message rather than a
+    construction traceback.
+    """
+    mode = os.environ.get("GATEWAY_UPSTREAM_CLIENT_MODE") or DEFAULT_UPSTREAM_CLIENT_MODE
+    try:
+        return validate_upstream_client_mode(mode)
+    except ValueError as exc:
+        logger.error("Invalid GATEWAY_UPSTREAM_CLIENT_MODE: %s", exc)
+        sys.exit(1)
 
 
 def _float_env(name: str) -> float | None:
@@ -548,6 +575,8 @@ def main() -> None:
             logger.error("Invalid GATEWAY_MAX_SCHEMA_DEPTH: %s", exc)
             sys.exit(1)
 
+    upstream_client_mode = _load_upstream_client_mode()
+
     # Execution hooks.
     hooks = _load_hooks()
 
@@ -615,6 +644,7 @@ def main() -> None:
             trace_health_routes=trace_health_routes,
             max_schema_depth=max_schema_depth,
             registration_identities=registration_identities,
+            upstream_client_mode=upstream_client_mode,
         )
     except CodeModeUnavailableError as exc:
         # Friendly handling for the one construction-time error with a

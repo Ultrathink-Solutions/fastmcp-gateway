@@ -7,9 +7,9 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import httpx
+import httpx2
 import pytest
-from mcp.shared.exceptions import McpError
+from mcp import MCPError
 from mcp.types import ErrorData
 
 from fastmcp_gateway.errors import UpstreamJsonRpcError
@@ -44,33 +44,33 @@ def result_payload(result: Any) -> dict[str, Any]:
     return cast("dict[str, Any]", json.loads(result_text(result)))
 
 
-def upstream_status_error(status_code: int, www_authenticate: str | None = None) -> httpx.HTTPStatusError:
-    """The exception httpx raises for a non-2xx upstream response, with an optional challenge."""
+def upstream_status_error(status_code: int, www_authenticate: str | None = None) -> httpx2.HTTPStatusError:
+    """The exception httpx2 raises for a non-2xx upstream response, with an optional challenge."""
     headers = {} if www_authenticate is None else {"WWW-Authenticate": www_authenticate}
-    return httpx.HTTPStatusError(
+    return httpx2.HTTPStatusError(
         f"upstream answered {status_code}",
-        request=httpx.Request("POST", "http://upstream:8080/mcp"),
-        response=httpx.Response(status_code, headers=headers),
+        request=httpx2.Request("POST", "http://upstream:8080/mcp"),
+        response=httpx2.Response(status_code, headers=headers),
     )
 
 
 def upstream_jsonrpc_error(code: int, message: str) -> UpstreamJsonRpcError:
     """What ``UpstreamManager.execute_tool`` raises when the upstream answers with a JSON-RPC error."""
-    return UpstreamJsonRpcError(ErrorData(code=code, message=message))
+    return UpstreamJsonRpcError.from_error_data(ErrorData(code=code, message=message))
 
 
-def client_session_failure(code: int, message: str) -> McpError:
-    """An ``McpError`` the MCP client raised itself because no answer arrived."""
-    return McpError(ErrorData(code=code, message=message))
+def client_session_failure(code: int, message: str) -> MCPError:
+    """An ``MCPError`` the MCP client raised itself because no answer arrived."""
+    return MCPError(code=code, message=message)
 
 
 @dataclass
 class FakeTool:
-    """Mimics ``mcp.types.Tool`` for tests that don't need the MCP dependency."""
+    """Mimics ``mcp.types.Tool`` (snake_case attributes) for tests that don't need the MCP dependency."""
 
     name: str
     description: str | None = None
-    inputSchema: dict[str, Any] | None = None
+    input_schema: dict[str, Any] | None = None
 
 
 @pytest.fixture
@@ -88,7 +88,7 @@ def deep_schema_tool() -> Callable[..., FakeTool]:
         node: dict[str, Any] = {"type": "string"}
         for index in range(wrappers):
             node = {"type": "object", "properties": {f"level_{index}": node}}
-        return FakeTool(name=name, description="Deeply nested tool", inputSchema=node)
+        return FakeTool(name=name, description="Deeply nested tool", input_schema=node)
 
     return _build
 
@@ -102,7 +102,7 @@ def patch_upstream_client() -> Callable[..., AbstractContextManager[Any]]:
     """
 
     def _patch(*tools: FakeTool) -> AbstractContextManager[Any]:
-        def make_client(url: str) -> MagicMock:
+        def make_client(url: str, **_client_kwargs: Any) -> MagicMock:
             client = AsyncMock()
             client.__aenter__ = AsyncMock(return_value=client)
             client.__aexit__ = AsyncMock(return_value=None)

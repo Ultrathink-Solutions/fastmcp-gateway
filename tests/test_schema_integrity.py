@@ -14,7 +14,7 @@ import logging
 
 import pytest
 from fastmcp import FastMCP
-from httpx import ASGITransport, AsyncClient
+from httpx2 import ASGITransport, AsyncClient
 
 from fastmcp_gateway.gateway import GatewayServer
 from fastmcp_gateway.registry import ToolRegistry, compute_schema_digest
@@ -380,7 +380,7 @@ class TestRefreshEndpoint:
         # digest mismatch (description change) rather than schema
         # validation — an empty ``{}`` would be rejected by the stricter
         # ``validate_input_schema`` for the wrong reason.
-        mutated_tool.inputSchema = {"type": "object"}
+        mutated_tool.input_schema = {"type": "object"}
         mock_client = AsyncMock()
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=None)
