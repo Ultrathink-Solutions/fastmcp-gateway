@@ -458,8 +458,9 @@ class TestPopulateDomain:
 
     def test_populate_default_max_schema_depth_rejects_deep_tool(self, empty_registry: ToolRegistry) -> None:
         """Omitting max_schema_depth preserves the existing cap of 5."""
+        # Six field levels (root -> a ... e) plus e's own type: depth 7.
         deep: dict = {"type": "string"}
-        for key in ("b", "a"):
+        for key in ("e", "d", "c", "b", "a"):
             deep = {"type": "object", "properties": {key: deep}}
         raw_tools = [
             {"name": "dom_shallow", "inputSchema": {"type": "object"}},
@@ -473,7 +474,7 @@ class TestPopulateDomain:
     def test_populate_raised_max_schema_depth_admits_deep_tool(self, empty_registry: ToolRegistry) -> None:
         """A caller-supplied max_schema_depth threads through to the validator."""
         deep: dict = {"type": "string"}
-        for key in ("b", "a"):
+        for key in ("e", "d", "c", "b", "a"):
             deep = {"type": "object", "properties": {key: deep}}
         raw_tools = [
             {"name": "dom_deep", "inputSchema": {"type": "object", "properties": {"root": deep}}},
