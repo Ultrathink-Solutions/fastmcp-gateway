@@ -10,12 +10,14 @@ the wire in the cases the gateway has to tell apart.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
 import uvicorn
 from mcp.types.version import HANDSHAKE_PROTOCOL_VERSIONS
+from sse_starlette.sse import AppStatus
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable
@@ -45,6 +47,12 @@ async def serve_http(app: Any) -> AsyncIterator[str]:
     finally:
         server.should_exit = True
         await task
+        # sse_starlette watches the running uvicorn server's ``should_exit``
+        # and, on seeing it, sets its process-wide ``AppStatus.should_exit``,
+        # which ends every event stream any later server opens at once. The
+        # server has stopped: clear both, so the next one starts clean.
+        server.should_exit = False
+        AppStatus.should_exit = False
 
 
 def _header(scope: Scope, name: bytes) -> str | None:
@@ -151,18 +159,30 @@ class RecordEras:
 
 
 class FailMethod:
-    """Answer POSTs of one JSON-RPC *method* (``None``: every one) with an HTTP error and no JSON-RPC body.
+    """Answer POSTs of one JSON-RPC *method* (``None``: every one) with an HTTP error.
 
     Mirrors an authorizing proxy or an upstream's auth middleware, or a route
     that is not mounted yet: the request is refused before it reaches the MCP
-    server, with an ``application/json`` body that is not a JSON-RPC message.
+    server. By default the ``application/json`` body is not a JSON-RPC
+    message. With *jsonrpc_error* (``(code, message)``) the body is a JSON-RPC
+    error answering the request, as an upstream's own auth middleware may
+    send with its ``401``.
     """
 
-    def __init__(self, app: ASGIApp, method: str | None, status: int, headers: dict[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        app: ASGIApp,
+        method: str | None,
+        status: int,
+        headers: dict[str, str] | None = None,
+        *,
+        jsonrpc_error: tuple[int, str] | None = None,
+    ) -> None:
         self.app = app
         self.method = method
         self.status = status
         self.headers = headers or {}
+        self.jsonrpc_error = jsonrpc_error
         self.failed = 0
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -171,9 +191,74 @@ class FailMethod:
             method = _jsonrpc_method(body)
             if method is not None and self.method in (None, method):
                 self.failed += 1
-                await _send_json(send, self.status, {"error": "refused"}, self.headers)
+                payload: Any = {"error": "refused"}
+                if self.jsonrpc_error is not None:
+                    code, message = self.jsonrpc_error
+                    request_id = json.loads(body).get("id")
+                    payload = {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
+                await _send_json(send, self.status, payload, self.headers)
                 return
         await self.app(scope, receive, send)
+
+
+class StallMethod:
+    """Accept POSTs of one JSON-RPC *method* and never answer them.
+
+    The response opens an event stream at once and then carries only
+    keep-alive comments, so the HTTP connection stays busy while no answer
+    arrives: the client's session deadline expires before any HTTP read
+    timeout does, as with an upstream stuck behind a slow dependency. The
+    stream ends when the client disconnects, or after *seconds*.
+    :attr:`stalled` counts the requests held.
+
+    Ending on disconnect keeps the server's shutdown prompt rather than
+    holding it for *seconds*.
+    """
+
+    def __init__(self, app: ASGIApp, method: str, seconds: float = 5.0, *, keep_alive: float = 0.05) -> None:
+        self.app = app
+        self.method = method
+        self.seconds = seconds
+        self.keep_alive = keep_alive
+        self.stalled = 0
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http" and scope["method"] == "POST":
+            body, receive = await _read_body(receive)
+            if _jsonrpc_method(body) == self.method:
+                self.stalled += 1
+                await self._stall(receive, send)
+                return
+        await self.app(scope, receive, send)
+
+    async def _stall(self, receive: Receive, send: Send) -> None:
+        disconnected = asyncio.Event()
+
+        async def watch() -> None:
+            while (await receive())["type"] != "http.disconnect":
+                pass
+            disconnected.set()
+
+        watcher = asyncio.create_task(watch())
+        try:
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 200,
+                    "headers": [(b"content-type", b"text/event-stream"), (b"cache-control", b"no-cache")],
+                }
+            )
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + self.seconds
+            while not disconnected.is_set() and loop.time() < deadline:
+                await send({"type": "http.response.body", "body": b": keep-alive\n\n", "more_body": True})
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(disconnected.wait(), self.keep_alive)
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
+        finally:
+            watcher.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await watcher
 
 
 class CutResponse:

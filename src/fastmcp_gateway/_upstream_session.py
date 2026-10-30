@@ -78,6 +78,9 @@ RESERVED_META_PREFIX = "io.modelcontextprotocol/"
 _CALL_METHOD = "tools/call"
 _LIST_METHOD = "tools/list"
 
+#: HTTP statuses that refuse the request's credentials.
+_AUTH_STATUSES = (401, 403)
+
 
 class _Unpinned:
     """Sentinel: forward a call's ``_meta`` as the client builds it."""
@@ -230,13 +233,19 @@ class UpstreamExchange:
             # reply is due, and the SDK ignores the status of such a POST.
             return
         content_type = response.headers.get("content-type", "").lower()
-        if self.auth_flow and response.status_code in (401, 403):
-            # The auth flow answers this challenge itself and may retry. If it
-            # gives up, this is the response the request ended on, and
+        if response.status_code in _AUTH_STATUSES:
+            # Kept whatever the body holds: the SDK hands a JSON-RPC error
+            # body to the session and drops the status, and that body's code
+            # (an auth middleware may send ``-32001``, the client's own
+            # timeout code) must not decide how the refusal is classified.
             # auth_failure() reports it at the gateway's error boundary.
             self._auth_failure = response
-            return
-        self._auth_failure = None
+            if self.auth_flow:
+                # The auth flow answers this challenge itself and may retry.
+                # If it gives up, this is the response the request ended on.
+                return
+        else:
+            self._auth_failure = None
         if response.status_code >= 400:
             if method == ERA_PROBE_METHOD:
                 return
@@ -283,16 +292,19 @@ class UpstreamExchange:
         return key in self._delivered_call_errors
 
     def auth_failure(self) -> httpx2.HTTPStatusError | None:
-        """The ``401``/``403`` an auth flow ended on, when the connection's last request got one.
+        """The ``401``/``403`` the connection's last request got, if it got one.
 
-        The MCP client reports such a response as a JSON-RPC error of its own,
-        which would hide the status the gateway classifies credentials on.
+        The MCP client reports such a response as a JSON-RPC error: the one in
+        its body, or one it builds itself (also when an auth flow gave up on
+        the response). Either would hide the status the gateway classifies
+        credentials on, so the gateway raises this in its place, before it
+        looks at any JSON-RPC error code.
         """
         response = self._auth_failure
         if response is None:
             return None
         return httpx2.HTTPStatusError(
-            f"upstream answered {response.status_code} after its auth flow",
+            f"upstream refused the request with {response.status_code}",
             request=response.request,
             response=response,
         )

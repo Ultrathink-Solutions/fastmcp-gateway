@@ -39,10 +39,12 @@ from tests.http_upstreams import (
     FailMethod,
     HandshakeEraOnly,
     RecordEras,
+    StallMethod,
     serve_http,
 )
 
 if TYPE_CHECKING:
+    from httpx2 import Response
     from starlette.applications import Starlette
 
 REGISTRATION_TOKEN = "test-registration-token-0123456789"
@@ -247,9 +249,50 @@ class TestUpstreamHttpStatuses:
         assert envelope["code"] == code
         assert envelope["details"] == {"tool": "widgets_echo", "domain": "widgets", **details}
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", CONNECT_MODES)
+    @pytest.mark.parametrize(
+        ("status", "headers", "code", "details"),
+        [
+            pytest.param(
+                403,
+                {"WWW-Authenticate": _INSUFFICIENT_SCOPE},
+                "upstream_insufficient_scope",
+                {"upstream_status": 403, "required_scope": "widgets:write"},
+                id="403-insufficient-scope",
+            ),
+            pytest.param(403, {}, "upstream_unauthorized", {"upstream_status": 403}, id="403"),
+            pytest.param(401, {}, "upstream_unauthorized", {"upstream_status": 401}, id="401"),
+        ],
+    )
+    async def test_a_call_refused_with_a_jsonrpc_error_body(
+        self, mode: str, status: int, headers: dict[str, str], code: str, details: dict[str, Any]
+    ) -> None:
+        """The client surfaces a JSON-RPC error body and drops the status; the status and its challenge decide."""
+        upstream = FailMethod(
+            _widgets_upstream().http_app(), "tools/call", status, headers, jsonrpc_error=(-32001, "Unauthorized")
+        )
+        async with serve_http(upstream) as base:
+            gateway = GatewayServer({"widgets": f"{base}/mcp"}, upstream_client_mode=mode)
+            await gateway.populate()
+            envelope = await _execute(gateway, "widgets_echo", {"text": "hi"})
+
+        assert upstream.failed == 1
+        assert envelope["code"] == code
+        assert envelope["details"] == {"tool": "widgets_echo", "domain": "widgets", **details}
+
     @staticmethod
     def _registration_app(gateway: GatewayServer) -> Starlette:
         return gateway.mcp.http_app(transport="streamable-http")
+
+    async def _register(self, gateway: GatewayServer, url: str) -> Response:
+        transport = ASGITransport(app=self._registration_app(gateway), raise_app_exceptions=False)
+        async with AsyncClient(transport=transport, base_url="http://testserver") as http:
+            return await http.post(
+                "/registry/servers",
+                headers={"authorization": f"Bearer {REGISTRATION_TOKEN}"},
+                json={"domain": "widgets", "url": url},
+            )
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("mode", CONNECT_MODES)
@@ -275,13 +318,7 @@ class TestUpstreamHttpStatuses:
         upstream = FailMethod(_widgets_upstream().http_app(), method, status)
         async with serve_http(upstream) as base:
             gateway = GatewayServer({}, registration_token=REGISTRATION_TOKEN, upstream_client_mode=mode)
-            transport = ASGITransport(app=self._registration_app(gateway), raise_app_exceptions=False)
-            async with AsyncClient(transport=transport, base_url="http://testserver") as http:
-                response = await http.post(
-                    "/registry/servers",
-                    headers={"authorization": f"Bearer {REGISTRATION_TOKEN}"},
-                    json={"domain": "widgets", "url": f"{base}/mcp"},
-                )
+            response = await self._register(gateway, f"{base}/mcp")
 
         assert upstream.failed >= 1
         assert response.status_code == answer
@@ -289,6 +326,54 @@ class TestUpstreamHttpStatuses:
             body = response.json()
             assert body["code"] == code
             assert body["upstream_status"] == status
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", CONNECT_MODES)
+    @pytest.mark.parametrize("status", [401, 403])
+    async def test_a_registration_probe_refused_with_a_jsonrpc_error_body(
+        self, monkeypatch: pytest.MonkeyPatch, mode: str, status: int
+    ) -> None:
+        """An upstream's auth middleware may refuse with a JSON-RPC error body.
+
+        ``-32001`` is also the MCP SDK v2 client's own request-timeout code,
+        so classifying the body's code would call a refused credential a
+        slow start, and the caller would retry it forever. The status
+        decides: the refusal is a caller-fixable 422.
+        """
+        monkeypatch.setenv("GATEWAY_URL_GUARD_ALLOW_PRIVATE_RANGES", "true")
+        upstream = FailMethod(
+            _widgets_upstream().http_app(), "tools/list", status, jsonrpc_error=(-32001, "Unauthorized")
+        )
+        async with serve_http(upstream) as base:
+            gateway = GatewayServer({}, registration_token=REGISTRATION_TOKEN, upstream_client_mode=mode)
+            response = await self._register(gateway, f"{base}/mcp")
+
+        assert upstream.failed >= 1
+        assert response.status_code == 422
+        body = response.json()
+        assert body["code"] == "upstream_auth_failed"
+        assert body["upstream_status"] == status
+
+    @pytest.mark.asyncio
+    async def test_a_registration_probe_that_times_out_is_not_ready(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The client's own ``-32001`` for a probe that missed its read deadline stays a retryable 503."""
+        monkeypatch.setenv("GATEWAY_URL_GUARD_ALLOW_PRIVATE_RANGES", "true")
+
+        def short_deadline_client(target: Any, **kwargs: Any) -> Client:
+            return Client(target, timeout=0.2, **kwargs)
+
+        monkeypatch.setattr("fastmcp_gateway.client_manager.Client", short_deadline_client)
+        upstream = StallMethod(_widgets_upstream().http_app(), "tools/list")
+        async with serve_http(upstream) as base:
+            gateway = GatewayServer({}, registration_token=REGISTRATION_TOKEN)
+            response = await self._register(gateway, f"{base}/mcp")
+
+        assert upstream.stalled >= 1
+        assert response.status_code == 503
+        body = response.json()
+        assert body["code"] == "upstream_not_ready"
+        assert body["upstream_error_code"] == -32001
+        assert "upstream_status" not in body
 
 
 # ---------------------------------------------------------------------------

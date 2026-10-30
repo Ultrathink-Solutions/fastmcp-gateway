@@ -428,6 +428,9 @@ class UpstreamManager:
                     async with client:
                         mcp_tools = await client.list_tools()
                 except MCPError as exc:
+                    # A 401/403 decides before the registration boundary
+                    # classifies the JSON-RPC error code: the code a refusal
+                    # carries can also mean "not ready yet" (``-32001``).
                     failed = _exchange(client)
                     auth_failure = failed.auth_failure() if failed is not None else None
                     if auth_failure is not None:
@@ -840,11 +843,13 @@ class UpstreamManager:
                         )
                 except MCPError as exc:
                     exchange = _exchange(fresh_client)
-                    if exchange is not None and exchange.answered(exc):
-                        raise UpstreamJsonRpcError.from_error_data(exc.error) from exc
+                    # A 401/403 decides before any JSON-RPC error code does,
+                    # including one the upstream sent in the refusal's body.
                     auth_failure = exchange.auth_failure() if exchange is not None else None
                     if auth_failure is not None:
                         raise auth_failure from exc
+                    if exchange is not None and exchange.answered(exc):
+                        raise UpstreamJsonRpcError.from_error_data(exc.error) from exc
                     raise
 
     def _make_execution_client(

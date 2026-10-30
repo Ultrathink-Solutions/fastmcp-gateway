@@ -180,6 +180,26 @@ class TestHttpFailures:
         assert exchange.auth_failure() is None
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [401, 403])
+    @pytest.mark.parametrize("method", ["tools/list", "tools/call"])
+    async def test_a_refusal_with_a_jsonrpc_error_body_is_kept_without_an_auth_flow(
+        self, status: int, method: str
+    ) -> None:
+        # The SDK hands the body's JSON-RPC error to the session and drops the
+        # status, so the status is kept for the gateway's error boundary.
+        exchange = UpstreamExchange(observes_http=True)
+        sent = {"jsonrpc": "2.0", "id": 1, "method": method, "params": {}}
+        request = httpx2.Request("POST", "http://svc/mcp", content=json.dumps(sent).encode())
+        refusal = httpx2.Response(
+            status,
+            request=request,
+            json={"jsonrpc": "2.0", "id": 1, "error": {"code": -32001, "message": "Unauthorized"}},
+        )
+        await exchange.on_http_response(refusal)
+        failure = exchange.auth_failure()
+        assert failure is not None and failure.response.status_code == status
+
+    @pytest.mark.asyncio
     async def test_a_failed_request_raises(self) -> None:
         sent = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "widgets_get"}}
         with pytest.raises(httpx2.HTTPStatusError):
