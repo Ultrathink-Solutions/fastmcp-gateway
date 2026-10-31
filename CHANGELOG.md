@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **An upstream's 401 or 403 decides, whatever JSON-RPC error its body carries.** An upstream's auth middleware may refuse a request with a JSON-RPC error body, such as `-32001`. The MCP SDK v2 client hands that body to the session and drops the status, and the gateway kept the status only while an `httpx2.Auth` flow was active. A registration probe refused that way was therefore classified by the body's code, and `-32001` is also the client's own request-timeout code: the registration answered `503 upstream_not_ready`, and a registry controller retried a credential that would never work. The gateway now keeps a 401 or 403 for every request and raises it before any JSON-RPC error code is classified, so the registration answers `422 upstream_auth_failed` with `upstream_status`, and `execute_tool` answers `upstream_unauthorized` (or `upstream_insufficient_scope`) where it answered `upstream_error`. A probe that times out in the client still answers `503` with `upstream_error_code: -32001`.
+
 ## [0.35.0] - 2026-10-21
 
 ### Changed
