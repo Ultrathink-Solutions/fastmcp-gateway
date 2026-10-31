@@ -27,6 +27,8 @@ from fastmcp_gateway.hooks import ExecutionContext, ExecutionDenied, HookRunner,
 from fastmcp_gateway.signatures import declared_types, extract_params, tool_to_signature, type_admits
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     from fastmcp import FastMCP
 
     from fastmcp_gateway.client_manager import UpstreamManager
@@ -326,32 +328,74 @@ def register_meta_tools(
     if hook_runner is None:
         hook_runner = HookRunner()
 
-    async def _filter_tools(tools: list[ToolEntry], domain: str | None) -> list[ToolEntry]:
-        """Authenticate and apply ``after_list_tools`` hooks if any are registered."""
+    async def _caller_filter() -> Callable[[list[ToolEntry], str | None], Awaitable[list[ToolEntry]]]:
+        """Authenticate the caller once and return an ``after_list_tools`` filter bound to that identity.
+
+        A request that filters more than once runs every pass through the
+        returned function, so ``on_authenticate`` runs once per request, as
+        the ``Hook`` contract says, and every pass sees the same user.
+        Without hooks the returned filter passes tools through unchanged.
+        """
         if not hook_runner.has_hooks:
-            return tools
+
+            async def unfiltered(tools: list[ToolEntry], domain: str | None) -> list[ToolEntry]:
+                return tools
+
+            return unfiltered
+
         from fastmcp_gateway.client_manager import get_user_headers
 
         headers = get_user_headers()
         user = await hook_runner.run_authenticate(headers)
-        ctx = ListToolsContext(domain=domain, headers=headers, user=user)
-        return await hook_runner.run_after_list_tools(tools, ctx)
 
-    async def _visible_tool_names() -> list[str]:
+        async def filtered(tools: list[ToolEntry], domain: str | None) -> list[ToolEntry]:
+            ctx = ListToolsContext(domain=domain, headers=headers, user=user)
+            return await hook_runner.run_after_list_tools(tools, ctx)
+
+        return filtered
+
+    async def _filter_tools(tools: list[ToolEntry], domain: str | None) -> list[ToolEntry]:
+        """Authenticate and apply ``after_list_tools`` hooks, for a request that filters once."""
+        return await (await _caller_filter())(tools, domain)
+
+    async def _visible_tool_names(
+        caller_filter: Callable[[list[ToolEntry], str | None], Awaitable[list[ToolEntry]]],
+    ) -> list[str]:
         """Return the sorted list of tool names visible to the caller.
 
-        Collects every registered tool, routes them through the same
-        ``_filter_tools`` closure that ``discover_tools`` uses for the
-        domain-summary mode, and returns just the names. This keeps the
-        fuzzy-match "did you mean" suggestion surface aligned with the
-        tools/list visibility filter so a caller with narrow scopes can
-        never probe the full registry via garbage tool-name lookups.
+        Collects every registered tool, filters them as the
+        ``discover_tools`` domain summary does (``ListToolsContext.domain``
+        unset), and returns just the names. This keeps the fuzzy-match
+        "did you mean" suggestion surface aligned with the tools/list
+        visibility filter so a caller with narrow scopes can never probe
+        the full registry via garbage tool-name lookups. *caller_filter*
+        is the request's filter, so a request that already filtered does
+        not authenticate again.
         """
         all_tools: list[ToolEntry] = []
         for d in registry.get_domain_names():
             all_tools.extend(registry.get_tools_by_domain(d))
-        visible = await _filter_tools(all_tools, None)
+        visible = await caller_filter(all_tools, None)
         return sorted(t.name for t in visible)
+
+    async def _visible_domain_names(
+        caller_filter: Callable[[list[ToolEntry], str | None], Awaitable[list[ToolEntry]]],
+        rejected: str,
+    ) -> list[str]:
+        """Return the sorted names of the domains a ``discover_tools(domain=...)`` lookup accepts for the caller.
+
+        Each domain is filtered on its own, with ``ListToolsContext.domain``
+        set to it as that lookup sets it, so a ``domain_not_found`` answer
+        never offers a domain the lookup would reject. *caller_filter* is
+        the request's filter, so the caller is authenticated once however
+        many domains there are. *rejected* is the domain the lookup just
+        rejected; it is never offered.
+        """
+        names: list[str] = []
+        for d in registry.get_domain_names():
+            if d != rejected and await caller_filter(registry.get_tools_by_domain(d), d):
+                names.append(d)
+        return sorted(names)
 
     @mcp.tool(
         annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
@@ -418,9 +462,9 @@ def register_meta_tools(
         `name` and `description`, plus its `domain` and `group` where your request did not already fix
         them. An empty listing means no tool matched.
 
-        An unknown `domain` or `group` returns `{"error": "...", "code": "domain_not_found"}` (or
-        `"group_not_found"`), with the valid names in `details.available_domains` (or
-        `details.available_groups`).
+        An unknown `domain` or `group`, or one with no tool you can use, returns
+        `{"error": "...", "code": "domain_not_found"}` (or `"group_not_found"`), with the valid names
+        in `details.available_domains` (or `details.available_groups`).
         """
         with _tracer.start_as_current_span("gateway.discover_tools") as span:
             if domain:
@@ -488,9 +532,16 @@ def register_meta_tools(
                     }
                 )
 
-            # Validate domain
-            if not registry.has_domain(domain):
-                available = registry.get_domain_names()
+            # Modes 2 and 3 answer from the domain as the caller sees it, as
+            # the summary does: a domain (or group) whose tools the hooks
+            # hide entirely does not exist for this caller. One filter
+            # serves every pass, so the caller is authenticated once.
+            caller_filter = await _caller_filter()
+            visible = (
+                await caller_filter(registry.get_tools_by_domain(domain), domain) if registry.has_domain(domain) else []
+            )
+            if not visible:
+                available = await _visible_domain_names(caller_filter, domain)
                 span.set_attribute("gateway.error_code", "domain_not_found")
                 return _gateway_error_result(
                     "domain_not_found",
@@ -503,8 +554,9 @@ def register_meta_tools(
 
             # Mode 3: domain + group -> tools in that group
             if group is not None:
-                if not registry.has_group(domain, group):
-                    available_groups = registry.get_groups_for_domain(domain)
+                tools = [t for t in visible if t.group == group]
+                if not tools:
+                    available_groups = sorted({t.group for t in visible})
                     span.set_attribute("gateway.error_code", "group_not_found")
                     msg = (
                         f"Unknown group '{group}' in domain '{domain}'. Available groups: {', '.join(available_groups)}"
@@ -516,7 +568,6 @@ def register_meta_tools(
                         group=group,
                         available_groups=available_groups,
                     )
-                tools = await _filter_tools(registry.get_tools_by_group(domain, group), domain)
                 span.set_attribute("gateway.result_count", len(tools))
                 if format == "signatures":
                     return _prose_result(_signatures_block(tools))
@@ -529,7 +580,7 @@ def register_meta_tools(
                 )
 
             # Mode 2: domain only -> all tools in domain
-            tools = await _filter_tools(registry.get_tools_by_domain(domain), domain)
+            tools = visible
             span.set_attribute("gateway.result_count", len(tools))
             if format == "signatures":
                 return _prose_result(_signatures_block(tools))
@@ -577,10 +628,13 @@ def register_meta_tools(
         with _tracer.start_as_current_span("gateway.get_tool_schema") as span:
             span.set_attribute("gateway.tool_name", tool_name)
 
+            # One filter serves the visibility check and the suggestions,
+            # so the caller is authenticated once.
+            caller_filter = await _caller_filter()
             entry = registry.lookup(tool_name)
             if entry is not None:
                 # Verify the tool is visible after hook filtering.
-                filtered = await _filter_tools([entry], entry.domain)
+                filtered = await caller_filter([entry], entry.domain)
                 if not filtered:
                     entry = None  # Treat as not found
 
@@ -597,7 +651,7 @@ def register_meta_tools(
                 )
 
             # Unknown tool (or filtered out) — suggest similar names
-            suggestions = _suggest_tool_names(tool_name, await _visible_tool_names())
+            suggestions = _suggest_tool_names(tool_name, await _visible_tool_names(caller_filter))
             if suggestions:
                 hint = f"Did you mean {', '.join(repr(s) for s in suggestions)}?"
             else:
@@ -700,7 +754,7 @@ def register_meta_tools(
             # Validate tool exists
             entry = registry.lookup(tool_name)
             if entry is None:
-                suggestions = _suggest_tool_names(tool_name, await _visible_tool_names())
+                suggestions = _suggest_tool_names(tool_name, await _visible_tool_names(await _caller_filter()))
                 if suggestions:
                     hint = f"Did you mean {', '.join(repr(s) for s in suggestions)}?"
                 else:

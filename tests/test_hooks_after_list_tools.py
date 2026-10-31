@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 from unittest.mock import patch
 
+import pytest
 from fastmcp import Client, FastMCP
 
 from fastmcp_gateway.client_manager import UpstreamManager
@@ -253,6 +254,145 @@ class TestDiscoverToolsWithFilter:
         assert "malloy" not in domain_names
         assert "apollo" in domain_names
         assert data["total_tools"] == 2
+
+
+class _HideAllMalloy:
+    """Hook that hides every malloy tool, as an authorization hook does for a domain the caller may not use."""
+
+    async def after_list_tools(self, tools: list[ToolEntry], context: ListToolsContext) -> list[ToolEntry]:
+        return [t for t in tools if t.domain != "malloy"]
+
+
+class _HideApolloOrganizations:
+    """Hook that hides every tool of apollo's ``organizations`` group."""
+
+    async def after_list_tools(self, tools: list[ToolEntry], context: ListToolsContext) -> list[ToolEntry]:
+        return [t for t in tools if (t.domain, t.group) != ("apollo", "organizations")]
+
+
+@pytest.mark.asyncio
+class TestDiscoverToolsHiddenDomains:
+    """A domain or group whose tools are all filtered out does not exist for the caller.
+
+    The no-argument summary already leaves such a domain out; naming it
+    explicitly must not answer an empty listing instead.
+    """
+
+    @pytest.mark.parametrize("fmt", ["signatures", "schema"])
+    async def test_a_fully_filtered_domain_is_not_found(self, fmt: str) -> None:
+        mcp = _make_mcp_with_hook(_HideAllMalloy())
+        data = await _call_discover(mcp, domain="malloy", format=fmt)
+
+        assert data["code"] == "domain_not_found"
+        assert data["details"]["available_domains"] == ["apollo"]
+
+    async def test_a_group_of_a_fully_filtered_domain_is_not_found(self) -> None:
+        mcp = _make_mcp_with_hook(_HideAllMalloy())
+        data = await _call_discover(mcp, domain="malloy", group="general")
+
+        assert data["code"] == "domain_not_found"
+
+    async def test_an_unknown_domain_lists_only_the_domains_the_caller_sees(self) -> None:
+        mcp = _make_mcp_with_hook(_HideAllMalloy())
+        data = await _call_discover(mcp, domain="nope")
+
+        assert data["code"] == "domain_not_found"
+        assert data["details"]["available_domains"] == ["apollo"]
+        assert "malloy" not in data["error"]
+
+    async def test_a_fully_filtered_group_is_not_found(self) -> None:
+        mcp = _make_mcp_with_hook(_HideApolloOrganizations())
+        data = await _call_discover(mcp, domain="apollo", group="organizations")
+
+        assert data["code"] == "group_not_found"
+        assert data["details"]["available_groups"] == ["people"]
+
+    async def test_a_partly_filtered_domain_still_lists_what_is_visible(self) -> None:
+        mcp = _make_mcp_with_hook(_HideApolloOrganizations())
+        data = await _call_discover(mcp, domain="apollo", format="schema")
+
+        assert [t["name"] for t in data["tools"]] == ["apollo_people_search"]
+
+    @pytest.mark.parametrize("requested", ["malloy", "nope"])
+    async def test_available_domains_are_judged_as_a_domain_lookup_sees_them(self, requested: str) -> None:
+        """A domain hidden only when listed by name is not offered: the lookup would reject it."""
+        mcp = _make_mcp_with_hook(_HideMalloyWhenListedByName())
+        data = await _call_discover(mcp, domain=requested)
+
+        assert data["code"] == "domain_not_found"
+        assert data["details"]["available_domains"] == ["apollo"]
+
+
+class _HideMalloyWhenListedByName:
+    """Hook that hides malloy's tools only when the listing names malloy (``ListToolsContext.domain``)."""
+
+    async def after_list_tools(self, tools: list[ToolEntry], context: ListToolsContext) -> list[ToolEntry]:
+        return [] if context.domain == "malloy" else tools
+
+
+class _CountingAuthHideMalloy:
+    """Hook that counts ``on_authenticate`` calls, answers a new user each time, and records each pass's user."""
+
+    def __init__(self) -> None:
+        self.users_issued: list[dict[str, int]] = []
+        self.users_seen: list[Any] = []
+
+    async def on_authenticate(self, headers: dict[str, str]) -> dict[str, int]:
+        user = {"call": len(self.users_issued) + 1}
+        self.users_issued.append(user)
+        return user
+
+    async def after_list_tools(self, tools: list[ToolEntry], context: ListToolsContext) -> list[ToolEntry]:
+        self.users_seen.append(context.user)
+        return [] if context.domain == "malloy" else tools
+
+
+@pytest.mark.asyncio
+class TestDiscoverToolsAuthenticatesOnce:
+    """``on_authenticate`` runs once per ``discover_tools`` request, and every filtering pass reuses that user."""
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            pytest.param({}, id="summary"),
+            pytest.param({"query": "search"}, id="search"),
+            pytest.param({"domain": "apollo"}, id="domain"),
+            pytest.param({"domain": "apollo", "group": "people"}, id="group"),
+            pytest.param({"domain": "apollo", "group": "nope"}, id="group-not-found"),
+            pytest.param({"domain": "malloy"}, id="hidden-domain-not-found"),
+            pytest.param({"domain": "nope"}, id="unknown-domain-not-found"),
+        ],
+    )
+    async def test_one_authentication_per_request(self, kwargs: dict[str, str]) -> None:
+        hook = _CountingAuthHideMalloy()
+        mcp = _make_mcp_with_hook(hook)
+        await _call_discover(mcp, format="schema", **kwargs)
+
+        assert len(hook.users_issued) == 1
+        assert hook.users_seen
+        assert all(user is hook.users_issued[0] for user in hook.users_seen)
+
+
+@pytest.mark.asyncio
+class TestGetToolSchemaAuthenticatesOnce:
+    """``on_authenticate`` runs once per ``get_tool_schema`` request, and every filtering pass reuses that user."""
+
+    @pytest.mark.parametrize(
+        "tool_name",
+        [
+            pytest.param("apollo_people_search", id="visible-tool"),
+            pytest.param("malloy_executeQuery", id="hidden-tool"),
+            pytest.param("no_such_tool", id="unknown-tool"),
+        ],
+    )
+    async def test_one_authentication_per_request(self, tool_name: str) -> None:
+        hook = _CountingAuthHideMalloy()
+        mcp = _make_mcp_with_hook(hook)
+        await _call_get_schema(mcp, tool_name)
+
+        assert len(hook.users_issued) == 1
+        assert hook.users_seen
+        assert all(user is hook.users_issued[0] for user in hook.users_seen)
 
 
 class TestGetToolSchemaWithFilter:
