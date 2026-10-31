@@ -302,7 +302,7 @@ class TestUpstreamHttpStatuses:
             pytest.param("tools/list", 401, 422, "upstream_auth_failed", id="401-auth"),
             pytest.param(None, 404, 503, "upstream_not_ready", id="404-not-mounted"),
             pytest.param("tools/list", 503, 503, "upstream_not_ready", id="503-no-backend"),
-            pytest.param("tools/list", 500, 500, None, id="500-failure"),
+            pytest.param("tools/list", 500, 502, "registration_failed", id="500-failure"),
         ],
     )
     async def test_a_refused_registration_probe(

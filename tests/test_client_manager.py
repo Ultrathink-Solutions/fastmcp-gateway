@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -118,6 +119,96 @@ class TestPopulateAll:
         # Only the second upstream succeeded
         assert len(results) == 1
         assert registry.tool_count == 3
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("operation", ["populate_all", "refresh_all"])
+    async def test_a_failed_upstream_logs_one_error_line_and_the_traceback_at_debug(
+        self,
+        registry: ToolRegistry,
+        upstreams: dict[str, str],
+        caplog: pytest.LogCaptureFixture,
+        operation: str,
+    ) -> None:
+        """Each failed upstream is one ERROR line naming it and its failure; the traceback is DEBUG."""
+        failing = next(iter(upstreams.keys()))
+
+        def make_client(url: str, **_client_kwargs: Any) -> MagicMock:
+            domain = next(d for d, u in upstreams.items() if u == url)
+            client = AsyncMock()
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=None)
+            if domain == failing:
+                client.list_tools = AsyncMock(side_effect=ConnectionError("unreachable\nsecond line"))
+            else:
+                client.list_tools = AsyncMock(return_value=_make_fake_tools(domain))
+            return client
+
+        with patch("fastmcp_gateway.client_manager.Client", side_effect=make_client):
+            manager = UpstreamManager(upstreams, registry)
+            with caplog.at_level(logging.DEBUG, logger="fastmcp_gateway.client_manager"):
+                await getattr(manager, operation)()
+
+        errors = [record for record in caplog.records if record.levelno >= logging.ERROR]
+        assert len(errors) == 1
+        message = errors[0].getMessage()
+        assert failing in message
+        assert "ConnectionError: unreachable" in message
+        assert "\n" not in message
+        assert errors[0].exc_info is None
+        assert "Traceback (most recent call last)" not in caplog.text
+        frames = [record.getMessage() for record in caplog.records if record.levelno == logging.DEBUG]
+        assert len(frames) == 1
+        assert "ConnectionError" in frames[0]
+        assert "_populate_domain" in frames[0]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("operation", ["populate_all", "refresh_all"])
+    async def test_the_debug_traceback_carries_frames_but_no_credential(
+        self,
+        registry: ToolRegistry,
+        upstreams: dict[str, str],
+        caplog: pytest.LogCaptureFixture,
+        operation: str,
+    ) -> None:
+        """At DEBUG a failed upstream is its summary, exception types and frames, all sanitized, never a raw message.
+
+        The raising line holds the credentials literally, since a frame shows
+        its line's source; the assertions read the formatted log text.
+        """
+        failing = next(iter(upstreams.keys()))
+        jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.c2lnbmF0dXJlLXZhbHVl"
+
+        async def _list_tools_refused(*_args: Any, **_kwargs: Any) -> list[FakeTool]:
+            raise ConnectionError(f"{jwt} https://user:password@example.com/token-value Authorization: Bearer abc.def")
+
+        def make_client(url: str, **_client_kwargs: Any) -> MagicMock:
+            domain = next(d for d, u in upstreams.items() if u == url)
+            client = AsyncMock()
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=None)
+            if domain == failing:
+                client.list_tools = _list_tools_refused
+            else:
+                client.list_tools = AsyncMock(return_value=_make_fake_tools(domain))
+            return client
+
+        with patch("fastmcp_gateway.client_manager.Client", side_effect=make_client):
+            manager = UpstreamManager(upstreams, registry)
+            with caplog.at_level(logging.DEBUG, logger="fastmcp_gateway.client_manager"):
+                await getattr(manager, operation)()
+
+        for leak in ("abc.def", *jwt.split("."), "user:password", "password@", "token-value"):
+            assert leak not in caplog.text, f"{leak!r} leaked into the log"
+        debug = [record.getMessage() for record in caplog.records if record.levelno == logging.DEBUG]
+        assert len(debug) == 1
+        for expected in (
+            "[REDACTED]",
+            "https://example.com",
+            "ConnectionError",
+            "_list_tools_refused",
+            "_populate_domain",
+        ):
+            assert expected in debug[0], f"{expected!r} missing from {debug[0]!r}"
 
 
 # ---------------------------------------------------------------------------

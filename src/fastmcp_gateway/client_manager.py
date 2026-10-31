@@ -38,7 +38,12 @@ from opentelemetry import trace
 from pydantic import BaseModel, ConfigDict
 
 from fastmcp_gateway._upstream_session import ObservedTransport, UpstreamExchange, observable
-from fastmcp_gateway.errors import RegistrationSelectionError, UpstreamJsonRpcError
+from fastmcp_gateway.errors import (
+    RegistrationSelectionError,
+    UpstreamJsonRpcError,
+    _failure_summary,
+    _failure_traceback,
+)
 from fastmcp_gateway.registration import (
     RegistrationChange,
     RegistrationCommitHook,
@@ -136,6 +141,27 @@ def _exchange(client: Client) -> UpstreamExchange | None:
     """The record of *client*'s latest connection, when its transport is observed."""
     transport: Any = client.transport
     return transport.exchange if isinstance(transport, ObservedTransport) else None
+
+
+def _log_upstream_failure(action: str, domain: str, exc: BaseException) -> None:
+    """Log one ERROR line for an upstream a pass skipped, with its stack frames at DEBUG.
+
+    Startup and every background refresh pass call this once per failed
+    upstream; a traceback per upstream per pass buries which upstream
+    failed and why. Neither line carries an unredacted exception message
+    (see :func:`~fastmcp_gateway.errors._failure_traceback`): an
+    upstream's error text can carry a credential.
+    """
+    summary, error_count = _failure_summary(exc)
+    logger.error(
+        "Failed to %s upstream '%s' — skipping: %s",
+        action,
+        domain,
+        summary,
+        extra={"error_count": error_count},
+    )
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug("Failure to %s upstream '%s': %s", action, domain, _failure_traceback(exc))
 
 
 async def _settle_task(task: asyncio.Task[Any]) -> Any:
@@ -361,8 +387,8 @@ class UpstreamManager:
                     diff = await self._populate_domain(domain, client)
                     results[domain] = diff.tool_count
                     logger.info("Populated %d tools from upstream '%s'", diff.tool_count, domain)
-                except Exception:
-                    logger.exception("Failed to populate upstream '%s' — skipping", domain)
+                except Exception as exc:
+                    _log_upstream_failure("populate", domain, exc)
             span.set_attribute("gateway.domain_count", len(results))
             span.set_attribute("gateway.total_tools", sum(results.values()))
             return results
@@ -737,8 +763,8 @@ class UpstreamManager:
                     client = self._registry_clients[domain]
                     diff = await self._populate_domain(domain, client)
                     diffs.append(diff)
-                except Exception:
-                    logger.exception("Failed to refresh upstream '%s' — skipping", domain)
+                except Exception as exc:
+                    _log_upstream_failure("refresh", domain, exc)
             span.set_attribute("gateway.domain_count", len(diffs))
             return diffs
 

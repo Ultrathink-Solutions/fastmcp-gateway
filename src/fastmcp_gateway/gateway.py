@@ -21,7 +21,14 @@ from fastmcp_gateway.client_manager import (
     UpstreamManager,
     validate_upstream_client_mode,
 )
-from fastmcp_gateway.errors import _find_upstream_response, _walk_wrapped_exceptions
+from fastmcp_gateway.errors import (
+    _failure_identity,
+    _failure_summary,
+    _failure_traceback,
+    _find_upstream_response,
+    _scrub_url_for_diagnostics,
+    _walk_wrapped_exceptions,
+)
 from fastmcp_gateway.hooks import HookRunner
 from fastmcp_gateway.output_guard import OutputGuardConfig, OutputGuardHook
 from fastmcp_gateway.registration import RegistrationIdentity
@@ -207,56 +214,6 @@ def _not_ready_discriminators(failure: BaseException) -> dict[str, int]:
 # ``Retry-After`` header value. Matches the registry-controller's default
 # poll interval — a single missed cycle, then back to the normal rhythm.
 _UPSTREAM_RETRY_AFTER_SECONDS = 5
-
-
-def _scrub_url_for_diagnostics(url: str) -> str:
-    """Return *url* with userinfo, query, and fragment removed.
-
-    Registration error responses and log lines echo the failing URL
-    back to the caller so operators can disambiguate which upstream
-    triggered the error. Some URL shapes carry secrets in those
-    components (basic-auth in userinfo, signed-URL tokens in the
-    query string), so we strip them before they reach a log
-    aggregator or a JSON response body. Only ``scheme://host[:port]
-    /path`` survives — enough to identify the upstream, never enough
-    to replay against it.
-
-    Malformed URLs that fail to parse fall back to the literal
-    ``"<unparseable-url>"`` placeholder so we never leak the raw
-    string by accident.
-    """
-    from urllib.parse import urlsplit, urlunsplit
-
-    try:
-        parts = urlsplit(url)
-    except ValueError:
-        return "<unparseable-url>"
-
-    if not parts.scheme or not parts.hostname:
-        return "<unparseable-url>"
-
-    host = parts.hostname
-    # IPv6 hosts come back from ``urlsplit`` without their brackets
-    # (``[::1]:80`` → host ``"::1"``). The bracketing must be
-    # restored before composing netloc, or downstream parsers would
-    # misread the embedded colons as port separators. Detect IPv6 by
-    # the presence of a colon in the host string.
-    bracketed_host = f"[{host}]" if ":" in host else host
-
-    # ``parts.port`` accesses an underlying property that raises
-    # ``ValueError`` when the URL carries a non-numeric or
-    # out-of-range port string (e.g. ``http://h:abc/``). Treat that as
-    # "no port" rather than letting the exception propagate — the
-    # scrubber's contract is to never raise on caller-supplied input.
-    try:
-        port = parts.port
-    except ValueError:
-        port = None
-
-    netloc = f"{bracketed_host}:{port}" if port is not None else bracketed_host
-
-    # urlunsplit signature: (scheme, netloc, path, query, fragment)
-    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
 
 
 class CodeModeAuthorizerRequiredError(ValueError):
@@ -1083,13 +1040,19 @@ class GatewayServer:
             #     corrects the auth posture.  We return ``422
             #     Unprocessable Entity`` so the caller logs once and
             #     stops hammering the endpoint.
-            #   * Anything else — actual internal error.  Falls through
-            #     to the generic ``500`` path with the original
-            #     exception logged.
+            #   * Anything else — a genuine failure (the upstream
+            #     answered with another error status or a listing the
+            #     client cannot read, or registration itself failed).
+            #     We return ``502 Bad Gateway`` classified as
+            #     ``registration_failed``, naming the failures by type
+            #     and URL host only, and log one ERROR line with the
+            #     message, credentials redacted (its stack frames at
+            #     DEBUG, never a raw message): the caller retries on every
+            #     reconcile pass, and a traceback per pass buries what
+            #     failed.
             #
-            # Reserving 500 for true internal errors lets controllers
-            # treat 5xx-but-503 as escalation-worthy and 503 as expected
-            # boot-window noise.
+            # Keeping 503 for startup noise lets controllers treat any
+            # other 5xx as escalation-worthy.
             try:
                 # The manager serializes same-domain transitions and final
                 # publication. Keep probe I/O and admitted-call draining out
@@ -1147,9 +1110,9 @@ class GatewayServer:
                 # by its outermost type.
                 not_ready = _find_not_ready_failure(exc)
                 if not_ready is not None:
-                    # Scrub userinfo / query / fragment off the URL before
-                    # it lands in logs or in the response body — some URL
-                    # shapes carry secrets in those components.
+                    # Cut the URL to scheme://host[:port] before it lands
+                    # in logs or in the response body: userinfo, path and
+                    # query can each carry a secret.
                     safe_url = _scrub_url_for_diagnostics(discovery_url or url)
                     discriminators = _not_ready_discriminators(not_ready)
                     not_ready_status = discriminators.get("upstream_status")
@@ -1185,15 +1148,37 @@ class GatewayServer:
                     )
                 upstream_response = _find_upstream_response(exc)
                 upstream_status = None if upstream_response is None else upstream_response.status_code
+                safe_url = _scrub_url_for_diagnostics(discovery_url or url)
                 # Only 401/403 from the upstream maps to a caller-fixable
                 # auth-config error. Anything else (a genuine upstream
                 # 500, a request the upstream rejects, an internal
-                # failure) falls through to the generic 500 handler so it
-                # surfaces as escalation-worthy rather than as "stop
+                # failure) is a 502, escalation-worthy rather than "stop
                 # hammering this".
                 if upstream_status not in _UPSTREAM_AUTH_STATUSES:
-                    raise
-                safe_url = _scrub_url_for_diagnostics(discovery_url or url)
+                    # The log line keeps the message, credentials redacted;
+                    # the body names the failure by type and URL hosts only,
+                    # since an upstream's error text can carry a credential.
+                    summary, error_count = _failure_summary(exc)
+                    identity = _failure_identity(exc)
+                    logger.error(
+                        "Registration of upstream '%s' (%s) failed: %s",
+                        domain,
+                        safe_url,
+                        summary,
+                        extra={"upstream_status": upstream_status, "error_count": error_count},
+                    )
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug("Registration failure for upstream '%s': %s", domain, _failure_traceback(exc))
+                    return JSONResponse(
+                        {
+                            "error": f"Registering upstream '{domain}' at '{safe_url}' failed: {identity}",
+                            "code": "registration_failed",
+                            "domain": domain,
+                            "error_count": error_count,
+                            **({} if upstream_status is None else {"upstream_status": upstream_status}),
+                        },
+                        status_code=502,
+                    )
                 logger.warning(
                     "Upstream '%s' (%s) rejected discovery probe with status %s — caller-fixable",
                     domain,
