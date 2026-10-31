@@ -19,9 +19,12 @@ from __future__ import annotations
 import logging
 import re
 import unicodedata
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from fastmcp_gateway.injection_patterns import INJECTION_FLAGS, INJECTION_PATTERNS
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 logger = logging.getLogger(__name__)
 
@@ -240,20 +243,21 @@ class _PhysicalRecursionExceeded(SchemaValidationError):
     A :class:`SchemaValidationError` subclass, so the registry's
     per-tool ingest loop keeps skipping just the offending tool and the
     fail-closed contract is unchanged. It exists as a distinct type so
-    the rejection *reason* stays truthful: a schema that chains more
-    wrapper levels than the traversal will follow is not the same
-    defect as one that nests deeper than the logical cap, and the
-    operator reading the audit log should not be handed a nesting-depth
-    number that doesn't appear anywhere in their schema.
+    the rejection *reason* stays truthful: a schema whose raw JSON nests
+    deeper than the traversal will follow (through wrappers that cost no
+    level of data, such as a chain of ``items``) is not the same defect
+    as one that nests deeper than the cap in data, and the operator
+    reading the audit log should not be handed a nesting depth that
+    describes neither.
     """
 
 
-# Depth at which schema recursion is considered pathological. Legitimate
-# MCP tool schemas almost never exceed 3 levels of nesting
-# (``properties.foo.items.properties.bar`` is already depth 4). A cap of
-# 5 accommodates edge cases without giving adversaries room to build
-# gigantic nested structures designed to exhaust the sandbox's type
-# renderer.
+# Depth at which schema nesting is considered pathological. Depth counts
+# levels of data (see :func:`_schema_depth`): a flat object of scalar
+# fields measures 2, and each level of fields nested inside another adds 1,
+# so ``{"a": {"b": {"c": str}}}`` measures 4. A cap of 5 accommodates edge
+# cases without giving adversaries room to build gigantic nested structures
+# designed to exhaust the sandbox's type renderer.
 #
 # Deliberately not in ``__all__``: ``GatewayServer`` remains the only
 # public API surface. These names exist so the internal call chain (and
@@ -261,77 +265,38 @@ class _PhysicalRecursionExceeded(SchemaValidationError):
 # in four places.
 DEFAULT_MAX_SCHEMA_DEPTH = 5
 
-# Upper ceiling any caller may configure *max_depth* to. Generous relative
-# to the "3-4 levels is typical" reasoning behind DEFAULT_MAX_SCHEMA_DEPTH
-# -- no legitimate schema should ever need to approach it -- but bounded
-# well below the point at which the ingest-time depth/$ref recursion
-# itself becomes a stack-overflow risk on adversarial input (measured
-# uncaught RecursionError from a few hundred levels of plain nesting in
-# this recursion-limit environment). Enforced at every site that accepts
-# a caller-supplied depth via :func:`_validate_max_schema_depth`.
+# Upper ceiling any caller may configure *max_depth* to, and the furthest
+# :func:`validate_input_schema` measures a schema's depth: a rejection
+# names the depth it measured, up to this ceiling. Generous relative to
+# the default -- no legitimate schema should ever need to approach it.
+# Enforced at every site that accepts a caller-supplied depth via
+# :func:`_validate_max_schema_depth`.
 MAX_ALLOWED_SCHEMA_DEPTH = 50
 
-# JSON-Schema keys that encode a union of alternative schemas. Pydantic (and
-# most JSON-Schema generators) emit ``anyOf`` for ``Optional[X]`` /
-# ``X | None``; ``oneOf`` is JSON Schema's mutually-exclusive-union sibling
-# and is treated identically here since the null-optionality shape is the
-# same either way.
-_UNION_KEYS = ("anyOf", "oneOf")
+# Keywords whose value holds the schemas of the SAME level of data as the
+# schema that carries them: the elements of an array (``items``, and
+# ``prefixItems`` for a tuple's positions) and alternatives or parts of the
+# same value (``anyOf``, ``oneOf``, ``allOf``). Their wrappers add no depth.
+# ``properties`` is handled on its own: its map is no level either, but
+# each field it names is one level below the object that carries it.
+_SAME_LEVEL_KEYWORDS = frozenset({"items", "prefixItems", "anyOf", "oneOf", "allOf"})
 
-# Hard ceiling on REAL recursive call count, independent of the logical
-# depth cap. The optional-union transparency below deliberately recurses
-# into a wrapper's non-null member WITHOUT advancing the logical ``depth``
-# counter -- so a schema built entirely from chained
-# ``{"anyOf": [<inner>, {"type": "null"}]}`` wrappers around a single leaf
-# can climb arbitrarily many real Python stack frames while ``depth`` never
-# exceeds the cap, defeating the ``depth > max_depth`` bail-out below and
-# eventually raising an uncaught ``RecursionError`` deep inside registry
-# population -- an exception the per-tool ``except SchemaValidationError``
-# catch in ``ToolRegistry.populate_domain`` does NOT catch, so it would
-# abort the whole domain's registration instead of just skipping the one
-# malformed tool. This counter increments on EVERY recursive call,
-# transparent or not, and is checked independently of ``depth``. It must
-# stay comfortably above MAX_ALLOWED_SCHEMA_DEPTH, or it would pre-empt
-# the logical cap for a legitimately deep schema at a raised
-# max_schema_depth; 100 clears the ceiling of 50 by 2x while leaving ample
-# headroom under Python's default recursion limit (~1000).
+# Hard ceiling on the RAW JSON depth the traversal follows, independent of
+# the depth cap. Wrappers cost no depth (above), so depth alone cannot bound
+# the real recursion: a chain of ``items`` (or of ``anyOf`` members) around
+# one leaf keeps the depth at 1 or 2 while each level is one more Python
+# stack frame. Past Python's default recursion limit that would raise an
+# uncaught ``RecursionError`` inside registry population -- an exception
+# the per-tool ``except SchemaValidationError`` catch in
+# ``ToolRegistry.populate_domain`` does NOT catch, so it would abort the
+# whole domain's registration instead of skipping the one malformed tool.
+# The traversal counts every dict and list it enters, wrapper or not, and
+# rejects the schema past this many. It must stay well above
+# MAX_ALLOWED_SCHEMA_DEPTH: a field level costs two raw levels (the
+# ``properties`` map and the field's schema), so 100 still admits a schema
+# of nested fields at the depth ceiling, while leaving ample headroom under
+# Python's default recursion limit (~1000).
 _MAX_PHYSICAL_RECURSION = 100
-
-
-def _is_null_schema(node: Any) -> bool:
-    """Strict test for the JSON-Schema null-type sentinel ``{"type": "null"}``.
-
-    Matches ONLY a dict whose single key is ``"type"`` with value
-    ``"null"`` -- the exact shape Pydantic (and most JSON-Schema
-    generators) emit for the null branch of ``Optional[X]``. A dict
-    that additionally carries annotation keys (``title``,
-    ``description``, a sibling ``default``, ...) alongside
-    ``"type": "null"`` does NOT match. This is the strictest reading of
-    "the null member": a schema author who attached an explicit
-    annotation to the null branch presumably wants it treated as
-    meaningful structure, not silently made transparent.
-    """
-    return isinstance(node, dict) and node == {"type": "null"}
-
-
-def _optional_wrapper_target(members: Any) -> Any | None:
-    """Return the sole non-null member of a 2-member null union, else ``None``.
-
-    *members* is the raw value of an ``anyOf``/``oneOf`` key. Returns
-    the other member when *members* is a list of exactly two schemas,
-    exactly one of which is :func:`_is_null_schema`. Any other shape —
-    not a list, not exactly 2 items, zero null members, or two null
-    members — returns ``None``, and the caller falls back to counting
-    the union normally. This deliberately narrow match means a
-    3+-branch union (``Union[A, B, None]``) or a union with no null
-    member is never treated as an optionality wrapper.
-    """
-    if not isinstance(members, list) or len(members) != 2:
-        return None
-    null_flags = [_is_null_schema(m) for m in members]
-    if sum(null_flags) != 1:
-        return None
-    return members[1] if null_flags[0] else members[0]
 
 
 def _validate_max_schema_depth(value: object, *, param: str = "max_schema_depth") -> int:
@@ -360,13 +325,7 @@ def _validate_max_schema_depth(value: object, *, param: str = "max_schema_depth"
     return value
 
 
-def _contains_ref(
-    node: Any,
-    depth: int = 0,
-    *,
-    max_depth: int = DEFAULT_MAX_SCHEMA_DEPTH,
-    physical_depth: int = 0,
-) -> bool:
+def _contains_ref(node: Any, physical_depth: int = 0) -> bool:
     """Recursively check whether any dict in *node* contains a ``$ref`` key.
 
     ``$ref`` is rejected outright: resolving it requires fetching an
@@ -375,166 +334,120 @@ def _contains_ref(
     sandbox type renderer reads the schema. Static inline schemas are
     strictly more auditable.
 
-    Recurses through an ``Optional[X]`` union (see :func:`_schema_depth`)
-    at the SAME logical *depth* as its wrapper dict, mirroring the
-    depth-counting transparency below. *physical_depth*, in contrast,
-    increments on EVERY recursive call including transparent ones -- see
-    :data:`_MAX_PHYSICAL_RECURSION` for why a second, always-advancing
-    counter is required and cannot be replaced by *depth* alone. The null
-    member itself is never checked for ``$ref`` because
-    :func:`_is_null_schema` only matches the fixed, ref-free shape
-    ``{"type": "null"}``.
+    Walks every dict and list, so a field map naming a property ``$ref``
+    counts too. *physical_depth* is the raw JSON depth, counted exactly as
+    :func:`_schema_depth` counts it, so a schema that passed the depth
+    check is explored completely. Past :data:`_MAX_PHYSICAL_RECURSION` it
+    fails closed: an unexplored subtree is treated as containing a
+    ``$ref``, so a caller that skips the depth check (or runs it after this
+    one) can never admit a hidden ``$ref`` or hit a ``RecursionError``.
     """
-    if depth > max_depth:
-        # Fail closed: conservatively treat an unexplored subtree as
-        # potentially containing a ``$ref``. In the current caller
-        # ordering inside :func:`validate_input_schema`, the depth
-        # check fires first and rejects over-deep schemas before this
-        # function is invoked on them — so this branch is
-        # unreachable in practice today. But returning ``False`` here
-        # would create an ordering dependency: a future refactor that
-        # reordered the checks (or reused ``_contains_ref`` from a
-        # different callsite that did not gate on depth) could let a
-        # pathologically-deep schema with a hidden ``$ref`` pass the
-        # ref check silently. Returning ``True`` closes that class of
-        # bug regardless of caller ordering. *max_depth* must match the
-        # depth check's cap for this fail-closed guarantee to hold —
-        # :func:`validate_input_schema` always passes the same value to
-        # both.
-        return True
     if physical_depth > _MAX_PHYSICAL_RECURSION:
-        # Same fail-closed contract as the logical-depth bail-out above,
-        # but keyed on real recursive-call count instead of logical
-        # depth -- reachable ONLY via a chain of transparent
-        # optional-wrapper hops, since every non-transparent path already
-        # advances ``depth`` in lockstep with ``physical_depth`` and
-        # would hit the check above first.
         return True
     if isinstance(node, dict):
         if "$ref" in node:
             return True
-        for key, value in node.items():
-            if key in _UNION_KEYS:
-                target = _optional_wrapper_target(value)
-                if target is not None:
-                    if _contains_ref(target, depth, max_depth=max_depth, physical_depth=physical_depth + 1):
-                        return True
-                    continue
-            if _contains_ref(value, depth + 1, max_depth=max_depth, physical_depth=physical_depth + 1):
-                return True
-        return False
+        return any(_contains_ref(value, physical_depth + 1) for value in node.values())
     if isinstance(node, list):
-        return any(
-            _contains_ref(item, depth + 1, max_depth=max_depth, physical_depth=physical_depth + 1) for item in node
-        )
+        return any(_contains_ref(item, physical_depth + 1) for item in node)
     return False
+
+
+def _schema_children(node: dict[str, Any]) -> Iterator[tuple[Any, int, int]]:
+    """Yield ``(value, depth, raw)`` for each value below the schema *node*.
+
+    *depth* is the levels of data the value sits below *node*; *raw* is
+    the JSON levels it sits below *node* (a field's schema is two raw
+    levels down: the ``properties`` map, then the field).
+    """
+    for key, value in node.items():
+        if key == "properties" and isinstance(value, dict):
+            for field in value.values():
+                yield field, 1, 2
+        elif key in _SAME_LEVEL_KEYWORDS and isinstance(value, dict):
+            yield value, 0, 1
+        elif key in _SAME_LEVEL_KEYWORDS and isinstance(value, list):
+            for member in value:
+                yield member, 0, 2
+        else:
+            yield value, 1, 1
 
 
 def _schema_depth(
     node: Any,
     depth: int = 0,
     *,
-    max_depth: int = DEFAULT_MAX_SCHEMA_DEPTH,
+    max_depth: int = MAX_ALLOWED_SCHEMA_DEPTH,
     physical_depth: int = 0,
 ) -> int:
-    """Return the maximum nesting depth of dicts/lists in *node*.
+    """Return how many levels of data *node* nests.
 
-    Each dict or list increments the depth counter. Used to reject
-    pathologically nested schemas before they reach the sandbox type
-    renderer.
+    Used to reject pathologically nested schemas before they reach the
+    sandbox type renderer.
 
-    Bounded by *max_depth* to avoid ``RecursionError`` on adversarially
-    deep inputs. Once ``depth`` exceeds *max_depth* we stop recursing
-    and return the current depth — :func:`validate_input_schema`
-    already rejects any depth > cap, so an exact measurement past the
-    cap is unnecessary and unsafe (Python's default recursion limit
-    would fire on ~1000 levels). *max_depth* must be the same value the
-    caller will compare the result against, or the early bail-out
-    stops short of (or overshoots) the caller's actual cap.
+    Levels of data, not JSON wrappers
+    ---------------------------------
+    A JSON Schema spends several JSON levels on each level of data: an
+    object's field sits inside a ``properties`` map, an array's elements
+    inside ``items`` (or ``prefixItems``), and a union's or composition's
+    branches inside a list under ``anyOf``, ``oneOf`` or ``allOf``. Only
+    the data levels describe how complex a tool's arguments are, so:
 
-    Optional-union transparency
-    ----------------------------
-    Pydantic's ``Optional[X]`` / ``X | None`` encoding —
-    ``{"anyOf": [X, {"type": "null"}]}`` — costs 2 extra levels versus
-    a required ``X`` at the same position (the wrapper dict's ``anyOf``
-    key, plus the union array, plus recursing into the list member),
-    despite identical real complexity for an LLM consumer: an optional
-    list field would otherwise start 2 levels closer to the cap than a
-    required one for no structural reason. When a dict's
-    ``anyOf``/``oneOf`` value matches :func:`_optional_wrapper_target`
-    (exactly one non-null member alongside exactly one
-    ``{"type": "null"}`` member), that key's contribution to this
-    dict's depth is computed at the SAME *depth* as the dict itself — as
-    if the wrapper were replaced by the non-null member directly —
-    instead of the usual ``depth + 1``. Every other key in the same
-    dict (e.g. a sibling ``title``) is still counted normally, and this
-    composes: an optional field nested inside another optional field's
-    non-null branch keeps discounting each wrapper it crosses. A
-    3+-branch union or a union with no null member never matches
-    :func:`_optional_wrapper_target`, so it keeps the pre-existing,
-    non-transparent counting.
+    * each field named in ``properties`` is one level below the object
+      that carries it, and the map itself costs nothing;
+    * the schemas under ``items``, ``prefixItems``, ``anyOf``, ``oneOf``
+      and ``allOf`` sit at the level of the schema that carries them, so
+      an array of objects, an optional field (``anyOf [X, null]``) and a
+      tagged union cost what the object, the field or one branch costs;
+    * any other keyword's value counts one level per dict, list or value,
+      as before (so a field's own ``"type": "string"`` is the level below
+      the field, and a flat object of scalar fields measures 2).
+
+    For example, an object field holding an array of objects, each with an
+    array of tagged-union objects whose ``params`` field is a two-position
+    tuple, is four field levels deep and measures 5, although its raw JSON
+    nests 17 levels.
+
+    Bounded by *max_depth*: once ``depth`` exceeds it, the walk stops and
+    returns the current depth, so the result is exact up to *max_depth*
+    and ``max_depth + 1`` beyond it. :func:`validate_input_schema`
+    measures up to :data:`MAX_ALLOWED_SCHEMA_DEPTH` whatever its cap, so a
+    rejection names the depth it found.
 
     Physical recursion guard
     -------------------------
-    Because the transparency above recurses WITHOUT advancing *depth*,
-    *depth* alone can no longer bound the real recursive-call count: a
-    schema built entirely from chained optional-wrapper hops around one
-    leaf keeps *depth* at (or near) 0 forever while still making one real
-    Python call per hop. *physical_depth* is a second counter that
-    increments on every recursive call — transparent or not — and is
-    checked independently via :data:`_MAX_PHYSICAL_RECURSION`. When it
-    fires, this raises :class:`_PhysicalRecursionExceeded` rather than
-    returning a depth number at all. Returning a fabricated
-    over-the-cap depth would reject the schema correctly but describe it
-    wrongly: the registry logs the exception text verbatim, so an
-    operator debugging a rejected tool would read a nesting depth that
-    appears nowhere in their schema. Raising a distinct
-    :class:`SchemaValidationError` subclass keeps the fail-closed
-    contract (the per-tool ingest loop still skips just this tool) while
-    naming the actual defect. Without the counter entirely, a
-    sufficiently long chain would either be wrongly admitted (low
-    reported depth) or, past Python's default recursion limit, raise an
-    uncaught ``RecursionError`` that escapes the registry's per-tool
-    ``SchemaValidationError`` catch and aborts the whole upstream's
-    registration.
-
-    Note that a transparent hop advances *physical_depth* without
-    advancing *depth*, so a schema crossing more than
-    :data:`_MAX_PHYSICAL_RECURSION` optional wrappers on a single path
-    exhausts this counter before the logical cap even at a raised
-    *max_depth*. That is the intended trade: the ceiling is what keeps a
-    raised cap from re-opening the stack-overflow surface, and such a
-    schema is now rejected with an accurate reason rather than a
-    misleading depth.
+    Wrappers cost no depth, so *depth* alone cannot bound the real
+    recursion: a chain of ``items`` or of union members around one leaf
+    keeps *depth* at 1 or 2 while each JSON level is one more Python call.
+    *physical_depth* is the raw JSON depth of *node* (every dict and list
+    entered, wrapper or not), checked independently against
+    :data:`_MAX_PHYSICAL_RECURSION`. Past it this raises
+    :class:`_PhysicalRecursionExceeded` rather than returning a depth at
+    all: a fabricated over-the-cap depth would reject the schema correctly
+    but describe it wrongly, and the registry logs the exception text
+    verbatim. Raising a distinct :class:`SchemaValidationError` subclass
+    keeps the fail-closed contract (the per-tool ingest loop still skips
+    just this tool) while naming the actual defect.
     """
     if depth > max_depth:
         return depth
     if physical_depth > _MAX_PHYSICAL_RECURSION:
         raise _PhysicalRecursionExceeded(
-            f"inputSchema traversal exceeded the physical recursion ceiling of {_MAX_PHYSICAL_RECURSION} — "
-            "the schema chains more wrapper levels than the validator will follow"
+            f"inputSchema nests more than {_MAX_PHYSICAL_RECURSION} JSON levels deep, "
+            "the most the validator will follow"
         )
     if isinstance(node, dict):
-        if not node:
-            return depth
-        contributions: list[int] = []
-        for key, value in node.items():
-            if key in _UNION_KEYS:
-                target = _optional_wrapper_target(value)
-                if target is not None:
-                    contributions.append(
-                        _schema_depth(target, depth, max_depth=max_depth, physical_depth=physical_depth + 1)
-                    )
-                    continue
-            contributions.append(
-                _schema_depth(value, depth + 1, max_depth=max_depth, physical_depth=physical_depth + 1)
-            )
-        return max(contributions)
-    if isinstance(node, list):
-        if not node:
-            return depth
         return max(
-            _schema_depth(item, depth + 1, max_depth=max_depth, physical_depth=physical_depth + 1) for item in node
+            (
+                _schema_depth(value, depth + levels, max_depth=max_depth, physical_depth=physical_depth + raw)
+                for value, levels, raw in _schema_children(node)
+            ),
+            default=depth,
+        )
+    if isinstance(node, list):
+        return max(
+            (_schema_depth(item, depth + 1, max_depth=max_depth, physical_depth=physical_depth + 1) for item in node),
+            default=depth,
         )
     return depth
 
@@ -550,7 +463,9 @@ def validate_input_schema(schema: Any, *, max_depth: int = DEFAULT_MAX_SCHEMA_DE
     * Root-level ``"additionalProperties": true``. This keeps adversary
       upstreams from declaring an open schema that lets them smuggle
       arbitrary keys into the ``execute_tool`` forwarded call.
-    * Nesting deeper than *max_depth*.
+    * Nesting deeper than *max_depth* levels of data (see
+      :func:`_schema_depth`), or more than
+      :data:`_MAX_PHYSICAL_RECURSION` levels of raw JSON.
     * Any ``$ref`` key at any depth — the static-inline discipline is
       strictly easier to audit than a ref-resolution layer.
 
@@ -563,12 +478,9 @@ def validate_input_schema(schema: Any, *, max_depth: int = DEFAULT_MAX_SCHEMA_DE
         and prefer flattening an over-deep upstream schema instead.
         Must be an int between ``1`` and
         :data:`MAX_ALLOWED_SCHEMA_DEPTH` (inclusive), enforced by
-        :func:`_validate_max_schema_depth`. The upper bound isn't
-        arbitrary: the depth/``$ref`` recursion itself becomes a
-        stack-overflow risk on adversarial input well before
-        four-figure depths, so *max_depth* can't be raised without
-        limit even for a deployment that genuinely wants deeper
-        schemas.
+        :func:`_validate_max_schema_depth`. The depth is measured up to
+        that ceiling whatever the cap, so a rejection names the depth
+        found; the raw-JSON ceiling bounds the recursion on its own.
 
     Returns the *schema* unchanged when all checks pass. Raises
     :class:`SchemaValidationError` with a human-readable reason
@@ -598,11 +510,18 @@ def validate_input_schema(schema: Any, *, max_depth: int = DEFAULT_MAX_SCHEMA_DE
             "keys through execute_tool"
         )
 
-    depth = _schema_depth(schema, max_depth=max_depth)
+    # Measured past the cap, up to the ceiling, so the rejection names the
+    # schema's actual depth rather than the first level over the cap.
+    depth = _schema_depth(schema, max_depth=MAX_ALLOWED_SCHEMA_DEPTH)
+    if depth > MAX_ALLOWED_SCHEMA_DEPTH:
+        raise SchemaValidationError(
+            f"inputSchema nesting depth exceeds {MAX_ALLOWED_SCHEMA_DEPTH}, the most the validator measures "
+            f"(cap of {max_depth})"
+        )
     if depth > max_depth:
         raise SchemaValidationError(f"inputSchema nesting depth {depth} exceeds cap of {max_depth}")
 
-    if _contains_ref(schema, max_depth=max_depth):
+    if _contains_ref(schema):
         raise SchemaValidationError(
             "inputSchema must not contain '$ref' at any depth — inline schemas are required for auditability"
         )

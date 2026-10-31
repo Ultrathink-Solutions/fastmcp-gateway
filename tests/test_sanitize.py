@@ -156,13 +156,11 @@ class TestValidateInputSchema:
 
     def test_rejects_excessive_depth(self) -> None:
         """Nesting beyond the depth cap is rejected."""
-        # Build depth 7: object -> properties -> a -> properties -> b ->
-        # properties -> c -> properties -> d -> type
+        # Five field levels (root -> a -> b -> c -> d) plus d's own type:
+        # depth 6, over the cap of 5.
         deep: dict = {"type": "string"}
         for key in ("d", "c", "b", "a"):
             deep = {"type": "object", "properties": {key: deep}}
-        # Wrap one more time so the overall depth clearly exceeds the
-        # cap of 5 (the root dict itself is depth 1).
         wrapped = {"type": "object", "properties": {"root": deep}}
         with pytest.raises(SchemaValidationError, match="nesting depth"):
             validate_input_schema(wrapped)
@@ -196,8 +194,9 @@ class TestValidateInputSchema:
         Regression shield for the previous ``_schema_depth`` implementation
         which recursed unconditionally. Python's default recursion limit
         (~1000) would fire on inputs past that depth and bubble out as an
-        unhandled 500 from the registry. The current implementation bails
-        at the depth cap and ``validate_input_schema`` rejects cleanly.
+        unhandled 500 from the registry. The current implementation stops
+        measuring past :data:`MAX_ALLOWED_SCHEMA_DEPTH` and
+        ``validate_input_schema`` rejects cleanly.
         """
         deep: dict = {"type": "string"}
         for i in range(2000):
@@ -229,12 +228,11 @@ class TestValidateInputSchema:
 
 
 def _nested_schema(levels: int) -> dict:
-    """Build an object schema wrapping a scalar leaf *levels* + 1 times.
+    """Build an object schema nesting a scalar leaf *levels* + 1 fields deep.
 
-    The loop wraps *levels* times and the ``root`` property wraps once
-    more, so the measured depth is ``2 * (levels + 1) + 1`` -- each
-    wrapper costs two counted levels and the leaf's scalar value costs
-    one.
+    The loop nests *levels* fields and the ``root`` field one more, and the
+    leaf's own ``type`` is one level below the deepest field, so the
+    measured depth is ``levels + 2``.
     """
     deep: dict = {"type": "string"}
     for i in range(levels):
@@ -242,9 +240,9 @@ def _nested_schema(levels: int) -> dict:
     return {"type": "object", "properties": {"root": deep}}
 
 
-# Three wrappers => depth 7, the first odd depth clear of the default cap
-# of 5 and comfortably under the raised cap of 10 used below.
-_DEPTH_7_SCHEMA = _nested_schema(2)
+# Depth 7: clear of the default cap of 5 and comfortably under the raised
+# cap of 10 used below.
+_DEPTH_7_SCHEMA = _nested_schema(5)
 
 
 class TestConfigurableSchemaDepth:
@@ -311,17 +309,16 @@ class TestConfigurableSchemaDepth:
 
 
 # ---------------------------------------------------------------------------
-# _schema_depth — Optional[X] union transparency
+# _schema_depth — levels of data, not JSON wrappers
 # ---------------------------------------------------------------------------
 #
-# Pydantic (and most JSON-Schema generators) encode ``Optional[X]`` /
-# ``X | None`` as ``{"anyOf": [X, {"type": "null"}]}``. Before this change,
-# the wrapper dict + union array + null-branch member added 2 depth levels
-# versus a required ``X`` at the same position, despite identical real
-# complexity for an LLM consumer. These tests pin the new "the wrapper is
-# transparent" counting directly against ``_schema_depth`` and confirm the
-# unaffected cases (3+-branch unions, unions without a null member) keep
-# their prior counting exactly.
+# A JSON Schema spends several JSON levels on each level of data: a field
+# sits inside a ``properties`` map, an array's elements inside ``items`` or
+# ``prefixItems``, and branches inside an ``anyOf`` / ``oneOf`` / ``allOf``
+# list. Depth counts each field level once and treats those wrappers as
+# transparent, so Pydantic's ``Optional[X]`` (``{"anyOf": [X, {"type":
+# "null"}]}``), an array of models, and a tagged union cost what the field,
+# the model, or one branch costs.
 
 
 def _optional_of(inner: dict) -> dict:
@@ -329,60 +326,138 @@ def _optional_of(inner: dict) -> dict:
     return {"anyOf": [inner, {"type": "null"}]}
 
 
+def _raw_json_depth(node: object) -> int:
+    """Nesting depth of *node* counting every dict, list and value, as JSON nests it."""
+    if isinstance(node, dict):
+        return max((_raw_json_depth(v) + 1 for v in node.values()), default=0)
+    if isinstance(node, list):
+        return max((_raw_json_depth(v) + 1 for v in node), default=0)
+    return 0
+
+
 _ARRAY_OF_STR = {"type": "array", "items": {"type": "string"}}
 _NESTED_OBJECT = {"type": "object", "properties": {"bar": {"type": "string"}}}
+_FLAT_OBJECT = {"type": "object", "properties": {"foo": {"type": "string"}}}
+
+
+def _object_with(foo: object) -> dict:
+    return {"type": "object", "properties": {"foo": foo}}
+
+
+def _graph_shaped_schema() -> dict:
+    """An object nested four fields deep through the wrappers generators emit.
+
+    ``graph`` (object) -> ``groups`` (array of objects) -> ``rules`` (array of
+    a two-branch tagged union) -> ``params`` (an optional two-position tuple)
+    -> each position's own ``type``: five levels of data, seventeen of raw
+    JSON.
+    """
+    tagged_rule = {
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": {
+                    "kind": {"const": "range"},
+                    "params": _optional_of(
+                        {"type": "array", "prefixItems": [{"type": "number"}, {"type": "number"}]},
+                    ),
+                },
+                "required": ["kind"],
+            },
+            {
+                "type": "object",
+                "properties": {"kind": {"const": "match"}, "pattern": {"type": "string"}},
+                "required": ["kind", "pattern"],
+            },
+        ]
+    }
+    group = {
+        "type": "object",
+        "properties": {"name": {"type": "string"}, "rules": {"type": "array", "items": tagged_rule}},
+    }
+    graph = {"type": "object", "properties": {"groups": {"type": "array", "items": group}}}
+    return {"type": "object", "properties": {"graph": graph}, "required": ["graph"]}
+
+
+class TestDataLevelDepth:
+    def test_a_flat_object_measures_two(self) -> None:
+        assert _schema_depth(_FLAT_OBJECT) == 2
+
+    def test_each_nested_field_level_counts_once(self) -> None:
+        assert _schema_depth(_object_with(_NESTED_OBJECT)) == 3
+
+    def test_an_array_of_models_costs_what_the_model_costs(self) -> None:
+        array_of_models = {"type": "array", "items": _NESTED_OBJECT}
+        assert _schema_depth(_object_with(array_of_models)) == _schema_depth(_object_with(_NESTED_OBJECT))
+
+    def test_a_tuple_costs_what_a_scalar_costs(self) -> None:
+        pair = {"type": "array", "prefixItems": [{"type": "string"}, {"type": "integer"}]}
+        assert _schema_depth(_object_with(pair)) == _schema_depth(_FLAT_OBJECT)
+
+    @pytest.mark.parametrize("keyword", ["anyOf", "oneOf", "allOf"])
+    def test_a_union_or_composition_costs_its_deepest_branch(self, keyword: str) -> None:
+        branches = {keyword: [{"type": "string"}, {"type": "integer"}, _NESTED_OBJECT]}
+        assert _schema_depth(_object_with(branches)) == _schema_depth(_object_with(_NESTED_OBJECT))
+
+    def test_a_field_named_like_a_keyword_is_a_field(self) -> None:
+        """Names inside ``properties`` are fields, never keywords to see through."""
+        schema = {"type": "object", "properties": {"items": _NESTED_OBJECT, "anyOf": {"type": "string"}}}
+        assert _schema_depth(schema) == _schema_depth(_object_with(_NESTED_OBJECT))
+
+    def test_a_graph_shaped_schema_measures_its_data_levels(self) -> None:
+        """Seventeen JSON levels deep, five levels of data: it passes the default cap."""
+        schema = _graph_shaped_schema()
+        assert _raw_json_depth(schema) == 17
+        assert _schema_depth(schema) == 5
+        assert validate_input_schema(schema) == schema
+
+    def test_a_schema_deep_in_data_is_refused_with_its_depth(self) -> None:
+        """Wrappers are free, fields are not: eight field levels measure 9."""
+        deep = _nested_schema(7)
+        assert _schema_depth(deep) == 9
+        with pytest.raises(SchemaValidationError, match=r"nesting depth 9 exceeds cap of 5"):
+            validate_input_schema(deep)
+        with pytest.raises(SchemaValidationError, match=r"nesting depth 9 exceeds cap of 8"):
+            validate_input_schema(deep, max_depth=8)
+        assert validate_input_schema(deep, max_depth=9) == deep
+
+    def test_a_schema_deeper_than_the_ceiling_says_so(self) -> None:
+        """Depth is measured up to the ceiling; past it, the message names the ceiling."""
+        deep: dict = {"type": "string"}
+        for _ in range(60):
+            deep = {"type": "object", "not": deep}
+        with pytest.raises(SchemaValidationError, match=f"exceeds {MAX_ALLOWED_SCHEMA_DEPTH}") as excinfo:
+            validate_input_schema(deep)
+        assert not isinstance(excinfo.value, _PhysicalRecursionExceeded)
+
+    def test_a_raw_deep_wrapper_chain_hits_the_ceiling(self) -> None:
+        """A chain of arrays costs no depth, but its raw JSON is still bounded."""
+
+        def chain(length: int) -> dict:
+            node: dict = {"type": "string"}
+            for _ in range(length):
+                node = {"type": "array", "items": node}
+            return node
+
+        assert _schema_depth(_object_with(chain(10))) == 2
+        deep = chain(150)
+        with pytest.raises(_PhysicalRecursionExceeded):
+            validate_input_schema(_object_with(deep), max_depth=MAX_ALLOWED_SCHEMA_DEPTH)
 
 
 class TestOptionalNullDepthTransparency:
     def test_optional_list_matches_required_list_depth(self) -> None:
         """Optional[list[str]] costs the same depth as a required list[str]."""
-        required = {"type": "object", "properties": {"foo": _ARRAY_OF_STR}}
-        optional = {"type": "object", "properties": {"foo": _optional_of(_ARRAY_OF_STR)}}
-        assert _schema_depth(optional) == _schema_depth(required)
+        assert _schema_depth(_object_with(_optional_of(_ARRAY_OF_STR))) == _schema_depth(_object_with(_ARRAY_OF_STR))
 
     def test_optional_nested_model_matches_required_depth(self) -> None:
         """Optional[NestedModel] costs the same depth as a required NestedModel."""
-        required = {"type": "object", "properties": {"foo": _NESTED_OBJECT}}
-        optional = {"type": "object", "properties": {"foo": _optional_of(_NESTED_OBJECT)}}
-        assert _schema_depth(optional) == _schema_depth(required)
+        assert _schema_depth(_object_with(_optional_of(_NESTED_OBJECT))) == _schema_depth(_object_with(_NESTED_OBJECT))
 
     def test_oneof_null_union_also_transparent(self) -> None:
         """``oneOf`` gets the same transparency as ``anyOf``."""
-        required = {"type": "object", "properties": {"foo": _ARRAY_OF_STR}}
-        optional = {"type": "object", "properties": {"foo": {"oneOf": [_ARRAY_OF_STR, {"type": "null"}]}}}
-        assert _schema_depth(optional) == _schema_depth(required)
-
-    def test_three_branch_union_depth_unchanged(self) -> None:
-        """A 3-branch union (even with a null member) is not transparency-eligible."""
-        three_branch = {
-            "type": "object",
-            "properties": {"foo": {"anyOf": [{"type": "string"}, {"type": "integer"}, {"type": "null"}]}},
-        }
-        # Regression pin: this is the same value _schema_depth reported
-        # before the transparency change, confirming the 3-branch case is
-        # untouched by it.
-        assert _schema_depth(three_branch) == 5
-
-    def test_union_without_null_member_depth_unchanged(self) -> None:
-        """A 2-branch union with no null member keeps normal counting."""
-        two_nonnull = {"type": "object", "properties": {"foo": {"anyOf": [{"type": "string"}, {"type": "integer"}]}}}
-        # Regression pin: unchanged from pre-transparency behaviour.
-        assert _schema_depth(two_nonnull) == 5
-
-    def test_strict_null_shape_with_extra_keys_not_transparent(self) -> None:
-        """``{"type": "null", "description": "..."}`` is NOT the transparency sentinel.
-
-        Strictest reading: the null member must be exactly the single
-        key ``"type"``. A schema author who attached an annotation to
-        the null branch gets normal (non-transparent) counting for that
-        union -- same as a 3-branch union.
-        """
-        annotated_null_union = {
-            "type": "object",
-            "properties": {"foo": {"anyOf": [_ARRAY_OF_STR, {"type": "null", "description": "absent"}]}},
-        }
-        plain_null_union = {"type": "object", "properties": {"foo": _optional_of(_ARRAY_OF_STR)}}
-        assert _schema_depth(annotated_null_union) > _schema_depth(plain_null_union)
+        optional = _object_with({"oneOf": [_ARRAY_OF_STR, {"type": "null"}]})
+        assert _schema_depth(optional) == _schema_depth(_object_with(_ARRAY_OF_STR))
 
     def test_nested_optionals_compose(self) -> None:
         """An optional field nested inside another optional field's non-null branch
@@ -398,10 +473,10 @@ class TestOptionalNullDepthTransparency:
     def test_validate_input_schema_admits_previously_rejected_optional_list(self) -> None:
         """End-to-end: a schema rejected under the old counting now passes.
 
-        Before this change, Optional[list[str]] at this position measured
-        depth 6 (> the cap of 5) and was rejected; the required
-        equivalent measures depth 4. This is a deliberate validator
-        relaxation -- more schemas are now admitted, not fewer.
+        Before Optional-union transparency, Optional[list[str]] at this
+        position measured depth 6 (> the cap of 5) and was rejected. This
+        is a deliberate validator relaxation -- more schemas are now
+        admitted, not fewer.
         """
         schema = {"type": "object", "properties": {"foo": _optional_of(_ARRAY_OF_STR)}}
         assert validate_input_schema(schema) == schema
@@ -528,7 +603,14 @@ class TestOptionalNullDepthTransparency:
         # unexplored/over-deep subtree -- the point of this test is that it
         # returns a bool at all rather than raising RecursionError.
         assert _contains_ref(deep) is True
-        assert _contains_ref(deep, max_depth=MAX_ALLOWED_SCHEMA_DEPTH) is True
+
+    def test_contains_ref_explores_every_schema_the_depth_check_admits(self) -> None:
+        """A schema within the raw-JSON ceiling is walked completely, so no false ``$ref`` verdict."""
+        assert _contains_ref(_graph_shaped_schema()) is False
+        deep = _nested_schema(MAX_ALLOWED_SCHEMA_DEPTH - 2)
+        assert _schema_depth(deep) == MAX_ALLOWED_SCHEMA_DEPTH
+        assert _contains_ref(deep) is False
+        assert validate_input_schema(deep, max_depth=MAX_ALLOWED_SCHEMA_DEPTH) == deep
 
 
 # ---------------------------------------------------------------------------

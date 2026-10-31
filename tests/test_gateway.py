@@ -67,7 +67,7 @@ class TestGatewayConstructor:
 class TestMaxSchemaDepth:
     """The cap is observable through what a gateway admits at registration,
     so these assert on registry contents after a populate rather than on the
-    manager's private depth field. Depth is ``2 * wrappers + 1`` -- see the
+    manager's private depth field. Depth is ``wrappers + 1`` -- see the
     ``deep_schema_tool`` factory in conftest."""
 
     @pytest.mark.asyncio
@@ -75,7 +75,7 @@ class TestMaxSchemaDepth:
         self, deep_schema_tool: Callable[..., Any], patch_upstream_client: Callable[..., Any]
     ) -> None:
         """Depth 7 — over the unchanged default cap of 5."""
-        with patch_upstream_client(deep_schema_tool(3)):
+        with patch_upstream_client(deep_schema_tool(6)):
             gw = GatewayServer({"svc": "http://svc:8080/mcp"})
             await gw.upstream_manager.populate_domain("svc")
 
@@ -86,7 +86,7 @@ class TestMaxSchemaDepth:
         self, deep_schema_tool: Callable[..., Any], patch_upstream_client: Callable[..., Any]
     ) -> None:
         """Depth 5 — exactly at the unchanged default cap."""
-        with patch_upstream_client(deep_schema_tool(2)):
+        with patch_upstream_client(deep_schema_tool(4)):
             gw = GatewayServer({"svc": "http://svc:8080/mcp"})
             await gw.upstream_manager.populate_domain("svc")
 
@@ -97,7 +97,7 @@ class TestMaxSchemaDepth:
         self, deep_schema_tool: Callable[..., Any], patch_upstream_client: Callable[..., Any]
     ) -> None:
         """The same depth-7 schema the default rejects is admitted at 12."""
-        with patch_upstream_client(deep_schema_tool(3)):
+        with patch_upstream_client(deep_schema_tool(6)):
             gw = GatewayServer({"svc": "http://svc:8080/mcp"}, max_schema_depth=12)
             await gw.upstream_manager.populate_domain("svc")
 
@@ -108,7 +108,7 @@ class TestMaxSchemaDepth:
         self, deep_schema_tool: Callable[..., Any], patch_upstream_client: Callable[..., Any]
     ) -> None:
         """The cap tightens as well as loosens: depth 5 is refused at 1."""
-        with patch_upstream_client(deep_schema_tool(2)):
+        with patch_upstream_client(deep_schema_tool(4)):
             gw = GatewayServer({"svc": "http://svc:8080/mcp"}, max_schema_depth=1)
             await gw.upstream_manager.populate_domain("svc")
 
@@ -119,7 +119,7 @@ class TestMaxSchemaDepth:
         self, deep_schema_tool: Callable[..., Any], patch_upstream_client: Callable[..., Any]
     ) -> None:
         """Depth 49 — admitted only at the ceiling, rejected at every default."""
-        with patch_upstream_client(deep_schema_tool(24)):
+        with patch_upstream_client(deep_schema_tool(48)):
             gw = GatewayServer({"svc": "http://svc:8080/mcp"}, max_schema_depth=MAX_ALLOWED_SCHEMA_DEPTH)
             await gw.upstream_manager.populate_domain("svc")
 

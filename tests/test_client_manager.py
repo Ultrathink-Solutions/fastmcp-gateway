@@ -156,8 +156,8 @@ class TestPopulateDomain:
 
 
 class TestPopulateDomainMaxSchemaDepth:
-    """Depth is ``2 * wrappers + 1`` -- see the ``deep_schema_tool`` factory
-    in conftest. Three wrappers is depth 7: over the default cap, under 10."""
+    """Depth is ``wrappers + 1`` -- see the ``deep_schema_tool`` factory
+    in conftest. Six wrappers is depth 7: over the default cap, under 10."""
 
     @pytest.mark.asyncio
     async def test_default_rejects_deep_schema(
@@ -166,7 +166,7 @@ class TestPopulateDomainMaxSchemaDepth:
         deep_schema_tool: Callable[..., Any],
         patch_upstream_client: Callable[..., Any],
     ) -> None:
-        with patch_upstream_client(deep_schema_tool(3)):
+        with patch_upstream_client(deep_schema_tool(6)):
             manager = UpstreamManager({"svc": "http://svc:8080/mcp"}, registry)
             count = await manager.populate_domain("svc")
 
@@ -180,7 +180,7 @@ class TestPopulateDomainMaxSchemaDepth:
         deep_schema_tool: Callable[..., Any],
         patch_upstream_client: Callable[..., Any],
     ) -> None:
-        with patch_upstream_client(deep_schema_tool(3)):
+        with patch_upstream_client(deep_schema_tool(6)):
             manager = UpstreamManager({"svc": "http://svc:8080/mcp"}, registry, max_schema_depth=10)
             count = await manager.populate_domain("svc")
 

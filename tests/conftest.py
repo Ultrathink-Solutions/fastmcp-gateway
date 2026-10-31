@@ -77,11 +77,11 @@ class FakeTool:
 def deep_schema_tool() -> Callable[..., FakeTool]:
     """Factory for a tool whose inputSchema nests to a chosen depth.
 
-    ``wrappers`` object layers around a scalar leaf. Each wrapper costs
-    two counted levels (the object dict plus its ``properties`` dict)
-    and the leaf's scalar value costs one, so the measured nesting depth
-    is ``2 * wrappers + 1``. Callers pick *wrappers* to sit deliberately
-    above or below the cap under test.
+    ``wrappers`` object layers around a scalar leaf. Each wrapper adds one
+    field level and the leaf's own ``type`` is one level below the
+    deepest field, so the measured nesting depth is ``wrappers + 1``.
+    Callers pick *wrappers* to sit deliberately above or below the cap
+    under test.
     """
 
     def _build(wrappers: int, *, name: str = "svc_deep") -> FakeTool:
