@@ -69,6 +69,27 @@ def _signatures_block(tools: list[ToolEntry]) -> str:
     return "\n\n".join(tool_to_signature(t) for t in tools)
 
 
+def _registered_entry(registry: ToolRegistry, entry: ToolEntry) -> ToolEntry:
+    """Return the registry's own entry for *entry*'s name, or *entry* when none is registered.
+
+    An ``after_list_tools`` hook may return modified ``ToolEntry`` objects
+    rather than a filtered list. Hooks decide visibility only, so what a
+    caller is shown about a visible tool always comes from the registry.
+    """
+    return registry.lookup(entry.name) or entry
+
+
+def _tool_parameters(registry: ToolRegistry, entry: ToolEntry) -> dict[str, Any]:
+    """Return a tool's input JSON Schema as ``get_tool_schema`` serves it.
+
+    ``get_tool_schema`` and the ``format="schema"`` domain listing in
+    ``discover_tools`` both read the schema through this function, from the
+    registry's entry, so the two answers cannot diverge. The schema was
+    validated when the tool was registered; nothing rewrites it on the way out.
+    """
+    return _registered_entry(registry, entry).input_schema
+
+
 def _json_result(payload: dict[str, Any]) -> ToolResult:
     """Carry *payload* on both MCP result channels.
 
@@ -460,7 +481,11 @@ def register_meta_tools(
         Required parameters come first, and optional ones end in `= None`. Pass those names and values
         to `execute_tool` as `arguments`. With `format="schema"`, it returns JSON that lists each tool's
         `name` and `description`, plus its `domain` and `group` where your request did not already fix
-        them. An empty listing means no tool matched.
+        them. When you pass `domain` without `group` or `query`, each tool also carries `parameters`,
+        its input JSON Schema, exactly as `get_tool_schema` returns it, so one call lists a domain with
+        every schema in one answer (a large domain gives a large answer), and `original_name`, the name
+        its own server gives it (equal to `name` unless the gateway renamed the tool to tell it apart
+        from a same-named tool in another domain). An empty listing means no tool matched.
 
         An unknown `domain` or `group`, or one with no tool you can use, returns
         `{"error": "...", "code": "domain_not_found"}` (or `"group_not_found"`), with the valid names
@@ -589,11 +614,13 @@ def register_meta_tools(
                     "domain": domain,
                     "tools": [
                         {
-                            "name": t.name,
-                            "group": t.group,
-                            "description": t.description,
+                            "name": r.name,
+                            "original_name": r.original_name or r.name,
+                            "group": r.group,
+                            "description": r.description,
+                            "parameters": _tool_parameters(registry, r),
                         }
-                        for t in tools
+                        for r in (_registered_entry(registry, t) for t in tools)
                     ],
                 }
             )
@@ -646,7 +673,7 @@ def register_meta_tools(
                         "domain": entry.domain,
                         "group": entry.group,
                         "description": entry.description,
-                        "parameters": entry.input_schema,
+                        "parameters": _tool_parameters(registry, entry),
                     }
                 )
 
@@ -714,6 +741,16 @@ def register_meta_tools(
                 )
             ),
         ] = None,
+        domain: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Pins the call to this domain. `tool_name` is then resolved among that domain's tools "
+                    "only, by its `original_name` or its `name`, each time you call. Leave it out to "
+                    "resolve `tool_name` among all tools by exact name."
+                )
+            ),
+        ] = None,
         request_ctx: Context | None = None,
     ) -> ToolResult:
         """Run one tool and return its result.
@@ -729,8 +766,9 @@ def register_meta_tools(
 
         On failure the text is JSON, `{"error": "<what went wrong>", "code": "<code>", "details": {...}}`.
         The error comes back as an ordinary result, not as a failed call, so read `code`:
-        - `tool_not_found`: no tool has that name. `details.suggestions` lists up to three similar
-          names you can use.
+        - `tool_not_found`: no tool has that name, or, when you pass `domain`, that domain has no tool
+          you can use by that name. `details.suggestions` lists up to three similar names you can use,
+          and is empty when you pass `domain`.
         - `invalid_arguments`: the arguments do not fit the tool. Before sending the call, the gateway
           checks for unknown names, missing required ones, and values outside a parameter's allowed
           values or bounds. The tool's server can reject other mistakes with the same code.
@@ -743,6 +781,10 @@ def register_meta_tools(
         - `execution_error`: the call failed before the tool's server answered it (unreachable, timed
           out, or an HTTP failure). Tools from other domains may still work.
 
+        Passing `domain` only changes how `tool_name` is looked up. The gateway's refusal of a name
+        that is hidden from you is part of that lookup, not an access boundary: whether you may run
+        a tool is decided by the gateway's execution rules and the tool's own server.
+
         The gateway can also refuse a call by its own policy, with that policy's code, for example
         `forbidden`.
         """
@@ -751,8 +793,44 @@ def register_meta_tools(
         with _tracer.start_as_current_span("gateway.execute_tool") as span:
             span.set_attribute("gateway.tool_name", tool_name)
 
-            # Validate tool exists
-            entry = registry.lookup(tool_name)
+            # Validate tool exists. A domain-pinned call resolves the name
+            # among that domain's tools only, by original or registry name,
+            # and treats a tool hidden from the caller as absent.
+            pinned_auth: tuple[dict[str, str], Any] | None = None
+            if domain is None:
+                entry = registry.lookup(tool_name)
+            else:
+                span.set_attribute("gateway.domain", domain)
+                entry = registry.lookup_registered(domain, tool_name)
+                if entry is None:
+                    candidate = registry.lookup(tool_name)
+                    entry = candidate if candidate is not None and candidate.domain == domain else None
+                if entry is not None and hook_runner.has_hooks:
+                    # Authenticate once: the same identity decides visibility
+                    # here and runs the hooks below.
+                    from fastmcp_gateway.client_manager import get_user_headers
+
+                    pin_headers = get_user_headers()
+                    pin_user = await hook_runner.run_authenticate(pin_headers)
+                    pinned_auth = (pin_headers, pin_user)
+                    shown = await hook_runner.run_after_list_tools(
+                        [entry], ListToolsContext(domain=domain, headers=pin_headers, user=pin_user)
+                    )
+                    if not shown:
+                        entry = None
+                if entry is None:
+                    span.set_attribute("gateway.error_code", "tool_not_found")
+                    return _error_result(
+                        error_response(
+                            "tool_not_found",
+                            f"Unknown tool '{tool_name}' in domain '{domain}'. "
+                            "Use discover_tools to browse available tools.",
+                            tool_name=tool_name,
+                            domain=domain,
+                            suggestions=[],
+                        )
+                    )
+                tool_name = entry.name
             if entry is None:
                 suggestions = _suggest_tool_names(tool_name, await _visible_tool_names(await _caller_filter()))
                 if suggestions:
@@ -788,7 +866,10 @@ def register_meta_tools(
                 )
 
                 # Authenticate
-                execution_ctx.user = await hook_runner.run_authenticate(execution_ctx.headers)
+                if pinned_auth is not None:
+                    execution_ctx.user = pinned_auth[1]
+                else:
+                    execution_ctx.user = await hook_runner.run_authenticate(execution_ctx.headers)
 
                 # Before execute — may raise ExecutionDenied
                 try:
@@ -830,6 +911,23 @@ def register_meta_tools(
             }
             if execution_ctx and execution_ctx.extra_headers:
                 execute_kwargs["extra_headers"] = execution_ctx.extra_headers
+            if domain is not None:
+                # The manager resolves a name globally, and the hooks above
+                # may have yielded. Re-check the pin with no await between
+                # this check and the manager's own (synchronous) resolution.
+                current = registry.lookup(tool_name)
+                if current is None or current.domain != domain:
+                    span.set_attribute("gateway.error_code", "tool_not_found")
+                    return _error_result(
+                        error_response(
+                            "tool_not_found",
+                            f"Unknown tool '{tool_name}' in domain '{domain}'. "
+                            "Use discover_tools to browse available tools.",
+                            tool_name=tool_name,
+                            domain=domain,
+                            suggestions=[],
+                        )
+                    )
             try:
                 result = await upstream_manager.execute_tool(
                     tool_name,

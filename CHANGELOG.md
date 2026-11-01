@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+This is a minor release: both changes are additive. Success answers gain fields, `execute_tool` gains an optional argument, and nothing is removed or changed for a caller that does not use them.
+
+### Added
+
+- **`discover_tools(domain=..., format="schema")` carries each tool's `parameters`.** Each entry in the domain listing gains `parameters`: the tool's input JSON Schema, the same value `get_tool_schema` returns for the same caller, read through one shared helper so the two cannot diverge. A tool the hooks hide from the caller stays absent, and a collision-renamed tool carries its own schema. A client that lists a domain's tools with their schemas now makes one call instead of one `get_tool_schema` call per tool. Success answers gain a field and nothing is removed; the `group` listing, the `query` search and `format="signatures"` are unchanged.
+- **Each entry in that listing also carries `original_name`.** It is the name the tool's own server gives it (`ToolEntry.original_name`, else `name`), so it equals `name` unless the gateway renamed the tool to tell it apart from a same-named tool in another domain. A client no longer has to guess a renamed tool by its `<domain>_<name>` prefix, which can match a tool that is natively named that way.
+- **`execute_tool` takes an optional `domain`.** When given, `tool_name` is resolved among that domain's tools only, by original name or registry name, at call time. A name not registered under that domain, or a tool hidden from the caller, answers the usual `tool_not_found` with `details.domain` and is never dispatched, so a cached name cannot route to another domain's tool after the gateway re-registers. Without `domain`, behavior is unchanged. The hook-based refusal is a lookup rule, not an access boundary: execution stays gated by `before_execute` and the upstream's own authorization. The call authenticates once, and the pin is re-checked immediately before dispatch. A listing's `parameters` and `original_name` come from the registry's entry for each tool the hooks leave visible, so a hook that returns modified entries cannot make them differ from `get_tool_schema`.
+
 ## [0.36.0] - 2026-10-31
 
 This is a minor release, not a patch. Nothing is removed and success paths are unchanged, but several failure paths now answer with a different status or error code: a registration probe refused with 401 or 403 and a JSON-RPC error body answers `422 upstream_auth_failed` (was `503 upstream_not_ready`), and a call refused that way answers `upstream_unauthorized` (was `upstream_error`); `discover_tools` on a domain or group whose tools are all hidden answers `domain_not_found` or `group_not_found` (was an empty listing); any other registration failure answers `502 registration_failed` (was `500`). A given schema-depth cap also admits schemas it rejected before, and registration diagnostics name an upstream by scheme, host and port only.
