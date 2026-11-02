@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.38.0] - 2026-11-01
+
 This is a minor release: one additive option. Nothing changes for a deployment that does not set it.
 
 ### Added
