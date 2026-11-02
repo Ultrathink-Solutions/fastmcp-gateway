@@ -348,6 +348,18 @@ class GatewayServer:
         intentionally contain denylist tokens. Accepted as an explicit
         Python-code kwarg (no env-var form) so a deployment mistake
         can't silently weaken sanitation.
+    sanitizer_uncapped_domains:
+        Optional set of domain names whose tool descriptions skip the
+        registry-ingest **length cap** (2048 characters) only. Unicode
+        normalization, control-character stripping, the injection-pattern
+        scan (unless the domain is also in ``sanitizer_trusted_domains``),
+        and inputSchema validation still apply. The cap bounds how much
+        context an untrusted upstream can put in front of a model; use
+        this for domains whose descriptions the operator writes and
+        wants served whole. An uncapped domain's descriptions appear in
+        full in ``discover_tools`` listings. Accepted as an explicit
+        Python-code kwarg (no env-var form), like
+        ``sanitizer_trusted_domains``.
     output_guard:
         Optional :class:`~fastmcp_gateway.output_guard.OutputGuardConfig`
         enabling the gateway-level output guard. When ``enabled=True``,
@@ -458,6 +470,7 @@ class GatewayServer:
         code_mode_audit_verbatim: bool = False,
         middleware: list[Any] | None = None,
         sanitizer_trusted_domains: set[str] | None = None,
+        sanitizer_uncapped_domains: set[str] | None = None,
         output_guard: OutputGuardConfig | None = None,
         trusted_output_tools: set[str] | None = None,
         auth: AuthProvider | None = None,
@@ -605,6 +618,7 @@ class GatewayServer:
             upstream_headers=upstream_headers,
             policy=effective_policy,
             sanitizer_trusted_domains=sanitizer_trusted_domains,
+            sanitizer_uncapped_domains=sanitizer_uncapped_domains,
             trusted_output_tools=trusted_output_tools,
             max_schema_depth=max_schema_depth,
             registration_identities=registration_identities,

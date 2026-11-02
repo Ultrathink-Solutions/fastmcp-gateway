@@ -330,6 +330,25 @@ class TestPopulateDomain:
         assert tool.description == "List all users"
         assert tool.upstream_url == "http://acme:8080/mcp"
 
+    def test_an_uncapped_domain_keeps_a_long_description_whole(self, empty_registry: ToolRegistry) -> None:
+        """An uncapped domain's description skips the length cap; others keep it,
+        a domain trusted only for the pattern scan among them."""
+        long_description = "Stages widgets. " + ("a" * 3000)
+
+        def tools(name: str) -> list[dict[str, object]]:
+            return [{"name": name, "description": long_description, "inputSchema": {"type": "object"}}]
+
+        empty_registry.populate_domain("uncapped", "http://u:8080/mcp", tools("stage"), uncapped_domains={"uncapped"})
+        empty_registry.populate_domain(
+            "trusted", "http://t:8080/mcp", tools("submit"), trusted_domains={"trusted"}, uncapped_domains={"uncapped"}
+        )
+
+        uncapped = next(t for t in empty_registry.get_tools_by_domain("uncapped"))
+        trusted = next(t for t in empty_registry.get_tools_by_domain("trusted"))
+        assert uncapped.description == long_description
+        assert len(trusted.description) == 2048
+        assert trusted.description.endswith(" [truncated]")
+
     def test_populate_infers_groups(self, empty_registry: ToolRegistry) -> None:
         raw_tools = [
             {"name": "mydom_alpha_one", "inputSchema": {"type": "object"}},
