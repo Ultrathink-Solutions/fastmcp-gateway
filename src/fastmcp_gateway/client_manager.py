@@ -244,6 +244,12 @@ class UpstreamManager:
         intentionally contain denylist tokens. Passed as an explicit
         Python-code kwarg (no env-var form) so a deployment mistake
         can't silently weaken sanitation.
+    sanitizer_uncapped_domains:
+        Optional set of domain names whose tool descriptions skip the
+        description sanitizer's **length cap** only. All other sanitation
+        and schema validation still apply. Use this for domains whose
+        descriptions the operator writes and wants served whole. Passed
+        as an explicit Python-code kwarg (no env-var form).
     trusted_output_tools:
         Optional iterable of ``fnmatch`` glob patterns naming tools
         whose result text the gateway-level output guard will skip
@@ -286,6 +292,7 @@ class UpstreamManager:
         upstream_headers: dict[str, dict[str, str]] | None = None,
         policy: AccessPolicy | None = None,
         sanitizer_trusted_domains: set[str] | None = None,
+        sanitizer_uncapped_domains: set[str] | None = None,
         trusted_output_tools: set[str] | None = None,
         discovery_urls: dict[str, str] | None = None,
         max_schema_depth: int = DEFAULT_MAX_SCHEMA_DEPTH,
@@ -328,6 +335,9 @@ class UpstreamManager:
         # change sanitation behaviour mid-flight.
         self._sanitizer_trusted_domains: set[str] = (
             set(sanitizer_trusted_domains) if sanitizer_trusted_domains else set()
+        )
+        self._sanitizer_uncapped_domains: set[str] = (
+            set(sanitizer_uncapped_domains) if sanitizer_uncapped_domains else set()
         )
         # Stored as a sorted list (not a set) so iteration order is
         # deterministic — matters when a future extension logs which
@@ -504,6 +514,7 @@ class UpstreamManager:
                 policy=self._policy,
                 expected_digest=expected_digest,
                 trusted_domains=self._sanitizer_trusted_domains,
+                uncapped_domains=self._sanitizer_uncapped_domains,
                 trusted_output_tool_patterns=self._trusted_output_tool_patterns,
                 max_schema_depth=self._max_schema_depth,
             )

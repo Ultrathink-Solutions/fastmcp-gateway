@@ -106,7 +106,7 @@ def _strip_control_chars(raw: str) -> str:
     return "".join(out_chars)
 
 
-def sanitize_description(raw: Any, *, skip_pattern_scan: bool = False) -> str:
+def sanitize_description(raw: Any, *, skip_pattern_scan: bool = False, skip_length_cap: bool = False) -> str:
     """Sanitize a tool description for safe registry ingest.
 
     Pipeline:
@@ -122,9 +122,10 @@ def sanitize_description(raw: Any, *, skip_pattern_scan: bool = False) -> str:
        past a surface-string denylist.
     4. Scan against the shared injection-pattern denylist; replace each
        match with a single space and emit a WARNING audit log per strip.
-    5. Cap at :data:`_MAX_DESCRIPTION_LEN` characters; append
-       ``" [truncated]"`` when truncation was applied so downstream
-       consumers can tell the description is elided.
+    5. Unless *skip_length_cap*, cap at :data:`_MAX_DESCRIPTION_LEN`
+       characters; append ``" [truncated]"`` when truncation was
+       applied so downstream consumers can tell the description is
+       elided.
 
     Never raises. Always returns a string.
 
@@ -136,12 +137,17 @@ def sanitize_description(raw: Any, *, skip_pattern_scan: bool = False) -> str:
         empty-string result.
     skip_pattern_scan:
         When ``True``, skip step 4 (the injection-pattern scrub) only.
-        Unicode normalization, control-character stripping, and length
-        capping still apply. Operators use this for legitimate
-        prompt-processing tools whose descriptions intentionally
-        contain denylist tokens — the override is scoped to the
-        pattern scan so always-on hygiene (NFC, control strip, length
-        cap) is never weakened.
+        Unicode normalization, control-character stripping, and the
+        length cap (unless *skip_length_cap*) still apply. Operators use
+        this for legitimate prompt-processing tools whose descriptions
+        intentionally contain denylist tokens.
+    skip_length_cap:
+        When ``True``, skip step 5 (the length cap) only. The cap bounds
+        how much context an untrusted upstream can put in front of a
+        model; operators use this for domains whose descriptions they
+        write and want served whole. Unicode normalization,
+        control-character stripping, and the pattern scan (unless
+        *skip_pattern_scan*) still apply.
 
     Returns
     -------
@@ -168,7 +174,7 @@ def sanitize_description(raw: Any, *, skip_pattern_scan: bool = False) -> str:
     if skip_pattern_scan:
         # Operator-configured trusted domain. Hygiene steps above still
         # ran; only the denylist scrub is skipped. The length cap below
-        # remains in force.
+        # applies unless the domain is separately uncapped.
         scrubbed = stripped
     else:
         # Injection-pattern scan. ``sub`` with a callback replaces every
@@ -212,7 +218,7 @@ def sanitize_description(raw: Any, *, skip_pattern_scan: bool = False) -> str:
 
     # Length cap. Checked on the post-scrub form so oversized inputs
     # that compress under the scrub step aren't truncated unnecessarily.
-    if len(scrubbed) > _MAX_DESCRIPTION_LEN:
+    if not skip_length_cap and len(scrubbed) > _MAX_DESCRIPTION_LEN:
         # Reserve room for the marker so the final string fits within
         # the advertised cap — we don't want ``len(result) > cap`` when
         # the caller is budgeting bytes.

@@ -464,6 +464,7 @@ class ToolRegistry:
         policy: AccessPolicy | None = None,
         expected_digest: str | None = None,
         trusted_domains: set[str] | None = None,
+        uncapped_domains: set[str] | None = None,
         trusted_output_tool_patterns: list[str] | None = None,
         max_schema_depth: int = DEFAULT_MAX_SCHEMA_DEPTH,
     ) -> PreparedDomain:
@@ -495,6 +496,9 @@ class ToolRegistry:
         normalization, control-character stripping, length capping, and
         schema validation still apply — trust is scoped to the pattern
         scan only.
+
+        When a domain appears in *uncapped_domains*, its descriptions skip
+        the length cap. Every other step still applies.
 
         Schema-integrity check
         ----------------------
@@ -701,6 +705,7 @@ class ToolRegistry:
             filtered_count = 0
             prefix = f"{domain}_"
             domain_is_trusted = trusted_domains is not None and domain in trusted_domains
+            domain_is_uncapped = uncapped_domains is not None and domain in uncapped_domains
             output_patterns = trusted_output_tool_patterns or []
             for name, raw_description, clean_schema, upstream_trusted, required_scope in accepted:
                 # Collision renaming (see register_tool) may rewrite this tool's
@@ -719,6 +724,7 @@ class ToolRegistry:
                 clean_description = sanitize_description(
                     raw_description,
                     skip_pattern_scan=domain_is_trusted,
+                    skip_length_cap=domain_is_uncapped,
                 )
 
                 group = overrides.get(name, infer_group(domain, name))
@@ -828,6 +834,7 @@ class ToolRegistry:
         policy: AccessPolicy | None = None,
         expected_digest: str | None = None,
         trusted_domains: set[str] | None = None,
+        uncapped_domains: set[str] | None = None,
         trusted_output_tool_patterns: list[str] | None = None,
         max_schema_depth: int = DEFAULT_MAX_SCHEMA_DEPTH,
     ) -> RegistryDiff:
@@ -844,6 +851,7 @@ class ToolRegistry:
                     policy=policy,
                     expected_digest=expected_digest,
                     trusted_domains=trusted_domains,
+                    uncapped_domains=uncapped_domains,
                     trusted_output_tool_patterns=trusted_output_tool_patterns,
                     max_schema_depth=max_schema_depth,
                 )

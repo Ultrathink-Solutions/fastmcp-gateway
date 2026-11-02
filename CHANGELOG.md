@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+This is a minor release: one additive option. Nothing changes for a deployment that does not set it.
+
+### Added
+
+- **`GatewayServer(sanitizer_uncapped_domains=...)` serves a domain's tool descriptions whole.** Registry ingest caps every upstream tool description at 2048 characters, so a long description from a server the operator runs reached clients cut short with ` [truncated]`, although the server's own endpoint serves it whole. The cap bounds how much context an untrusted upstream can put in front of a model. A domain listed in the new `sanitizer_uncapped_domains` set skips the cap and nothing else: Unicode normalization, control-character stripping, the injection-pattern scan (unless the domain is also in `sanitizer_trusted_domains`) and `inputSchema` validation still run, and its full descriptions appear in `discover_tools` listings. `sanitizer_trusted_domains` keeps its meaning: it skips the pattern scan only. Like that set, the new one is a Python-code argument with no environment-variable form. `UpstreamManager` takes the same argument, `ToolRegistry.prepare_domain` and `populate_domain` take `uncapped_domains`, and `sanitize_description` takes an optional `skip_length_cap` keyword, `False` by default.
+
 ## [0.37.0] - 2026-11-01
 
 This is a minor release: both changes are additive. Success answers gain fields, `execute_tool` gains an optional argument, and nothing is removed or changed for a caller that does not use them.
