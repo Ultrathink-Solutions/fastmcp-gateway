@@ -69,7 +69,7 @@ The gateway starts on `http://0.0.0.0:8080/mcp` and exposes 4 tools to any MCP c
 
 1. **`discover_tools()`** — Call with no arguments to see all domains and tool counts. Call with `domain="apollo"` to see that domain's tools with descriptions. Returns each tool as a Python-style function signature by default (`apollo_search(query: str, limit: int = None) -> any`) — useful when the LLM will subsequently write code against the listed tools. Pass `format="schema"` to receive the JSON summary instead; for a whole domain (`domain=` with no `group` or `query`), each tool in it also carries `parameters`, its input JSON Schema exactly as `get_tool_schema` returns it, so one call lists a domain with every schema (the answer carries every visible tool's full schema, so a large domain gives a large answer), and `original_name`, the name the tool's own server gives it (equal to `name` unless the gateway renamed the tool because another domain registered the same name).
 
-2. **`get_tool_schema("apollo_people_search")`** — Returns the full JSON Schema for a tool's parameters, for when a signature is not enough (parameter descriptions, nested objects' required fields and bounds). The name must match exactly; an unknown name returns `tool_not_found` with up to three similar names as suggestions.
+2. **`get_tool_schema("apollo_people_search")`** — Returns the full JSON Schema for a tool's parameters, for when a signature is not enough (parameter descriptions, nested objects' required fields and bounds). The name must match exactly; an unknown name returns `tool_not_found` with up to three similar names as suggestions, and a name more than one domain serves also lists each domain's renamed tool (see [Tool Name Collisions](#tool-name-collisions)).
 
 3. **`execute_tool("apollo_people_search", {"query": "Anthropic"})`** — Routes the call to the correct upstream server and returns `{"tool": ..., "result": ...}`, or a structured error whose `code` says what to do next (see [Error Handling](#error-handling)). Pass the optional `domain` (`execute_tool("people_search", {...}, domain="apollo")`) to pin the call: the name is then resolved among that domain's tools only, by `original_name` or `name`, at call time, so a guessed prefix or a name cached before a re-registration cannot reach another domain's tool. A name that domain has no tool you can use for is `tool_not_found` (with `details.domain`) and nothing is dispatched. Without `domain`, resolution is by exact `name` as before. The refusal of a name hidden from the caller is part of this lookup, not an access boundary: execution is gated by `before_execute` hooks and by the upstream's own authorization. A pinned refusal carries `suggestions: []`.
 
@@ -423,6 +423,12 @@ hubspot registers "search" →  hubspot_search
 ```
 
 The original names remain searchable via `discover_tools(query="search")`.
+
+A caller that uses the bare name anyway, in `execute_tool` without `domain` or in `get_tool_schema`, gets `tool_not_found` with the reason and each domain's renamed tool it can see, in the message and in `details.candidates`. Those names also lead `details.suggestions`, even past its usual three. A renamed tool the caller's hooks hide is never named, and when none is visible the answer is the usual one. `execute_tool` with `domain` resolves the bare name within that domain.
+
+```json
+{"error": "'search' is served by more than one domain, so each domain's tool has its own name: 'apollo_search' (domain 'apollo'), 'hubspot_search' (domain 'hubspot'). Call one of those names, or pass domain to choose one.", "code": "tool_not_found", "details": {"tool_name": "search", "suggestions": ["apollo_search", "hubspot_search"], "candidates": [{"name": "apollo_search", "domain": "apollo"}, {"name": "hubspot_search", "domain": "hubspot"}]}}
+```
 
 ## MCP Handshake Instructions
 

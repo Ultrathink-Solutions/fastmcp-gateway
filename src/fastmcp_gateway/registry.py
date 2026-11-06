@@ -912,6 +912,25 @@ class ToolRegistry:
         ]
         return matches[0].model_copy(deep=True) if len(matches) == 1 else None
 
+    def collision_arms(self, name: str) -> list[ToolEntry]:
+        """Return the registered tools that a cross-domain collision on *name* renamed.
+
+        When more than one domain registers a tool named *name*,
+        :meth:`register_tool` renames each to ``{domain}_{name}`` and keeps
+        *name* in :attr:`ToolEntry.original_name`, so *name* itself no longer
+        resolves. This returns every registered tool whose upstream name is
+        *name*, sorted by domain and then by registered name. An arm that
+        could not be renamed keeps *name* and is included.
+
+        Returns an empty list when no two domains have registered *name*.
+        A domain cleared since drops out, and a domain populated again
+        rejoins under its renamed name.
+        """
+        if name not in self._collided_names:
+            return []
+        arms = [tool for tool in self._tools.values() if (tool.original_name or tool.name) == name]
+        return [tool.model_copy(deep=True) for tool in sorted(arms, key=lambda t: (t.domain, t.name))]
+
     def get_domain_names(self) -> list[str]:
         """Get all registered domain names."""
         return sorted(self._domains.keys())

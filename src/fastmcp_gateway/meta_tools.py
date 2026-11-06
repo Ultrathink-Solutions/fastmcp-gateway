@@ -150,7 +150,11 @@ def _gateway_error_result(code: str, message: str, **details: Any) -> ToolResult
     return _json_result(error_payload(code, message, **details))
 
 
-def _suggest_tool_names(query: str, all_names: list[str], max_suggestions: int = 3) -> list[str]:
+#: The most fuzzy-matched names a ``tool_not_found`` answer suggests.
+_MAX_SUGGESTIONS = 3
+
+
+def _suggest_tool_names(query: str, all_names: list[str], max_suggestions: int = _MAX_SUGGESTIONS) -> list[str]:
     """Return tool names similar to *query* for error messages.
 
     Scores based on substring containment, shared prefix segments,
@@ -173,6 +177,25 @@ def _suggest_tool_names(query: str, all_names: list[str], max_suggestions: int =
             scored.append((score, name))
     scored.sort(key=lambda x: (-x[0], x[1]))
     return [name for _, name in scored[:max_suggestions]]
+
+
+def _collision_message(tool_name: str, candidates: list[ToolEntry], *, takes_domain: bool) -> str:
+    """The ``tool_not_found`` message for a name that domains collided on: the reason, then the way out.
+
+    *candidates* are the renamed tools the caller can see. *takes_domain*
+    is whether the answering meta-tool accepts ``domain``, which resolves
+    the bare name within one domain.
+    """
+    listing = ", ".join(f"{c.name!r} (domain {c.domain!r})" for c in candidates)
+    if len(candidates) == 1:
+        reason = f"'{tool_name}' was renamed to tell it apart from a same-named tool in another domain: {listing}."
+        way_out = "Call that name, or pass domain to choose it." if takes_domain else "Use that name."
+    else:
+        reason = f"'{tool_name}' is served by more than one domain, so each domain's tool has its own name: {listing}."
+        way_out = (
+            "Call one of those names, or pass domain to choose one." if takes_domain else "Use one of those names."
+        )
+    return f"{reason} {way_out}"
 
 
 def _is_number(value: Any) -> bool:
@@ -418,6 +441,53 @@ def register_meta_tools(
                 names.append(d)
         return sorted(names)
 
+    async def _tool_not_found(
+        tool_name: str,
+        caller_filter: Callable[[list[ToolEntry], str | None], Awaitable[list[ToolEntry]]],
+        *,
+        takes_domain: bool,
+    ) -> tuple[str, dict[str, Any]]:
+        """Return the message and details of the ``tool_not_found`` answer for an unresolved *tool_name*.
+
+        ``details.suggestions`` lists similar names the caller can see. When
+        more than one domain registered *tool_name*, each domain's tool was
+        renamed; the ones the caller can use are named in the message and in
+        ``details.candidates`` (``{"name", "domain"}``, sorted by domain),
+        and lead ``suggestions``, past its cap if need be. A renamed tool
+        passes when *caller_filter* (the request's, so the caller is not
+        authenticated again) leaves it visible both in the all-domain
+        listing the suggestions come from and within its own domain, where
+        ``get_tool_schema`` and a domain-pinned ``execute_tool`` look it up.
+        One that fails is left out of the answer, fuzzy matches included,
+        unless none passes: then the answer is the plain "Unknown tool" one,
+        exactly as before. *takes_domain* is whether the answering meta-tool
+        accepts ``domain``.
+        """
+        visible_names = await _visible_tool_names(caller_filter)
+        visible = set(visible_names)
+        arms = registry.collision_arms(tool_name)
+        candidates: list[ToolEntry] = []
+        for arm in arms:
+            # An arm that kept the bare name did not resolve for this caller, so it is no way out.
+            if arm.name != tool_name and arm.name in visible and await caller_filter([arm], arm.domain):
+                candidates.append(arm)
+        if not candidates:
+            suggestions = _suggest_tool_names(tool_name, visible_names)
+            if suggestions:
+                hint = f"Did you mean {', '.join(repr(s) for s in suggestions)}?"
+            else:
+                hint = "Use discover_tools to browse available tools."
+            return f"Unknown tool '{tool_name}'. {hint}", {"tool_name": tool_name, "suggestions": suggestions}
+
+        named = [c.name for c in candidates]
+        others = sorted(visible.difference(arm.name for arm in arms))
+        suggestions = named + _suggest_tool_names(tool_name, others, max(_MAX_SUGGESTIONS - len(named), 0))
+        return _collision_message(tool_name, candidates, takes_domain=takes_domain), {
+            "tool_name": tool_name,
+            "suggestions": suggestions,
+            "candidates": [{"name": c.name, "domain": c.domain} for c in candidates],
+        }
+
     @mcp.tool(
         annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
         # output_schema=None stops FastMCP deriving an output schema from
@@ -650,7 +720,9 @@ def register_meta_tools(
 
         The name must match exactly. An unknown name, or a tool hidden from you, returns
         `{"error": "...", "code": "tool_not_found", "details": {"tool_name", "suggestions"}}`, where
-        `suggestions` lists up to three similar tool names.
+        `suggestions` lists up to three similar tool names. When more than one domain has a tool by
+        that name, the gateway gives each domain's tool its own name, and `details.candidates` lists
+        the ones you can use as `[{"name", "domain"}]`. `suggestions` then starts with all of them.
         """
         with _tracer.start_as_current_span("gateway.get_tool_schema") as span:
             span.set_attribute("gateway.tool_name", tool_name)
@@ -677,19 +749,11 @@ def register_meta_tools(
                     }
                 )
 
-            # Unknown tool (or filtered out) — suggest similar names
-            suggestions = _suggest_tool_names(tool_name, await _visible_tool_names(caller_filter))
-            if suggestions:
-                hint = f"Did you mean {', '.join(repr(s) for s in suggestions)}?"
-            else:
-                hint = "Use discover_tools to browse available tools."
+            # Unknown tool (or filtered out): name the renamed tools of a
+            # collided name, and suggest similar names.
+            message, details = await _tool_not_found(tool_name, caller_filter, takes_domain=False)
             span.set_attribute("gateway.error_code", "tool_not_found")
-            return _gateway_error_result(
-                "tool_not_found",
-                f"Unknown tool '{tool_name}'. {hint}",
-                tool_name=tool_name,
-                suggestions=suggestions,
-            )
+            return _gateway_error_result("tool_not_found", message, **details)
 
     def _error_result(error_text: str) -> ToolResult:
         """Wrap an ``error_response`` string in a :class:`ToolResult`.
@@ -768,7 +832,10 @@ def register_meta_tools(
         The error comes back as an ordinary result, not as a failed call, so read `code`:
         - `tool_not_found`: no tool has that name, or, when you pass `domain`, that domain has no tool
           you can use by that name. `details.suggestions` lists up to three similar names you can use,
-          and is empty when you pass `domain`.
+          and is empty when you pass `domain`. When more than one domain has a tool by that name, the
+          gateway gives each domain's tool its own name, and `details.candidates` lists the ones you
+          can use as `[{"name", "domain"}]`. `suggestions` then starts with all of them. Call one of
+          those names, or pass its `domain` with the name you gave.
         - `invalid_arguments`: the arguments do not fit the tool. Before sending the call, the gateway
           checks for unknown names, missing required ones, and values outside a parameter's allowed
           values or bounds. The tool's server can reject other mistakes with the same code.
@@ -832,20 +899,9 @@ def register_meta_tools(
                     )
                 tool_name = entry.name
             if entry is None:
-                suggestions = _suggest_tool_names(tool_name, await _visible_tool_names(await _caller_filter()))
-                if suggestions:
-                    hint = f"Did you mean {', '.join(repr(s) for s in suggestions)}?"
-                else:
-                    hint = "Use discover_tools to browse available tools."
+                message, details = await _tool_not_found(tool_name, await _caller_filter(), takes_domain=True)
                 span.set_attribute("gateway.error_code", "tool_not_found")
-                return _error_result(
-                    error_response(
-                        "tool_not_found",
-                        f"Unknown tool '{tool_name}'. {hint}",
-                        tool_name=tool_name,
-                        suggestions=suggestions,
-                    )
-                )
+                return _error_result(error_response("tool_not_found", message, **details))
 
             span.set_attribute("gateway.domain", entry.domain)
 
