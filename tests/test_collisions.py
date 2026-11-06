@@ -185,3 +185,97 @@ class TestCollisionDomainIndex:
 
         empty_registry.register_tool(_make_tool("search", "sales"))
         assert empty_registry.tool_count == 3
+
+
+class TestCollisionArms:
+    """``collision_arms`` returns the tools a cross-domain collision renamed."""
+
+    def test_both_arms_in_domain_order(self, empty_registry: ToolRegistry) -> None:
+        """Both renamed tools are returned, sorted by domain, with their original name."""
+        empty_registry.register_tool(_make_tool("create_upload", "widgets"))
+        empty_registry.register_tool(_make_tool("create_upload", "svc"))
+
+        arms = empty_registry.collision_arms("create_upload")
+
+        assert [(t.name, t.domain, t.original_name) for t in arms] == [
+            ("svc_create_upload", "svc", "create_upload"),
+            ("widgets_create_upload", "widgets", "create_upload"),
+        ]
+
+    def test_a_later_domain_joins_the_arms(self, empty_registry: ToolRegistry) -> None:
+        """A third domain registering the collided name is renamed and joins the arms."""
+        for domain in ("svc", "widgets", "acme"):
+            empty_registry.register_tool(_make_tool("create_upload", domain))
+
+        assert [t.name for t in empty_registry.collision_arms("create_upload")] == [
+            "acme_create_upload",
+            "svc_create_upload",
+            "widgets_create_upload",
+        ]
+
+    def test_a_name_that_never_collided_has_no_arms(self, empty_registry: ToolRegistry) -> None:
+        """A name no two domains registered, including a renamed tool's own name, has no arms."""
+        empty_registry.register_tool(_make_tool("create_upload", "svc"))
+        empty_registry.register_tool(_make_tool("create_upload", "widgets"))
+        empty_registry.register_tool(_make_tool("list_widgets", "widgets"))
+
+        assert empty_registry.collision_arms("list_widgets") == []
+        assert empty_registry.collision_arms("delete_upload") == []
+        # A renamed tool's own name is not a collided name.
+        assert empty_registry.collision_arms("svc_create_upload") == []
+
+    def test_an_arm_kept_under_its_bare_name_is_still_an_arm(self, empty_registry: ToolRegistry) -> None:
+        """When the first arm cannot be renamed, it keeps the bare name and still counts."""
+        empty_registry.register_tool(_make_tool("b_c", "a"))
+        empty_registry.register_tool(_make_tool("c", "b"))
+        empty_registry.register_tool(_make_tool("c", "a_b"))
+
+        assert [(t.name, t.domain) for t in empty_registry.collision_arms("c")] == [("a_b_c", "a_b"), ("c", "b")]
+
+    def test_a_cleared_domain_drops_out(self, empty_registry: ToolRegistry) -> None:
+        """Clearing a domain removes its arm, and clearing both leaves none."""
+        empty_registry.register_tool(_make_tool("create_upload", "svc"))
+        empty_registry.register_tool(_make_tool("create_upload", "widgets"))
+
+        empty_registry.clear_domain("widgets")
+        assert [t.name for t in empty_registry.collision_arms("create_upload")] == ["svc_create_upload"]
+
+        empty_registry.clear_domain("svc")
+        assert empty_registry.collision_arms("create_upload") == []
+
+    def test_a_refresh_keeps_the_arms(self, empty_registry: ToolRegistry) -> None:
+        """Re-populating a domain with the same tools keeps both arms under their renamed names."""
+        payload = [{"name": "create_upload", "inputSchema": {"type": "object"}}]
+        empty_registry.populate_domain("svc", "http://svc:8080/mcp", payload)
+        empty_registry.populate_domain("widgets", "http://widgets:8080/mcp", payload)
+
+        diff = empty_registry.populate_domain("svc", "http://svc:8080/mcp", payload)
+
+        assert not diff.refused
+        assert [(t.name, t.domain) for t in empty_registry.collision_arms("create_upload")] == [
+            ("svc_create_upload", "svc"),
+            ("widgets_create_upload", "widgets"),
+        ]
+
+    def test_a_refresh_that_drops_the_tool_drops_its_arm(self, empty_registry: ToolRegistry) -> None:
+        """An acknowledged refresh that no longer lists the tool removes that domain's arm."""
+        payload = [{"name": "create_upload", "inputSchema": {"type": "object"}}]
+        empty_registry.populate_domain("svc", "http://svc:8080/mcp", payload)
+        empty_registry.populate_domain("widgets", "http://widgets:8080/mcp", payload)
+        changed = [{"name": "list_widgets", "inputSchema": {"type": "object"}}]
+        digest = empty_registry.prepare_domain("widgets", "http://widgets:8080/mcp", changed).diff.schema_digest
+
+        diff = empty_registry.populate_domain("widgets", "http://widgets:8080/mcp", changed, expected_digest=digest)
+
+        assert not diff.refused
+        assert [t.name for t in empty_registry.collision_arms("create_upload")] == ["svc_create_upload"]
+
+    def test_arms_are_copies(self, empty_registry: ToolRegistry) -> None:
+        """Mutating a returned arm does not change the registry."""
+        empty_registry.register_tool(_make_tool("create_upload", "svc"))
+        empty_registry.register_tool(_make_tool("create_upload", "widgets"))
+
+        arm = empty_registry.collision_arms("create_upload")[0]
+        arm.input_schema["mutated"] = True
+
+        assert "mutated" not in empty_registry.collision_arms("create_upload")[0].input_schema

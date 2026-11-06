@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+This is a minor release: one additive detail field. Only a `tool_not_found` answer for a name more than one domain serves changes; every other answer is unchanged.
+
+### Added
+
+- **A bare name that more than one domain serves answers `tool_not_found` naming each domain's tool.** When two domains register the same tool name, the gateway renames each to `<domain>_<name>`, so the bare name no longer resolves. A caller that used it anyway, in `execute_tool` without `domain` or in `get_tool_schema`, got `Unknown tool` with up to three fuzzy `suggestions`: the answer never said the name had been renamed, and the cap could leave a renamed tool out. The message now gives the reason and the way out (call one of the renamed tools, or, in `execute_tool`, pass `domain`), and the new `details.candidates` lists each renamed tool the caller can see as `{"name", "domain"}`, sorted by domain. Those names lead `details.suggestions`, which keeps every one of them past its usual three, and fuzzy matches fill any place left. A renamed tool is a candidate only when the caller's `after_list_tools` hooks leave it visible both in the all-domain listing the suggestions come from and within its own domain, where `get_tool_schema` and a domain-pinned `execute_tool` look it up. A renamed tool hidden from the caller is therefore never a candidate, and when no renamed tool qualifies the answer is exactly as before. The `code` stays `tool_not_found`; for such a name, the `error` text and the order of `suggestions` change. `execute_tool` with `domain` is unchanged. `ToolRegistry.collision_arms(name)` is the new public method that returns the tools a collision on `name` renamed.
+
 ## [0.38.0] - 2026-11-01
 
 This is a minor release: one additive option. Nothing changes for a deployment that does not set it.
