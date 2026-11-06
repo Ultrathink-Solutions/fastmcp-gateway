@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.39.0] - 2026-11-06
+
 This is a minor release: one additive detail field. Only a `tool_not_found` answer for a name more than one domain serves changes; every other answer is unchanged.
 
 ### Added
