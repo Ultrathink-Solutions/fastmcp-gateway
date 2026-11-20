@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+This release changes no interface and no answer: `execute_tool` does less work on every call it resolves for itself.
+
+### Changed
+
+- **`execute_tool` without a `resolved_tool` no longer copies the domain's registration.** Handed no `ResolvedTool`, `UpstreamManager.execute_tool` resolved one for itself through `resolve_tool`, which makes two deep copies of the domain's registration snapshot, every tool the domain serves with its input schema: one detaches the handle from manager state, and the other is the issued copy `pin_registration` checks a handle against. Neither protects anything when the handle never leaves the manager, yet their cost grew with the size of the domain on every call, and the `execute_tool` meta-tool and code mode make every call this way. The manager now admits its own call against the live registration: it looks up the one tool, answers `registration_changed` while the domain is blocked or its registration is retiring, or when the tool is not part of the published registration, and holds the registration until the call returns, so a refresh, replacement or removal still waits for the call before it publishes. An unknown tool still raises `KeyError`. A caller that passes `resolved_tool` is checked exactly as before. Results, errors, spans and the registration lifecycle are unchanged.
+
 ## [0.39.0] - 2026-11-06
 
 This is a minor release: one additive detail field. Only a `tool_not_found` answer for a name more than one domain serves changes; every other answer is unchanged.

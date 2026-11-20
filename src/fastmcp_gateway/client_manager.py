@@ -24,7 +24,7 @@ import logging
 import re
 import weakref
 from collections import defaultdict
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
@@ -55,7 +55,7 @@ from fastmcp_gateway.registry import ToolEntry
 from fastmcp_gateway.sanitize import DEFAULT_MAX_SCHEMA_DEPTH, _validate_max_schema_depth
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+    from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
 
     from fastmcp.client.client import CallToolResult
 
@@ -200,6 +200,18 @@ class _RegistrationRuntime:
 
     def __post_init__(self) -> None:
         self.drained.set()
+
+    @contextmanager
+    def admitted(self) -> Iterator[None]:
+        """Count one admitted call, so a registration change drains it before publishing."""
+        self.active += 1
+        self.drained.clear()
+        try:
+            yield
+        finally:
+            self.active -= 1
+            if not self.active:
+                self.drained.set()
 
 
 class UpstreamManager:
@@ -676,14 +688,42 @@ class UpstreamManager:
             )
         ):
             raise RegistrationSelectionError("registration_changed", "Registration changed")
-        runtime.active += 1
-        runtime.drained.clear()
-        try:
+        with runtime.admitted():
             yield
-        finally:
-            runtime.active -= 1
-            if not runtime.active:
-                runtime.drained.set()
+
+    @asynccontextmanager
+    async def _pin_live_entry(self, tool_name: str) -> AsyncIterator[ToolEntry]:
+        """Admit a call to *tool_name* for the manager's own dispatch, yielding its registry entry.
+
+        :meth:`resolve_tool` copies the domain's whole registration snapshot
+        twice, so that a :class:`ResolvedTool` held by a caller stays detached
+        from manager state and :meth:`pin_registration` can refuse one altered
+        after issue. Here no object leaves the manager, and nothing awaits
+        between the lookup and the admission, so the call is admitted against
+        the live registration without either copy. The refusals and the drain
+        protocol are the same: a blocked domain or a retiring registration is
+        ``registration_changed``, and a registration change waits for the
+        call to finish before it publishes.
+        """
+        entry = self._registry.lookup(tool_name)
+        if entry is None:
+            raise RegistrationSelectionError("tool_not_found", "Tool not found")
+        if entry.domain in self._blocked_domains:
+            raise RegistrationSelectionError("registration_changed", "Registration changed")
+        runtime = self._runtimes.get(entry.domain)
+        if runtime is None:
+            # The first use of a registry populated directly builds the runtime once.
+            resolved = self.resolve_tool(tool_name)
+            async with self.pin_registration(resolved):
+                yield self._issued[id(resolved)][1].entry
+            return
+        canonical = entry.original_name or entry.name
+        if runtime.retiring or not any(
+            (t.original_name or t.name) == canonical and t.domain == entry.domain for t in runtime.snapshot.tools
+        ):
+            raise RegistrationSelectionError("registration_changed", "Registration changed")
+        with runtime.admitted():
+            yield entry
 
     def set_registration_commit_hook(self, hook: RegistrationCommitHook) -> None:
         """Install the durable adapter once, before the first population."""
@@ -847,15 +887,21 @@ class UpstreamManager:
         with _tracer.start_as_current_span("gateway.upstream.execute") as span:
             span.set_attribute("gateway.tool_name", tool_name)
 
-            if resolved_tool is None:
-                try:
-                    resolved_tool = self.resolve_tool(tool_name)
-                except RegistrationSelectionError as exc:
-                    if exc.code == "tool_not_found":
-                        raise KeyError(f"Tool '{tool_name}' not found in registry") from exc
-                    raise
-            async with self.pin_registration(resolved_tool):
-                entry = self._issued[id(resolved_tool)][1].entry
+            async with AsyncExitStack() as admission:
+                if resolved_tool is None:
+                    # The manager's own call: admitted against the live
+                    # registration, with no copy of the domain's snapshot.
+                    try:
+                        entry = await admission.enter_async_context(self._pin_live_entry(tool_name))
+                    except RegistrationSelectionError as exc:
+                        if exc.code == "tool_not_found":
+                            raise KeyError(f"Tool '{tool_name}' not found in registry") from exc
+                        raise
+                else:
+                    # A caller's handle: checked against the copy kept at issue,
+                    # and routed from that copy, never from the caller's object.
+                    await admission.enter_async_context(self.pin_registration(resolved_tool))
+                    entry = self._issued[id(resolved_tool)][1].entry
                 span.set_attribute("gateway.domain", entry.domain)
                 dispatch_meta = None if request_meta is None else deepcopy(dict(request_meta))
                 fresh_client = self._make_execution_client(

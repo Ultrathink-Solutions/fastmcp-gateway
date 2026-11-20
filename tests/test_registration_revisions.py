@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 from uuid import uuid4
 
 import pytest
@@ -20,6 +21,32 @@ def server(value: str = "old") -> FastMCP:
         return value
 
     return svc
+
+
+def numbered_server(count: int) -> FastMCP:
+    """An upstream serving tools ``t1`` .. ``t<count>``, each answering its own name."""
+    svc = FastMCP("svc")
+
+    def numbered(name: str):
+        def tool(record_id: str = "", limit: int = 10) -> str:
+            return name
+
+        return tool
+
+    for index in range(1, count + 1):
+        svc.tool(name=f"t{index}")(numbered(f"t{index}"))
+    return svc
+
+
+def count_calls(monkeypatch, calls: Counter, owner: type, name: str) -> None:
+    """Count every call to ``owner.name``, keyed ``"<owner>.<name>"``, still calling through."""
+    original = getattr(owner, name)
+
+    def counted(*args, **kwargs):
+        calls[f"{owner.__name__}.{name}"] += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(owner, name, counted)
 
 
 def observe_retirement(manager: UpstreamManager, domain: str) -> asyncio.Event:
@@ -273,6 +300,147 @@ async def test_refused_refresh_preserves_incarnation_and_execution() -> None:
     manager._registry_clients["svc_a"] = __import__("fastmcp").Client(FastMCP("empty"))
     assert (await manager.refresh_domain("svc_a")).refused
     assert manager.registration_snapshot("svc_a") == before
+    assert (await manager.execute_tool("widgets_create")).content[0].text == "old"
+
+
+async def test_execute_tool_without_a_resolved_tool_copies_no_snapshot(monkeypatch) -> None:
+    from fastmcp_gateway.registration import RegistrationSnapshot
+
+    manager = UpstreamManager({"svc_a": numbered_server(90)}, ToolRegistry())
+    await manager.populate_all()
+    assert len(manager.registration_snapshot("svc_a").tools) == 90
+    calls: Counter = Counter()
+    # A snapshot is copied through ``model_copy`` or, nested in a copied
+    # ``ResolvedTool``, through ``copy.deepcopy``; count both.
+    count_calls(monkeypatch, calls, RegistrationSnapshot, "model_copy")
+    count_calls(monkeypatch, calls, RegistrationSnapshot, "__deepcopy__")
+    count_calls(monkeypatch, calls, ToolRegistry, "get_tools_by_domain")
+    count_calls(monkeypatch, calls, ToolRegistry, "lookup")
+    assert (await manager.execute_tool("t1", {})).content[0].text == "t1"
+    assert calls == {"ToolRegistry.lookup": 1}
+
+
+async def test_a_refresh_waits_for_a_call_pinned_without_a_resolved_tool() -> None:
+    from fastmcp import Client
+
+    started, release = asyncio.Event(), asyncio.Event()
+    svc = FastMCP("svc")
+
+    @svc.tool(meta={"axon/requiredScope": "widgets:read"})
+    async def widgets_create() -> str:
+        started.set()
+        await release.wait()
+        return "old"
+
+    changes = []
+    manager = UpstreamManager({"svc_a": svc}, ToolRegistry())
+
+    async def commit(change):
+        changes.append(change.kind)
+
+    manager.set_registration_commit_hook(commit)
+    await manager.populate_all()
+    before = manager.registration_snapshot("svc_a")
+    # The same tool listed with another scope: the registration changes, the schema digest does not.
+    changed = server()
+    (await changed.get_tool("widgets_create")).meta = {"axon/requiredScope": "widgets:write"}
+    manager._registry_clients["svc_a"] = Client(changed)
+    retiring = observe_retirement(manager, "svc_a")
+    call = asyncio.create_task(manager.execute_tool("widgets_create"))
+    await started.wait()
+    refreshing = asyncio.create_task(manager.refresh_domain("svc_a"))
+    await retiring.wait()
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert not refreshing.done()
+    assert changes == ["replace"]
+    assert manager._runtimes["svc_a"].snapshot == before
+    release.set()
+    assert (await call).content[0].text == "old"
+    assert not (await refreshing).refused
+    assert changes == ["replace", "refresh"]
+    after = manager.registration_snapshot("svc_a")
+    assert after.registration_revision != before.registration_revision
+    assert after.tools[0].required_scope == "widgets:write"
+
+
+async def test_a_call_arriving_while_its_domain_retires_is_refused(monkeypatch) -> None:
+    from fastmcp_gateway.errors import RegistrationSelectionError
+
+    manager = UpstreamManager({"svc_a": server()}, ToolRegistry())
+    await manager.populate_all()
+    held = manager.resolve_tool("widgets_create")
+    retiring = observe_retirement(manager, "svc_a")
+    async with manager.pin_registration(held):
+        replacement = asyncio.create_task(manager.add_upstream("svc_a", server("new")))
+        await retiring.wait()
+        assert manager._runtimes["svc_a"].retiring
+        with monkeypatch.context() as patched:
+            patched.setattr(manager, "_make_execution_client", lambda *a, **k: pytest.fail("refused call connected"))
+            with pytest.raises(RegistrationSelectionError) as refused:
+                await manager.execute_tool("widgets_create")
+        assert refused.value.code == "registration_changed"
+    await replacement
+    assert (await manager.execute_tool("widgets_create")).content[0].text == "new"
+
+
+async def test_a_call_to_a_blocked_domain_is_refused(monkeypatch) -> None:
+    from fastmcp_gateway.errors import RegistrationSelectionError
+
+    manager = UpstreamManager({"svc_a": server()}, ToolRegistry())
+    await manager.populate_all()
+    # A change being committed blocks its domain; retirement alone is covered above.
+    manager._blocked_domains.add("svc_a")
+    assert not manager._runtimes["svc_a"].retiring
+    with monkeypatch.context() as patched:
+        patched.setattr(manager, "_make_execution_client", lambda *a, **k: pytest.fail("refused call connected"))
+        with pytest.raises(RegistrationSelectionError) as refused:
+            await manager.execute_tool("widgets_create")
+    assert refused.value.code == "registration_changed"
+    manager._blocked_domains.discard("svc_a")
+    assert (await manager.execute_tool("widgets_create")).content[0].text == "old"
+
+
+async def test_a_passed_resolved_tool_is_still_checked_against_the_issued_copy(monkeypatch) -> None:
+    from fastmcp_gateway.errors import RegistrationSelectionError
+
+    manager = UpstreamManager({"svc_a": server()}, ToolRegistry())
+    await manager.populate_all()
+    issued = manager.resolve_tool("widgets_create")
+    equal = issued.model_copy(deep=True)
+    assert equal == issued
+    assert equal is not issued
+    with monkeypatch.context() as patched:
+        patched.setattr(manager, "_make_execution_client", lambda *a, **k: pytest.fail("refused handle connected"))
+        with pytest.raises(RegistrationSelectionError) as refused:
+            await manager.execute_tool("widgets_create", resolved_tool=equal)
+    assert refused.value.code == "registration_changed"
+    assert (await manager.execute_tool("widgets_create", resolved_tool=issued)).content[0].text == "old"
+
+
+async def test_a_tool_outside_the_published_registration_is_refused(monkeypatch) -> None:
+    from fastmcp_gateway.errors import RegistrationSelectionError
+    from fastmcp_gateway.registry import ToolEntry
+
+    registry = ToolRegistry()
+    manager = UpstreamManager({"svc_a": server()}, registry)
+    await manager.populate_all()
+    # Registered straight into the registry after publication, so absent from the registration.
+    registry.register_tool(
+        ToolEntry(
+            name="widgets_delete",
+            domain="svc_a",
+            group="widgets",
+            description="",
+            input_schema={"type": "object"},
+            upstream_url="",
+        )
+    )
+    with monkeypatch.context() as patched:
+        patched.setattr(manager, "_make_execution_client", lambda *a, **k: pytest.fail("refused call connected"))
+        with pytest.raises(RegistrationSelectionError) as refused:
+            await manager.execute_tool("widgets_delete")
+    assert refused.value.code == "registration_changed"
     assert (await manager.execute_tool("widgets_create")).content[0].text == "old"
 
 
