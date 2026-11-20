@@ -88,6 +88,7 @@ All configuration is via environment variables:
 | `GATEWAY_HOST` | No | `0.0.0.0` | Bind address |
 | `GATEWAY_PORT` | No | `8080` | Bind port |
 | `GATEWAY_INSTRUCTIONS` | No | Built-in | Custom LLM system instructions |
+| `GATEWAY_INSTRUCTIONS_PREAMBLE` | No | None | Text that opens the instructions (unless `GATEWAY_INSTRUCTIONS` is set) and the no-argument `discover_tools()` result |
 | `GATEWAY_REGISTRY_AUTH_TOKEN` | No | — | Bearer token for upstream discovery |
 | `GATEWAY_DOMAIN_DESCRIPTIONS` | No | — | JSON object: `{"domain": "description", ...}` |
 | `GATEWAY_UPSTREAM_HEADERS` | No | — | JSON object: `{"domain": {"Header": "Value"}, ...}` |
@@ -448,6 +449,8 @@ Call get_tool_schema() only when a signature is not enough.
 ```
 
 Instructions are automatically rebuilt when the registry changes during background refresh or dynamic registration. Custom `instructions=` passed at construction time are never overwritten.
+
+An optional `instructions_preamble=` (`GATEWAY_INSTRUCTIONS_PREAMBLE`) opens these instructions and the result of the no-argument `discover_tools()` call (under a `guidance` key); when `instructions` is set, that text is used whole and the preamble is not added to it, but the `discover_tools()` listing still carries it.
 
 ## Health Endpoints
 

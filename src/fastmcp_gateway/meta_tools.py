@@ -379,6 +379,7 @@ def register_meta_tools(
     *,
     code_mode_runner: Any | None = None,
     trace_tool_content: bool = False,
+    instructions_preamble: str | None = None,
 ) -> None:
     """Register the meta-tools on the FastMCP server.
 
@@ -393,6 +394,10 @@ def register_meta_tools(
     records the call's arguments (as sent) and the result text the caller
     receives, on every return path, as ``gen_ai.tool.call.arguments`` and
     ``gen_ai.tool.call.result``. Off by default: no such attribute is set.
+
+    When *instructions_preamble* is set, the no-argument ``discover_tools``
+    result opens with it under a ``guidance`` key. This does not depend on
+    the gateway's instructions text, which the caller may have replaced.
 
     Each meta-tool's docstring is served verbatim as its MCP description,
     and each parameter's ``Field(description=...)`` is served in its input
@@ -651,12 +656,12 @@ def register_meta_tools(
                     )
 
                 span.set_attribute("gateway.result_count", len(result_domains))
-                return _json_result(
-                    {
-                        "domains": result_domains,
-                        "total_tools": len(filtered),
-                    }
-                )
+                listing: dict[str, Any] = {}
+                if instructions_preamble is not None:
+                    listing["guidance"] = instructions_preamble
+                listing["domains"] = result_domains
+                listing["total_tools"] = len(filtered)
+                return _json_result(listing)
 
             # Modes 2 and 3 answer from the domain as the caller sees it, as
             # the summary does: a domain (or group) whose tools the hooks
