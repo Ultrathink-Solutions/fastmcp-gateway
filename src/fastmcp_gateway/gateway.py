@@ -245,6 +245,13 @@ class GatewayServer:
     instructions:
         Custom LLM system instructions.  If ``None``, uses a sensible
         default describing the 3-step discovery workflow.
+    instructions_preamble:
+        Operator-supplied text placed ahead of the generated instructions
+        and at the top of the no-argument ``discover_tools()`` result (under
+        a ``guidance`` key).  Used verbatim: it is neither sanitised nor
+        capped.  Custom *instructions* are used whole, so the preamble is not
+        added to the instructions text; the ``discover_tools()`` listing still
+        carries it.  ``None`` (the default) adds nothing.
     registry_auth_headers:
         Headers to send to upstreams during startup registry population
         (runs outside any HTTP request context).
@@ -466,6 +473,7 @@ class GatewayServer:
         *,
         name: str = "fastmcp-gateway",
         instructions: str | None = None,
+        instructions_preamble: str | None = None,
         registry_auth_headers: dict[str, str] | None = None,
         registry_token_provider: Callable[[], str | Awaitable[str]] | None = None,
         upstream_headers: dict[str, dict[str, str]] | None = None,
@@ -512,6 +520,7 @@ class GatewayServer:
         self.registry = ToolRegistry()
         self._domain_descriptions = domain_descriptions or {}
         self._custom_instructions = instructions  # None → auto-build from registry
+        self._instructions_preamble = instructions_preamble or None  # empty is unset
         self._refresh_interval = refresh_interval
         self._refresh_task: asyncio.Task[None] | None = None
         # Build the hook list so the output guard (when enabled) is
@@ -839,6 +848,7 @@ class GatewayServer:
             self._hook_runner,
             code_mode_runner=code_mode_runner,
             trace_tool_content=self._trace_tool_content,
+            instructions_preamble=self._instructions_preamble,
         )
 
     def _register_health_routes(self) -> None:
@@ -1400,6 +1410,12 @@ class GatewayServer:
             return
         self._mcp.instructions = self._build_instructions()
 
+    def _with_preamble(self, body: str) -> str:
+        """Open *body* with the operator's preamble, when one was supplied."""
+        if self._instructions_preamble is None:
+            return body
+        return f"{self._instructions_preamble}\n\n{body}"
+
     def _build_instructions(self) -> str:
         """Build instructions that include the domain summary from the registry.
 
@@ -1429,11 +1445,10 @@ class GatewayServer:
             "(deeply nested arguments, or the raw JSON schema is needed).\n"
             "Skip discovery for tools you've already used in this conversation."
         )
-        return "\n".join(lines)
+        return self._with_preamble("\n".join(lines))
 
-    @staticmethod
-    def _default_instructions() -> str:
-        return (
+    def _default_instructions(self) -> str:
+        return self._with_preamble(
             "You have access to a tool discovery gateway with 3 tools:\n"
             "1. discover_tools - Browse available tools. Call with no arguments to see domains, "
             "or with a domain to see tool signatures.\n"

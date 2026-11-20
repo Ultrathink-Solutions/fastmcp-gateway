@@ -39,6 +39,12 @@ Configure via environment variables:
     GATEWAY_INSTRUCTIONS
         Custom LLM system instructions.
 
+    GATEWAY_INSTRUCTIONS_PREAMBLE
+        Text placed ahead of the generated instructions and at the top of the
+        no-argument ``discover_tools()`` result. When GATEWAY_INSTRUCTIONS is
+        set, that text is used whole and the preamble is not added to it; the
+        ``discover_tools()`` listing still carries it. Empty means unset.
+
     GATEWAY_REGISTRY_AUTH_TOKEN
         Bearer token sent to upstreams during startup registry population.
 
@@ -535,6 +541,7 @@ def main() -> None:
         logger.error("Invalid GATEWAY_PORT value: %s (must be an integer)", port_raw)
         sys.exit(1)
     instructions = os.environ.get("GATEWAY_INSTRUCTIONS") or None
+    instructions_preamble = os.environ.get("GATEWAY_INSTRUCTIONS_PREAMBLE") or None
     registration_identities = _load_registration_identities(upstreams)
     domain_descriptions = _load_json_env("GATEWAY_DOMAIN_DESCRIPTIONS")
     upstream_headers = _load_json_env("GATEWAY_UPSTREAM_HEADERS")
@@ -635,6 +642,7 @@ def main() -> None:
             upstreams,
             name=name,
             instructions=instructions,
+            instructions_preamble=instructions_preamble,
             registry_auth_headers=registry_auth_headers,
             upstream_headers=upstream_headers,
             domain_descriptions=domain_descriptions,
