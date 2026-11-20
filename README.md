@@ -93,6 +93,7 @@ All configuration is via environment variables:
 | `GATEWAY_UPSTREAM_HEADERS` | No | — | JSON object: `{"domain": {"Header": "Value"}, ...}` |
 | `GATEWAY_REFRESH_INTERVAL` | No | Disabled | Seconds between automatic registry refresh cycles |
 | `GATEWAY_TRACE_HEALTH_ROUTES` | No | `true` | Emit an OTel span per `/healthz` / `/readyz` request (see Health Endpoints) |
+| `GATEWAY_TRACE_TOOL_CONTENT` | No | `false` | Record each `execute_tool` call's arguments and result on its span as `gen_ai.tool.call.arguments` / `gen_ai.tool.call.result` (see Observability) |
 | `GATEWAY_MAX_SCHEMA_DEPTH` | No | `5` | Registry-ingest schema-nesting-depth cap, `1`-`50` (see Schema Validation) |
 | `GATEWAY_UPSTREAM_CLIENT_MODE` | No | `legacy` | Protocol era the gateway's upstream connections negotiate: `legacy`, `auto`, or `2026-07-28` (see Protocol Eras) |
 | `GATEWAY_HOOK_MODULE` | No | — | Python module path for execution hooks: `module.path:factory_function` |
@@ -380,6 +381,8 @@ The gateway emits OpenTelemetry spans for all operations. Bring your own exporte
 Key spans: `gateway.discover_tools`, `gateway.get_tool_schema`, `gateway.execute_tool`, `gateway.refresh_registry`, `gateway.populate_all`, `gateway.background_refresh`.
 
 Each span includes attributes including `gateway.domain`, `gateway.tool_name`, `gateway.result_count`, and `gateway.error_code` for filtering and alerting.
+
+By default no span records a tool call's arguments or its result. Set `trace_tool_content=True` (or `GATEWAY_TRACE_TOOL_CONTENT=true`) and the `gateway.execute_tool` span records both, on every return path, as the JSON string `gen_ai.tool.call.arguments` (as the caller sent them, before any hook runs) and the text `gen_ai.tool.call.result` (what the caller receives), OpenTelemetry's opt-in attributes for tool calls. `gateway.tool_call.arguments_bytes` and `gateway.tool_call.result_bytes` give each value's UTF-8 size; a value over 1,048,576 bytes is cut to at most that size, on a character boundary, and flagged with `gateway.tool_call.arguments_truncated` or `gateway.tool_call.result_truncated`. Request headers and `_meta` are never recorded. Enable it only where the trace backend is allowed to hold what your tools carry.
 
 ## Error Handling
 

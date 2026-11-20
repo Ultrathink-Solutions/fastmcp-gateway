@@ -403,6 +403,17 @@ class GatewayServer:
         disable it here (or via ``GATEWAY_TRACE_HEALTH_ROUTES=false``).
         When disabled, the handlers create no span at all — the
         response bodies and status codes are unaffected either way.
+    trace_tool_content:
+        When true, the ``gateway.execute_tool`` span records the call's
+        arguments, as the caller sent them, and the result text the caller
+        receives, on every return path, as ``gen_ai.tool.call.arguments``
+        and ``gen_ai.tool.call.result`` (OpenTelemetry's opt-in attributes
+        for tool calls), with ``gateway.tool_call.arguments_bytes`` and
+        ``gateway.tool_call.result_bytes`` holding each value's UTF-8 size.
+        A value over 1,048,576 bytes is cut to at most that size, on a character boundary, and its
+        ``gateway.tool_call.*_truncated`` attribute is set. Request headers
+        and ``_meta`` are never recorded. Default ``False``: no such
+        attribute is set.
     max_schema_depth:
         Overrides the registry-ingest schema-nesting-depth cap (default
         5, unchanged) applied to every upstream tool's ``inputSchema``
@@ -478,6 +489,7 @@ class GatewayServer:
         max_schema_depth: int = DEFAULT_MAX_SCHEMA_DEPTH,
         registration_identities: Mapping[str, RegistrationIdentity] | None = None,
         upstream_client_mode: str = DEFAULT_UPSTREAM_CLIENT_MODE,
+        trace_tool_content: bool = False,
     ) -> None:
         # Fail fast at construction rather than deferring to the first
         # populate() call — an operator misconfiguration here should
@@ -625,6 +637,7 @@ class GatewayServer:
             client_mode=upstream_client_mode,
         )
         self._trace_health_routes = trace_health_routes
+        self._trace_tool_content = trace_tool_content
         # ``auth`` plugs an inbound auth provider (TokenVerifier,
         # RemoteAuthProvider, OAuthProvider, or any other AuthProvider
         # subclass) into the underlying FastMCP server. When set, FastMCP
@@ -825,6 +838,7 @@ class GatewayServer:
             self.upstream_manager,
             self._hook_runner,
             code_mode_runner=code_mode_runner,
+            trace_tool_content=self._trace_tool_content,
         )
 
     def _register_health_routes(self) -> None:

@@ -82,6 +82,12 @@ Configure via environment variables:
         root trace; set this to ``false`` to opt a deployment out of
         that per-probe span volume entirely.
 
+    GATEWAY_TRACE_TOOL_CONTENT
+        When true, the ``gateway.execute_tool`` span records each call's
+        arguments and result (``gen_ai.tool.call.arguments`` and
+        ``gen_ai.tool.call.result``). Same truthy values as
+        ``GATEWAY_CODE_MODE``. Default: off.
+
     GATEWAY_MAX_SCHEMA_DEPTH
         Overrides the registry-ingest schema-nesting-depth cap (default
         5) applied to every upstream tool's inputSchema during
@@ -557,6 +563,7 @@ def main() -> None:
 
     # Health-route span opt-out (default preserves prior behaviour: traced).
     trace_health_routes = _bool_env("GATEWAY_TRACE_HEALTH_ROUTES", default=True)
+    trace_tool_content = _bool_env("GATEWAY_TRACE_TOOL_CONTENT", default=False)
 
     # Registry-ingest schema-depth cap (optional; default preserved when unset).
     # The upper bound (MAX_ALLOWED_SCHEMA_DEPTH) isn't a sanity nicety: the
@@ -642,6 +649,7 @@ def main() -> None:
             auth=auth,
             registry_token_provider=registry_token_provider,
             trace_health_routes=trace_health_routes,
+            trace_tool_content=trace_tool_content,
             max_schema_depth=max_schema_depth,
             registration_identities=registration_identities,
             upstream_client_mode=upstream_client_mode,
