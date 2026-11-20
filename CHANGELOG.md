@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.40.0] - 2026-11-20
+
+This is a minor release: two additive options, both off by default. With neither set, nothing changes.
+
 ### Added
 
 - **`trace_tool_content` records a tool call's arguments and result on the `gateway.execute_tool` span.** `GatewayServer(..., trace_tool_content=True)`, or `GATEWAY_TRACE_TOOL_CONTENT` set to a true value on the CLI, makes the span carry `gen_ai.tool.call.arguments` (a JSON string of the arguments as the caller sent them, set before any hook runs) and `gen_ai.tool.call.result` (the text the caller receives, set on every return path: success, an upstream error result or exception, `tool_not_found`, `invalid_arguments` and a hook's denial). These are OpenTelemetry's opt-in attribute names for tool calls. `gateway.tool_call.arguments_bytes` and `gateway.tool_call.result_bytes` hold each value's UTF-8 length. A value over 1,048,576 bytes is cut to at most that size, on a character boundary, and `gateway.tool_call.arguments_truncated` or `gateway.tool_call.result_truncated` is then set to `True`. Request headers and `_meta` are never recorded. The default is off, and with it off none of these attributes is set and nothing else changes.
