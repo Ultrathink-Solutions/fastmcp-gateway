@@ -7,7 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-This release changes no interface and no answer: `execute_tool` does less work on every call it resolves for itself.
+## [0.39.1] - 2026-11-19
+
+This is a patch release: it changes no interface and no answer: `execute_tool` does less work on every call it resolves for itself.
 
 ### Changed
 
