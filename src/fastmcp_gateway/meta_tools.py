@@ -36,6 +36,31 @@ if TYPE_CHECKING:
 
 _tracer = trace.get_tracer("fastmcp_gateway.meta_tools")
 
+# Longest tool-call argument or result, in UTF-8 bytes, recorded on a span. A
+# longer value is cut to this size and its full size recorded beside it, since
+# one oversized attribute can make an OTLP export request exceed a collector's
+# limit and lose the whole batch it travels with.
+_MAX_TRACED_CONTENT_BYTES = 1_048_576
+
+
+def _record_traced_content(span: trace.Span, kind: str, value: str) -> None:
+    """Record *value* on *span* as ``gen_ai.tool.call.<kind>`` with its size.
+
+    ``gateway.tool_call.<kind>_bytes`` is the UTF-8 length before any cut;
+    ``gateway.tool_call.<kind>_truncated`` is set, to ``True``, only when the
+    value was cut (on a character boundary). Does nothing for a span that is
+    not recording (an unsampled call).
+    """
+    if not span.is_recording():
+        return
+    encoded = value.encode("utf-8", errors="replace")
+    size = len(encoded)
+    if size > _MAX_TRACED_CONTENT_BYTES:
+        value = encoded[:_MAX_TRACED_CONTENT_BYTES].decode("utf-8", errors="ignore")
+        span.set_attribute(f"gateway.tool_call.{kind}_truncated", True)
+    span.set_attribute(f"gen_ai.tool.call.{kind}", value)
+    span.set_attribute(f"gateway.tool_call.{kind}_bytes", size)
+
 
 def _request_meta_snapshot(request_ctx: Context | None) -> dict[str, Any] | None:
     """Copy the caller's inbound MCP request metadata, exactly as sent on the wire.
@@ -353,6 +378,7 @@ def register_meta_tools(
     hook_runner: HookRunner | None = None,
     *,
     code_mode_runner: Any | None = None,
+    trace_tool_content: bool = False,
 ) -> None:
     """Register the meta-tools on the FastMCP server.
 
@@ -362,6 +388,11 @@ def register_meta_tools(
     When *code_mode_runner* is provided (see
     :class:`~fastmcp_gateway.code_mode.CodeModeRunner`), additionally
     registers an experimental ``execute_code`` meta-tool.
+
+    When *trace_tool_content* is true, the ``gateway.execute_tool`` span
+    records the call's arguments (as sent) and the result text the caller
+    receives, on every return path, as ``gen_ai.tool.call.arguments`` and
+    ``gen_ai.tool.call.result``. Off by default: no such attribute is set.
 
     Each meta-tool's docstring is served verbatim as its MCP description,
     and each parameter's ``Field(description=...)`` is served in its input
@@ -763,7 +794,11 @@ def register_meta_tools(
         schema from the union and silently auto-populate
         ``structuredContent`` from dict-shaped TextContent.  All error
         paths therefore route their error envelope through this helper.
+        It also records the text on the current ``gateway.execute_tool``
+        span when content tracing is on.
         """
+        if trace_tool_content:
+            _record_traced_content(trace.get_current_span(), "result", error_text)
         return ToolResult(
             content=[TextContent(type="text", text=error_text)],
             structured_content=None,
@@ -859,6 +894,9 @@ def register_meta_tools(
         inbound_meta_snapshot = None if request_meta is None else MappingProxyType(request_meta)
         with _tracer.start_as_current_span("gateway.execute_tool") as span:
             span.set_attribute("gateway.tool_name", tool_name)
+            if trace_tool_content and span.is_recording():
+                # Recorded as sent: a hook may rewrite the arguments in place.
+                _record_traced_content(span, "arguments", json.dumps(arguments or {}, ensure_ascii=False, default=str))
 
             # Validate tool exists. A domain-pinned call resolves the name
             # among that domain's tools only, by original or registry name,
@@ -1141,6 +1179,8 @@ def register_meta_tools(
                                 domain=entry.domain,
                             )
                         )
+                if trace_tool_content:
+                    _record_traced_content(span, "result", result_text)
                 return ToolResult(
                     content=[TextContent(type="text", text=result_text)],
                     structured_content=upstream_structured,
@@ -1167,6 +1207,8 @@ def register_meta_tools(
                         )
                     )
 
+            if trace_tool_content:
+                _record_traced_content(span, "result", result_text)
             return ToolResult(
                 content=[TextContent(type="text", text=result_text)],
                 structured_content=upstream_structured,

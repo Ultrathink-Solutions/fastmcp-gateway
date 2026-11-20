@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -14,6 +15,7 @@ if TYPE_CHECKING:
 import httpx2
 import pytest
 from fastmcp import Client, FastMCP
+from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
@@ -467,3 +469,259 @@ class TestHealthRouteSpans:
         assert response.status_code == 200
         assert response.json()["status"] == "ready"
         assert _get_spans(exporter, "gateway.readyz") == []
+
+
+# ---------------------------------------------------------------------------
+# Opt-in recording of a tool call's arguments and result
+# ---------------------------------------------------------------------------
+
+_CONTENT_KEYS = (
+    "gen_ai.tool.call.arguments",
+    "gen_ai.tool.call.result",
+    "gateway.tool_call.arguments_bytes",
+    "gateway.tool_call.result_bytes",
+    "gateway.tool_call.arguments_truncated",
+    "gateway.tool_call.result_truncated",
+)
+
+
+def _content_gateway(*, trace_tool_content: bool, hooks: list | None = None) -> tuple[FastMCP, UpstreamManager]:
+    """A gateway with one ``echo`` tool in domain ``svc``, which takes a string ``q``."""
+    registry = ToolRegistry()
+    registry.populate_domain(
+        "svc",
+        "http://svc:8080/mcp",
+        [
+            {
+                "name": "echo",
+                "description": "Echo",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"q": {"type": "string"}},
+                    "required": ["q"],
+                    "additionalProperties": False,
+                },
+            }
+        ],
+    )
+    with patch("fastmcp_gateway.client_manager.Client"):
+        manager = UpstreamManager({"svc": "http://svc:8080/mcp"}, registry)
+    mcp = FastMCP("test-gateway")
+    register_meta_tools(
+        mcp, registry, manager, HookRunner(hooks) if hooks else None, trace_tool_content=trace_tool_content
+    )
+    return mcp, manager
+
+
+def _upstream_result(text: str, *, is_error: bool = False) -> MagicMock:
+    block = MagicMock()
+    block.text = text
+    result = MagicMock()
+    result.content = [block]
+    result.is_error = is_error
+    result.structured_content = None
+    return result
+
+
+def _execute_attrs(exporter: InMemorySpanExporter) -> dict:
+    spans = _get_spans(exporter, "gateway.execute_tool")
+    assert len(spans) == 1
+    return dict(spans[0].attributes or {})
+
+
+class TestExecuteToolContentRecording:
+    @pytest.mark.asyncio
+    async def test_execute_tool_span_records_arguments_and_result_when_enabled(
+        self, exporter: InMemorySpanExporter
+    ) -> None:
+        mcp, manager = _content_gateway(trace_tool_content=True)
+        manager.execute_tool = AsyncMock(return_value=_upstream_result("ok"))  # type: ignore[method-assign]
+
+        async with Client(mcp) as client:
+            await client.call_tool("execute_tool", {"tool_name": "echo", "arguments": {"q": "héllo"}})
+
+        attrs = _execute_attrs(exporter)
+        assert attrs["gen_ai.tool.call.arguments"] == '{"q": "héllo"}'
+        assert "ok" in attrs["gen_ai.tool.call.result"]
+        assert attrs["gateway.tool_call.arguments_bytes"] == len(attrs["gen_ai.tool.call.arguments"].encode("utf-8"))
+        assert attrs["gateway.tool_call.result_bytes"] == len(attrs["gen_ai.tool.call.result"].encode("utf-8"))
+        assert "gateway.tool_call.arguments_truncated" not in attrs
+        assert "gateway.tool_call.result_truncated" not in attrs
+
+    @pytest.mark.asyncio
+    async def test_execute_tool_span_records_nothing_by_default(self, exporter: InMemorySpanExporter) -> None:
+        mcp, manager = _content_gateway(trace_tool_content=False)
+        manager.execute_tool = AsyncMock(return_value=_upstream_result("ok"))  # type: ignore[method-assign]
+
+        async with Client(mcp) as client:
+            await client.call_tool("execute_tool", {"tool_name": "echo", "arguments": {"q": "x"}})
+
+        attrs = _execute_attrs(exporter)
+        assert [key for key in _CONTENT_KEYS if key in attrs] == []
+
+    @pytest.mark.parametrize(
+        "case",
+        ["unknown-tool", "invalid-arguments", "hook-denial", "upstream-is-error", "upstream-raises"],
+    )
+    @pytest.mark.asyncio
+    async def test_every_return_path_records_the_result(self, exporter: InMemorySpanExporter, case: str) -> None:
+        from fastmcp_gateway.hooks import ExecutionDenied
+
+        class Denier:
+            async def before_execute(self, context: ExecutionContext) -> None:
+                raise ExecutionDenied("no", code="forbidden")
+
+        hooks = [Denier()] if case == "hook-denial" else None
+        mcp, manager = _content_gateway(trace_tool_content=True, hooks=hooks)
+        tool, arguments = "echo", {"q": "x"}
+        if case == "unknown-tool":
+            tool = "missing"
+        elif case == "invalid-arguments":
+            arguments = {"nope": 1}
+        elif case == "upstream-is-error":
+            manager.execute_tool = AsyncMock(return_value=_upstream_result("bad", is_error=True))  # type: ignore[method-assign]
+        elif case == "upstream-raises":
+            manager.execute_tool = AsyncMock(side_effect=ConnectionError("refused"))  # type: ignore[method-assign]
+
+        async with Client(mcp) as client:
+            result = await client.call_tool("execute_tool", {"tool_name": tool, "arguments": arguments})
+
+        returned = result.content[0].text  # type: ignore[union-attr]
+        attrs = _execute_attrs(exporter)
+        assert attrs["gen_ai.tool.call.arguments"] == json.dumps(arguments, ensure_ascii=False)
+        assert attrs["gen_ai.tool.call.result"] == returned
+        assert attrs["gateway.tool_call.result_bytes"] == len(returned.encode("utf-8"))
+
+    @pytest.mark.asyncio
+    async def test_arguments_are_recorded_as_sent_when_a_hook_rewrites_them(
+        self, exporter: InMemorySpanExporter
+    ) -> None:
+        class Rewriter:
+            async def before_execute(self, context: ExecutionContext) -> None:
+                context.arguments["q"] = "changed"
+
+        mcp, manager = _content_gateway(trace_tool_content=True, hooks=[Rewriter()])
+        manager.execute_tool = AsyncMock(return_value=_upstream_result("ok"))  # type: ignore[method-assign]
+
+        async with Client(mcp) as client:
+            await client.call_tool("execute_tool", {"tool_name": "echo", "arguments": {"q": "original"}})
+
+        assert manager.execute_tool.await_args.args[1] == {"q": "changed"}  # type: ignore[attr-defined]
+        assert _execute_attrs(exporter)["gen_ai.tool.call.arguments"] == '{"q": "original"}'
+
+    @pytest.mark.asyncio
+    async def test_a_value_over_the_bound_is_cut_and_its_size_kept(self, exporter: InMemorySpanExporter) -> None:
+        bound = mt_mod._MAX_TRACED_CONTENT_BYTES
+        assert bound == 1_048_576
+        # The envelope adds bytes around the tool's text, so size the text for a
+        # recorded result of exactly bound + 1 bytes.
+        mcp, manager = _content_gateway(trace_tool_content=True)
+        envelope = len(json.dumps({"tool": "echo", "result": ""}).encode("utf-8"))
+        body = "a" * (bound + 1 - envelope)
+        manager.execute_tool = AsyncMock(return_value=_upstream_result(body))  # type: ignore[method-assign]
+
+        async with Client(mcp) as client:
+            result = await client.call_tool("execute_tool", {"tool_name": "echo", "arguments": {"q": "x"}})
+
+        returned = result.content[0].text  # type: ignore[union-attr]
+        assert len(returned.encode("utf-8")) == bound + 1
+        attrs = _execute_attrs(exporter)
+        recorded = attrs["gen_ai.tool.call.result"]
+        assert len(recorded.encode("utf-8")) <= bound
+        assert returned.startswith(recorded)
+        assert attrs["gateway.tool_call.result_bytes"] == 1_048_577
+        assert attrs["gateway.tool_call.result_truncated"] is True
+        assert "gateway.tool_call.arguments_truncated" not in attrs
+
+    @pytest.mark.asyncio
+    async def test_a_cut_never_splits_a_multi_byte_character(self, exporter: InMemorySpanExporter) -> None:
+        bound = mt_mod._MAX_TRACED_CONTENT_BYTES
+        mcp, manager = _content_gateway(trace_tool_content=True)
+        manager.execute_tool = AsyncMock(return_value=_upstream_result("ok"))  # type: ignore[method-assign]
+        # ``{"q": "`` is 7 bytes, so the bound falls in the middle of a 2-byte character.
+        query = "\u00e9" * (bound // 2)
+
+        async with Client(mcp) as client:
+            await client.call_tool("execute_tool", {"tool_name": "echo", "arguments": {"q": query}})
+
+        attrs = _execute_attrs(exporter)
+        recorded = attrs["gen_ai.tool.call.arguments"]
+        assert len(recorded.encode("utf-8")) <= bound
+        assert recorded.startswith('{"q": "\u00e9')
+        assert "\ufffd" not in recorded
+        assert attrs["gateway.tool_call.arguments_bytes"] == len(f'{{"q": "{query}"}}'.encode())
+        assert attrs["gateway.tool_call.arguments_truncated"] is True
+
+    @pytest.mark.asyncio
+    async def test_headers_and_meta_are_never_recorded(self, exporter: InMemorySpanExporter) -> None:
+        seen_headers: list[str] = []
+
+        class Passive:
+            async def before_execute(self, context: ExecutionContext) -> None:
+                seen_headers.append(context.headers["authorization"])
+
+        mcp, manager = _content_gateway(trace_tool_content=True, hooks=[Passive()])
+        manager.execute_tool = AsyncMock(return_value=_upstream_result("ok"))  # type: ignore[method-assign]
+
+        with patch(
+            "fastmcp_gateway.client_manager.get_http_headers",
+            return_value={"authorization": "Bearer s3cr3t-token"},
+        ):
+            async with Client(mcp) as client:
+                await client.call_tool(
+                    "execute_tool",
+                    {"tool_name": "echo", "arguments": {"q": "x"}},
+                    meta={"trace_marker": "meta-value"},
+                )
+
+        # The header and the _meta did reach the gateway, so the checks below can fail.
+        assert seen_headers == ["Bearer s3cr3t-token"]
+        assert manager.execute_tool.await_args.kwargs["request_meta"]["trace_marker"] == "meta-value"  # type: ignore[attr-defined]
+        attrs = _execute_attrs(exporter)
+        assert attrs["gen_ai.tool.call.arguments"] == '{"q": "x"}'
+        for value in attrs.values():
+            assert "s3cr3t-token" not in str(value)
+            assert "trace_marker" not in str(value)
+            assert "meta-value" not in str(value)
+
+    @pytest.mark.asyncio
+    async def test_a_result_cut_by_a_hook_output_never_splits_a_multi_byte_character(
+        self, exporter: InMemorySpanExporter
+    ) -> None:
+        bound = mt_mod._MAX_TRACED_CONTENT_BYTES
+        big = "\u00e9" * (bound // 2 + 10)
+
+        class Expander:
+            async def after_execute(self, context: ExecutionContext, result: str, is_error: bool) -> str:
+                return big
+
+        mcp, manager = _content_gateway(trace_tool_content=True, hooks=[Expander()])
+        manager.execute_tool = AsyncMock(return_value=_upstream_result("ok"))  # type: ignore[method-assign]
+
+        async with Client(mcp) as client:
+            await client.call_tool("execute_tool", {"tool_name": "echo", "arguments": {"q": "x"}})
+
+        attrs = _execute_attrs(exporter)
+        recorded = attrs["gen_ai.tool.call.result"]
+        assert len(recorded.encode("utf-8")) <= bound
+        assert recorded == "\u00e9" * (bound // 2)
+        assert attrs["gateway.tool_call.result_bytes"] == len(big.encode("utf-8"))
+        assert attrs["gateway.tool_call.result_truncated"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_span_that_is_not_recording_does_no_serialization(self) -> None:
+        from opentelemetry.trace import NonRecordingSpan
+
+        class Unserializable:
+            def __str__(self) -> str:
+                raise AssertionError("serialized for a span that is not recording")
+
+        # No SDK provider is wired in: the helper must return before touching the value.
+        mt_mod._record_traced_content(NonRecordingSpan(trace.INVALID_SPAN_CONTEXT), "result", Unserializable())  # type: ignore[arg-type]
+
+        mcp, manager = _content_gateway(trace_tool_content=True)
+        manager.execute_tool = AsyncMock(return_value=_upstream_result("ok"))  # type: ignore[method-assign]
+        mt_mod._tracer = trace.NoOpTracer()
+        async with Client(mcp) as client:
+            result = await client.call_tool("execute_tool", {"tool_name": "echo", "arguments": {"q": "x"}})
+        assert "ok" in result.content[0].text  # type: ignore[union-attr]
